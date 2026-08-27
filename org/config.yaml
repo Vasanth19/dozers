@@ -18,6 +18,7 @@ lanes:
   - dev                        # code work
   - marketing                  # content work (staged for human approval)
 
-# Optional brand voice the marketing lane reads.
+# Optional brand voice for the marketing lane.
+# (skeleton: worker/lanes/marketing.sh has the TODO to read this, not yet wired.)
 brand:
   voice: "clear, warm, no hype"

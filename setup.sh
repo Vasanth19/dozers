@@ -8,12 +8,12 @@ chmod +x "$ROOT"/setup.sh "$ROOT"/demo.sh \
          "$ROOT"/director/run.sh "$ROOT"/worker/worker.sh \
          "$ROOT"/worker/lanes/*.sh "$ROOT"/tasks/*.sh 2>/dev/null || true
 
-backend="$(grep -E '^\s*backend:' "$ROOT/org/config.yaml" | head -1 | sed 's/.*backend:\s*//; s/#.*//; s/[[:space:]]//g')"
+backend="$(grep -E '^[[:space:]]*backend:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*backend:[[:space:]]*//; s/#.*//; s/[[:space:]]//g; s/"//g; s/'"'"'//g' || true)"
 echo "→ backend = $backend"
 
 if [[ "$backend" == "github" ]]; then
   command -v gh >/dev/null || { echo "✗ install GitHub CLI (gh) and run: gh auth login"; exit 1; }
-  repo="$(grep -E '^\s*repo:' "$ROOT/org/config.yaml" | head -1 | sed 's/.*repo:\s*//; s/#.*//; s/[[:space:]]//g')"
+  repo="$(grep -E '^[[:space:]]*repo:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*repo:[[:space:]]*//; s/#.*//; s/[[:space:]]//g; s/"//g; s/'"'"'//g' || true)"
   if [[ "$repo" == "OWNER/REPO" || -z "$repo" ]]; then
     echo "✗ set 'repo: owner/name' in org/config.yaml first"; exit 1
   fi

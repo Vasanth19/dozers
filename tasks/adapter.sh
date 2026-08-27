@@ -12,7 +12,10 @@
 #   task_list_untriaged   -> print one "<id>\t<title>" per line (no lane yet)
 #   task_list_ready       -> print one "<id>\t<lane>\t<title>" per line (ready+lane)
 #   task_mark_ready <id> <lane>   -> stamp an issue ready and give it a lane
-#   task_claim <id>       -> atomically take the task (returns non-zero if already taken)
+#   task_claim <id>       -> take the task, non-zero if already taken.
+#                            Atomic on the files backend (single rename); best-effort
+#                            on github (read-then-write) — assumes ONE worker/runner,
+#                            which the cloud Action and a single local loop both satisfy.
 #   task_done  <id>       -> mark the task finished
 #   task_comment <id> <text>  -> leave a note on the task
 set -euo pipefail
@@ -21,7 +24,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Resolve the backend: env wins, else read org/config.yaml, else default to files.
 if [[ -z "${BACKEND:-}" ]]; then
-  BACKEND="$(grep -E '^\s*backend:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*backend:\s*//; s/#.*//; s/[[:space:]]//g' || true)"
+  BACKEND="$(grep -E '^[[:space:]]*backend:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*backend:[[:space:]]*//; s/#.*//; s/[[:space:]]//g; s/"//g; s/'"'"'//g' || true)"
 fi
 BACKEND="${BACKEND:-files}"
 

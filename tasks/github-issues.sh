@@ -15,7 +15,7 @@
 
 _repo() {
   local r="${GH_REPO:-}"
-  [[ -z "$r" ]] && r="$(grep -E '^\s*repo:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*repo:\s*//; s/#.*//; s/[[:space:]]//g')"
+  [[ -z "$r" ]] && r="$(grep -E '^[[:space:]]*repo:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*repo:[[:space:]]*//; s/#.*//; s/[[:space:]]//g; s/"//g; s/'"'"'//g')"
   [[ -n "$r" ]] || { echo "github: set 'repo: owner/name' in org/config.yaml" >&2; return 1; }
   printf '%s' "$r"
 }
@@ -38,6 +38,9 @@ task_mark_ready() { # <id> <lane>
 }
 
 task_claim() { # <id> — take it: drop `ready`, add `status:wip`.
+  # NOTE: best-effort, not atomic — GitHub has no label compare-and-swap, so this
+  # re-checks then edits (two calls). Safe under one worker/runner; if you ever run
+  # workers concurrently, add a real lock (e.g. assign the issue and verify assignee).
   local id="$1"
   # Re-check it's still ready; if `ready` is already gone, someone else claimed it.
   _gh issue view "$id" --json labels --jq '.labels|map(.name)|index("ready")' | grep -q '^[0-9]' || return 1

@@ -33,7 +33,7 @@ task_list_ready() {
 
 task_mark_ready() { # <id> <lane>
   local id="$1" lane="$2" src
-  src="$(ls "$BOARD"/inbox/"$id".md 2>/dev/null || ls "$BOARD"/*/"$id".md 2>/dev/null | head -1)"
+  src="$(ls "$BOARD"/inbox/"$id".md "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
   [[ -n "$src" ]] || { echo "files: task $id not found" >&2; return 1; }
   # ensure a lane line exists / is updated
   if grep -qE '^lane:' "$src"; then
@@ -56,6 +56,6 @@ task_done() { # <id>
 
 task_comment() { # <id> <text>
   local id="$1"; shift
-  local f; f="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1)"
-  [[ -n "$f" ]] && printf '\n> %s\n' "$*" >> "$f"
+  local f; f="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
+  if [[ -n "$f" ]]; then printf '\n> %s\n' "$*" >> "$f"; fi
 }
