@@ -1,0 +1,23 @@
+# .github/labels.yml — the state machine, as GitHub labels.
+# Apply with:  gh label create <name> --color <hex> --description "…"
+# (or the ./setup.sh helper). These four labels ARE the workflow.
+
+- name: ready
+  color: "16a05a"
+  description: "Director approved — the Worker may pick this up"
+
+- name: "lane:dev"
+  color: "d98419"
+  description: "Code work — routed to worker/lanes/dev.sh"
+
+- name: "lane:marketing"
+  color: "cf5a80"
+  description: "Content work — routed to worker/lanes/marketing.sh (human approval)"
+
+- name: "status:wip"
+  color: "5b57e0"
+  description: "A Worker has claimed this and is running it"
+
+- name: "status:done"
+  color: "6b7688"
+  description: "Worker finished"

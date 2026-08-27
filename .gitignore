@@ -1,0 +1,5 @@
+# produced work + local file-board state
+.artifacts/
+tasks/board/
+*.bak
+.DS_Store

@@ -1,0 +1,29 @@
+# .github/workflows/worker.yml — run the Worker in the cloud, no always-on machine.
+#
+# This is the shareable equivalent of your local scheduler: every 15 minutes
+# (and on demand) it drains anything the Director has stamped ready+lane.
+# Disable it and run worker/worker.sh locally instead if you prefer.
+name: worker
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"     # every 15 minutes
+  workflow_dispatch: {}         # run-now button in the Actions tab
+
+permissions:
+  issues: write                 # the Worker moves labels / closes issues
+  contents: read
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    env:
+      BACKEND: github
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Drain ready work
+        run: |
+          chmod +x worker/worker.sh worker/lanes/*.sh tasks/*.sh
+          ./worker/worker.sh once

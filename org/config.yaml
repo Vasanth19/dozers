@@ -1,0 +1,23 @@
+# org/config.yaml — the one organization this system runs.
+# One org, one Director, one team, two lanes. Grow later; start here.
+
+org:
+  name: "Acme"                 # your organization's name
+  team: "core"                 # the one team
+
+# Which task backend is plugged in. Swap this ONE value to change everything.
+#   github  -> GitHub Issues (shareable default; needs `gh auth login`)
+#   files   -> local markdown board (zero deps, offline, great for a first run)
+backend: github
+
+# Only used when backend: github
+repo: "OWNER/REPO"             # e.g. acme/director-worker
+
+# The lanes the Worker can execute. Each needs a script at worker/lanes/<lane>.sh
+lanes:
+  - dev                        # code work
+  - marketing                  # content work (staged for human approval)
+
+# Optional brand voice the marketing lane reads.
+brand:
+  voice: "clear, warm, no hype"
