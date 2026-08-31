@@ -57,3 +57,7 @@ task_comment() { # <id> <text>
   local id="$1"; shift
   _gh issue comment "$id" --body "$*" >/dev/null
 }
+
+task_repo() { # <id> - repo:<name> hint label, or empty
+  _gh issue view "$1" --json labels --jq '(.labels|map(.name)|map(select(startswith("repo:")))|.[0]//"")|sub("^repo:";"")'
+}

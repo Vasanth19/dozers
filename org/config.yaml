@@ -6,19 +6,46 @@ org:
   team: "core"                 # the one team
 
 # Which task backend is plugged in. Swap this ONE value to change everything.
-#   github  -> GitHub Issues (shareable default; needs `gh auth login`)
+#   linear  -> Linear (default; native OKR hierarchy). Needs LINEAR_API_KEY exported.
+#   github  -> GitHub Issues (needs `gh auth login`)
 #   files   -> local markdown board (zero deps, offline, great for a first run)
-backend: github
+backend: linear
+
+# Only used when backend: linear — the Linear team key (Initiative/Project/Issue live here).
+# Export LINEAR_API_KEY too (e.g. `source ~/.gsai/secrets/linear.env`).
+linear_team: "CFW"
 
 # Only used when backend: github
-repo: "OWNER/REPO"             # e.g. acme/director-worker
+repo: "OWNER/REPO"             # e.g. acme/dozers
 
-# The lanes the Worker can execute. Each needs a script at worker/lanes/<lane>.sh
+# The lanes the Dozer can execute. Each needs a script at dozers/lanes/<lane>.sh
 lanes:
   - dev                        # code work
   - marketing                  # content work (staged for human approval)
 
 # Optional brand voice for the marketing lane.
-# (skeleton: worker/lanes/marketing.sh has the TODO to read this, not yet wired.)
+# (skeleton: dozers/lanes/marketing.sh has the TODO to read this, not yet wired.)
 brand:
   voice: "clear, warm, no hype"
+
+# ── Where the Dozer works ────────────────────────────────────────────────────
+# When a Dozer claims a task it resolves the working directory in this order:
+#   1) the task's repo:<name> hint label      (most specific; for multi-repo orgs)
+#   2) the task's Linear TEAM key             (the org's default checkout)
+#      → a LearnLoop (LL) task lands in the learnloop repo automatically, no label
+#   3) workdir_default                         (fallback)
+workdir_default: "."
+workdirs:
+  # Linear team key → that org's default checkout (the common case)
+  CFW: "/Users/vasanth/Code/cfw-social-v2"
+  LL:  "/Users/vasanth/Code/learnloop"
+  # repo:<name> hint → a specific repo, overrides the team default (multi-repo orgs)
+  cfw-social-v2: "/Users/vasanth/Code/cfw-social-v2"
+  cfw-agent:     "/Users/vasanth/Code/cfw-agent"
+
+# ── Dev lane pipeline knobs (per-repo build/merge behavior) ──────────────────
+integration_branch: "develop"   # branch the Dozer cuts dozer/<id> off and merges back into
+branch_prefix: "dozer"           # task branch = <branch_prefix>/<task-id>, e.g. dozer/CFW-9
+worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
+model_cmd: "claude -p"           # how a dev Dozer launches its coding agent (headless)
+push: "false"                    # push the integration branch to origin after merge

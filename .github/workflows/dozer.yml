@@ -1,9 +1,9 @@
-# .github/workflows/worker.yml — run the Worker in the cloud, no always-on machine.
+# .github/workflows/dozer.yml — run the Dozer in the cloud, no always-on machine.
 #
 # This is the shareable equivalent of your local scheduler: every 15 minutes
 # (and on demand) it drains anything the Director has stamped ready+lane.
-# Disable it and run worker/worker.sh locally instead if you prefer.
-name: worker
+# Disable it and run dozers/dozer.sh locally instead if you prefer.
+name: dozer
 
 on:
   schedule:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch: {}         # run-now button in the Actions tab
 
 permissions:
-  issues: write                 # the Worker moves labels / closes issues
+  issues: write                 # the Dozer moves labels / closes issues
   contents: read
 
 jobs:
@@ -25,5 +25,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Drain ready work
         run: |
-          chmod +x worker/worker.sh worker/lanes/*.sh tasks/*.sh
-          ./worker/worker.sh once
+          chmod +x dozers/dozer.sh dozers/lanes/*.sh tasks/*.sh
+          ./dozers/dozer.sh once

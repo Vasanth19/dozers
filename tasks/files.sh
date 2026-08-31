@@ -59,3 +59,8 @@ task_comment() { # <id> <text>
   local f; f="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
   if [[ -n "$f" ]]; then printf '\n> %s\n' "$*" >> "$f"; fi
 }
+
+task_repo() { # <id> - optional repo: hint from frontmatter
+  local id="$1" ff; ff="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
+  [[ -n "$ff" ]] && _fm "$ff" repo || true
+}

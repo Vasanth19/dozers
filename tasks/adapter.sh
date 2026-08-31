@@ -29,9 +29,10 @@ fi
 BACKEND="${BACKEND:-files}"
 
 case "$BACKEND" in
+  linear)              source "$ROOT/tasks/linear.sh" ;;
   github|github-issues) source "$ROOT/tasks/github-issues.sh" ;;
   files)               source "$ROOT/tasks/files.sh" ;;
-  *) echo "adapter: unknown backend '$BACKEND' (use: github | files)" >&2; exit 1 ;;
+  *) echo "adapter: unknown backend '$BACKEND' (use: linear | github | files)" >&2; exit 1 ;;
 esac
 
 # Loud, so you always know which plug is in.

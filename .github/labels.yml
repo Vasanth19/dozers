@@ -4,20 +4,20 @@
 
 - name: ready
   color: "16a05a"
-  description: "Director approved — the Worker may pick this up"
+  description: "Director approved — the Dozer may pick this up"
 
 - name: "lane:dev"
   color: "d98419"
-  description: "Code work — routed to worker/lanes/dev.sh"
+  description: "Code work — routed to dozers/lanes/dev.sh"
 
 - name: "lane:marketing"
   color: "cf5a80"
-  description: "Content work — routed to worker/lanes/marketing.sh (human approval)"
+  description: "Content work — routed to dozers/lanes/marketing.sh (human approval)"
 
 - name: "status:wip"
   color: "5b57e0"
-  description: "A Worker has claimed this and is running it"
+  description: "A Dozer has claimed this and is running it"
 
 - name: "status:done"
   color: "6b7688"
-  description: "Worker finished"
+  description: "Dozer finished"

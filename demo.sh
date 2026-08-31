@@ -4,7 +4,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export BACKEND=files
-chmod +x "$ROOT"/director/run.sh "$ROOT"/worker/worker.sh "$ROOT"/worker/lanes/*.sh 2>/dev/null || true
+chmod +x "$ROOT"/directors/run.sh "$ROOT"/dozers/dozer.sh "$ROOT"/dozers/*/crew.sh 2>/dev/null || true
 
 BOARD="$ROOT/tasks/board"
 rm -rf "$BOARD"; mkdir -p "$BOARD"/{inbox,ready,wip,done}
@@ -18,14 +18,14 @@ title: Write the launch announcement
 EOF
 
 echo; echo "② Director triages — decides a lane for each:"
-"$ROOT/director/run.sh" triage
-"$ROOT/director/run.sh" ready 101 dev
-"$ROOT/director/run.sh" ready 102 marketing
+"$ROOT/directors/run.sh" triage
+"$ROOT/directors/run.sh" ready 101 dev
+"$ROOT/directors/run.sh" ready 102 marketing
 
-echo; echo "③ Worker drains everything that's ready+lane:"
-"$ROOT/worker/worker.sh" once
+echo; echo "③ Dozer drains everything that's ready+lane:"
+"$ROOT/dozers/dozer.sh" once
 
-echo; echo "④ What the Worker produced:"
+echo; echo "④ What the Dozer produced:"
 find "$ROOT/.artifacts" -type f 2>/dev/null | sed 's/^/   /'
 echo; echo "   board now:"; ls "$BOARD/done" | sed 's/^/   done\/ /'
-echo; echo "Done. Director decided, Worker did. That's the whole system."
+echo; echo "Done. Director decided, Dozer did. That's the whole system."
