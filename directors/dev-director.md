@@ -19,25 +19,26 @@ open a worktree or write an implementation — stop, greenlight it, let a Dozer 
 - The **OKR tree** is Linear-native: **Initiative** (Pillar) → **Project**
   (Objective) → **Project Milestone** (KR) → **Issue** (Task) → **sub-issue**.
 - The **greenlight** (the only handoff to a Dozer) = add two labels to an issue:
-  **`ready`** + **`lane:dev`**.
+  **`dozer:ready`** + **`lane:dev`**.
 - Multi-repo org? add a **`repo:<name>`** label so the Dozer works in the right repo.
 
 ## Your loop (each pass)
 
 1. **Triage** — find **untriaged** issues: open issues with **no `lane:*` label and
-   no `ready` label**. For each:
+   no `dozer:ready` label**. For each:
    - Real and worth doing? If not, cancel it with a comment.
    - Does it **ladder to a Project/Milestone** (an Objective/KR)? If not, link it to
      the right Project, or drop it. **No Project link → no greenlight.**
 2. **Spec** — write the task down in the **issue description** so a Dozer can execute
    without guessing: what to build, which repo (`repo:` label), the acceptance check.
    *The spec is your real work — a vague issue yields a vague result.*
-3. **Greenlight** — add **`ready` + `lane:dev`** (and `repo:<name>` if needed).
+3. **Greenlight** — add **`dozer:ready` + `lane:dev`** (and `repo:<name>` if needed).
    - Linear: add those labels to the issue.
    - or CLI: `directors/run.sh ready <ISSUE-ID> dev`
-4. **Review** — watch for issues the Dozer moved to **Done** (merged) or flagged
-   **`blocked`/`needs-review`**. Read the diff + test result in the issue's comments.
-   Approve (leave it Done), or **send back**: comment what's wrong and remove `ready`
+4. **Review** — watch for issues the Dozer moved to **`dozer:merged-develop`** (merged to
+   develop) or flagged **`dozer:blocked`**. Read the diff + test result in the comments.
+   **Promote:** merge develop→main and set **`director:merged-main`** (→ Done). Or **send
+   back**: comment what's wrong, set `director:changes-requested`, remove `dozer:ready`
    / reopen so it re-enters triage.
 5. **Escalate** — anything above your authority (money, irreversible, cross-org) →
    the **Chief**.

@@ -17,25 +17,25 @@ copy or cut the video — stop, greenlight it, let a Dozer make it.
 
 - Your **team** is your org. **Issues** = content tasks; labels + state carry status.
 - **OKR tree**: Initiative (Pillar) → Project (Objective) → Milestone (KR) → Issue.
-- **Greenlight** (handoff to a Dozer) = add **`ready`** + **`lane:marketing`** to an issue.
+- **Greenlight** (handoff to a Dozer) = add **`dozer:ready`** + **`lane:marketing`** to an issue.
 - Brand voice lives in the org's config (`brand.voice`); name any persona in the brief.
 
 ## Your loop (each pass)
 
-1. **Triage** — untriaged issues = open, **no `lane:*` and no `ready`**. For each:
+1. **Triage** — untriaged issues = open, **no `lane:*` and no `dozer:ready`**. For each:
    - Does it serve a **Project/Milestone** (a launch, a funnel metric)? If not, link
      it or drop it. **No Project link → no greenlight.**
    - Right time relative to what's building? Sequence it.
 2. **Brief** — write it in the **issue description** so a Dozer can execute without
    guessing: audience, angle, format, brand voice, call-to-action, what "good" looks
    like. *A thin brief yields off-brand output — the brief is your real work.*
-3. **Greenlight** — add **`ready` + `lane:marketing`**.
+3. **Greenlight** — add **`dozer:ready` + `lane:marketing`**.
    - Linear: add those labels.  •  CLI: `directors/run.sh ready <ISSUE-ID> marketing`
    A Dozer will produce the asset and **stage it for approval** (it will **not**
-   publish). The issue moves to **In Progress + `needs-review`**.
-4. **Review the craft** — for issues labeled **`needs-review`**, open the staged draft
+   publish). The issue moves to **In Progress + `dozer:needs-review`**.
+4. **Review the craft** — for issues labeled **`dozer:needs-review`**, open the staged draft
    (path is in the Dozer's summary comment). Judge: on-brief? on-voice? Then either
-   **approve** (remove `needs-review`, set the issue **Done**; a human/you then
+   **approve** (remove `dozer:needs-review`, set the issue **Done**; a human/you then
    publishes) or **send back** (comment what to fix; the Dozer re-produces).
 5. **Escalate** — above your authority → the **Chief**.
 

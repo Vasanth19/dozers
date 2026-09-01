@@ -29,13 +29,15 @@ the concrete "how" — the labels/states are the contract; use whichever access 
 
 | Meaning | In Linear |
 |---|---|
-| **Untriaged** (needs a decision) | issue with **no `lane:*` label** and **no `ready` label**, state not Done/Canceled |
-| **Greenlit** (Dozer may run it) | labels **`ready`** + **`lane:dev`** or **`lane:marketing`** |
+| **Untriaged** (needs a decision) | issue with **no `lane:*` label** and **no `dozer:ready` label**, state not Done/Canceled |
+| **Greenlit** (Dozer may run it) | labels **`dozer:ready`** + **`lane:dev`** or **`lane:marketing`** |
 | Which repo (dev, multi-repo org) | label **`repo:<name>>`** e.g. `repo:cfw-social-v2` |
-| **Claimed / running** | Dozer sets state **In Progress**, removes `ready` |
-| **Needs your review** | label **`needs-review`** (marketing drafts staged; dev merged) |
-| **Blocked** | label **`blocked`** |
-| **Done** | state **Done** (dev after merge; marketing after you approve) |
+| **Claimed / running** | Dozer swaps `dozer:ready` → **`dozer:in-progress`**, state In Progress |
+| **Dev merged to develop** | **`dozer:merged-develop`** (Dozer's terminal; you then promote) |
+| **Needs your review** | label **`dozer:needs-review`** (marketing drafts staged; dev merged) |
+| **Blocked** | label **`dozer:blocked`** |
+| **Done** | state **Done** — dev after **you promote develop→main (`director:merged-main`)**; marketing after you approve |
+| **Your decision labels** | `director:triaged`, `director:changes-requested`, `director:merged-main` |
 | **OKR ladder** | issue belongs to a **Project** (Objective) + ideally a **Milestone** (KR), under an **Initiative** (Pillar) |
 
 Team key = org: **CFW** = cfw-social, **LL** = learnloop.
@@ -46,10 +48,11 @@ Team key = org: **CFW** = cfw-social, **LL** = learnloop.
 - **Spec / brief** → write it into the issue **description** (this is your real work).
 - **Ladder** → set the issue's **Project** (and Milestone) so it maps to an OKR.
   *No Project → do not greenlight; link it or drop it.*
-- **Greenlight** → add labels `ready` + `lane:dev|lane:marketing` (+ `repo:` if dev).
-- **Review** → read `needs-review` issues + the Dozer's summary comment / staged draft.
-- **Approve** → remove `needs-review`, set state **Done**.
-- **Send back** → add a comment with what's wrong; remove `ready` so it re-triages.
+- **Greenlight** → add labels `dozer:ready` + `lane:dev|lane:marketing` (+ `repo:` if dev).
+- **Review** → read `dozer:needs-review` issues + the Dozer's summary comment / staged draft.
+- **Approve (mktg)** → remove `dozer:needs-review`, set state **Done**.
+- **Promote (dev)** → after `dozer:merged-develop`, merge develop→main, set `director:merged-main` → **Done**.
+- **Send back** → comment what's wrong, set `director:changes-requested`, remove `dozer:ready` so it re-triages.
 - **Escalate** → comment/assign to the **Chief** for anything above your authority.
 
 ## How to do each, by access method
@@ -60,7 +63,7 @@ Project/Milestone, set its workflow state, and create a comment. Map the operati
 above to the matching MCP tool call.
 
 **B) GraphQL API** (`https://api.linear.app/graphql`, header `Authorization: <key>`):
-- greenlight: `issueUpdate(id, input:{ labelIds:[...] })` adding the `ready`+lane label ids
+- greenlight: `issueUpdate(id, input:{ labelIds:[...] })` adding the `dozer:ready`+lane label ids
 - set project/milestone: `issueUpdate(id, input:{ projectId, projectMilestoneId })`
 - set state: `issueUpdate(id, input:{ stateId })`   • comment: `commentCreate(input:{ issueId, body })`
 - find untriaged: `issues(filter:{ team:{key:{eq:"CFW"}} })` then filter labels client-side

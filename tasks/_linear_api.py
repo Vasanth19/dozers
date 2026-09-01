@@ -10,11 +10,12 @@ Env it reads:
   LINEAR_TEAM      a single team key, e.g. "CFW"                   — single-team
                    (LINEAR_TEAMS wins if both are set)
 
-State machine (mirrors the other backends' labels):
-  greenlight  -> label  ready
-  lanes       -> labels lane:<name>
-  claimed     -> issue moves to a `started` state (removes `ready`)
-  done        -> issue moves to a `completed` state
+Label lifecycle (dozer:* = execution; lane:/repo: = routing):
+  greenlight -> dozer:ready + lane:<name>          (a Director sets both)
+  claimed    -> dozer:in-progress, state started    (drops dozer:ready)
+  dev done   -> dozer:merged-develop                (Director then promotes -> director:merged-main)
+  mktg done  -> dozer:needs-review                  (human approval gate)
+  failed     -> dozer:blocked
 Each mutation resolves the *issue's own* team, so multi-team ops are correct.
 """
 import json, os, sys, urllib.request
@@ -116,12 +117,34 @@ def _has(labels, name):
     return any(n["name"] == name for n in labels)
 
 
+# --- dozer:* execution-lifecycle labels (lane:/repo: are routing, unchanged) --
+READY = "dozer:ready"               # greenlight (a Director sets this + a lane:)
+INPROG = "dozer:in-progress"        # claimed, being worked
+NEEDSREVIEW = "dozer:needs-review"  # mktg staged for human approval
+MERGEDDEV = "dozer:merged-develop"  # dev merged to develop (Director then promotes)
+BLOCKED = "dozer:blocked"           # failure off-ramp
+_COLOR = {READY: "#16a05a", INPROG: "#fbca04", NEEDSREVIEW: "#d876e3",
+          MERGEDDEV: "#0e8a16", BLOCKED: "#b60205"}
+
+
 def set_labels_and_state(iss, label_ids, state_id_=None):
     inp = {"labelIds": label_ids}
     if state_id_:
         inp["stateId"] = state_id_
     gql('mutation($id:String!,$in:IssueUpdateInput!){ issueUpdate(id:$id,input:$in){ success } }',
         {"id": iss["id"], "in": inp})
+
+
+def _relabel(iss, add=(), remove=(), state_type=None):
+    """Add/remove labels by name (resolving/creating ids in the issue's own team)."""
+    rm = set(remove)
+    keep = [n["id"] for n in iss["labels"]["nodes"] if n["name"] not in rm]
+    for name in add:
+        lid = ensure_label(iss["team"]["id"], name, _COLOR.get(name, "#6b7688"))
+        if lid not in keep:
+            keep.append(lid)
+    sid = state_id(iss["team"]["id"], state_type) if state_type else None
+    set_labels_and_state(iss, keep, sid)
 
 
 # --- the verbs (all multi-team aware) ----------------------------------------
@@ -131,7 +154,7 @@ def list_untriaged():
         if i["state"]["type"] in ("completed", "canceled"):
             continue
         labels = i["labels"]["nodes"]
-        if _lane_of(labels) is None and not _has(labels, "ready"):
+        if _lane_of(labels) is None and not _has(labels, READY):
             print(f'{i["identifier"]}\t{i["title"]}')
 
 
@@ -141,33 +164,39 @@ def list_ready():
             continue
         labels = i["labels"]["nodes"]
         lane = _lane_of(labels)
-        if _has(labels, "ready") and lane:
+        if _has(labels, READY) and lane:
             print(f'{i["identifier"]}\t{lane}\t{i["title"]}')
 
 
 def mark_ready(identifier, lane):
     iss = issue(identifier)
-    tid = iss["team"]["id"]
-    ready_id = ensure_label(tid, "ready", "#16a05a")
-    lane_id = ensure_label(tid, f"lane:{lane}", "#d98419")
-    have = {n["id"] for n in iss["labels"]["nodes"]} | {ready_id, lane_id}
-    set_labels_and_state(iss, list(have))
-    print(f"{identifier} -> ready + lane:{lane}")
+    ensure_label(iss["team"]["id"], f"lane:{lane}", "#d98419")
+    _relabel(iss, add=[READY, f"lane:{lane}"])
+    print(f"{identifier} -> {READY} + lane:{lane}")
 
 
 def claim(identifier):
     iss = issue(identifier)
-    labels = iss["labels"]["nodes"]
-    if not _has(labels, "ready"):
-        sys.exit(1)  # already claimed (ready is gone)
-    keep = [n["id"] for n in labels if n["name"] != "ready"]
-    set_labels_and_state(iss, keep, state_id(iss["team"]["id"], "started"))
+    if not _has(iss["labels"]["nodes"], READY):
+        sys.exit(1)  # already claimed (dozer:ready is gone)
+    _relabel(iss, add=[INPROG], remove=[READY], state_type="started")
 
 
-def done(identifier):
-    iss = issue(identifier)
-    keep = [n["id"] for n in iss["labels"]["nodes"] if n["name"] != "ready"]
-    set_labels_and_state(iss, keep, state_id(iss["team"]["id"], "completed"))
+def merged(identifier):      # dev lane: merged to develop (Dozer terminal; Director promotes)
+    _relabel(issue(identifier), add=[MERGEDDEV], remove=[INPROG])
+
+
+def review(identifier):      # mktg lane: staged for human approval
+    _relabel(issue(identifier), add=[NEEDSREVIEW], remove=[READY, INPROG])
+
+
+def block(identifier):       # failure off-ramp
+    _relabel(issue(identifier), add=[BLOCKED], remove=[INPROG])
+
+
+def done(identifier):        # fully done (e.g. a Director after develop->main promotion)
+    _relabel(issue(identifier), remove=[READY, INPROG, MERGEDDEV, NEEDSREVIEW, BLOCKED],
+             state_type="completed")
 
 
 def repo(identifier):
@@ -176,38 +205,26 @@ def repo(identifier):
             print(n["name"][len("repo:"):]); return
 
 
-def review(identifier):
-    iss = issue(identifier)
-    nr = ensure_label(iss["team"]["id"], "needs-review", "#d876e3")
-    keep = [n["id"] for n in iss["labels"]["nodes"] if n["name"] != "ready"]
-    if nr not in keep: keep.append(nr)
-    set_labels_and_state(iss, keep)   # stays In Progress + needs-review; NOT done
-
-
 def list_inflight():
-    # Claimed-but-not-finished: state `started`, has a lane, ready is gone, and NOT
-    # awaiting human review (needs-review). These are the tasks a reaper checks for
-    # a live worker; the ones without one get requeued.
+    # Claimed-but-not-finished: state `started`, has a lane, no dozer:ready, and NOT
+    # awaiting human review. These are what a reaper checks for a live worker; the ones
+    # without one get requeued.
     for i in _all_issues():
         if i["state"]["type"] != "started":
             continue
         labels = i["labels"]["nodes"]
-        if _has(labels, "needs-review"):
+        if _has(labels, NEEDSREVIEW):
             continue
         lane = _lane_of(labels)
-        if lane and not _has(labels, "ready"):
+        if lane and not _has(labels, READY):
             print(f'{i["identifier"]}\t{lane}\t{i["title"]}')
 
 
 def requeue(identifier):
-    # Undo a claim: re-add `ready` and move the issue back to an unstarted state so
+    # Undo a claim: re-add dozer:ready, drop in-progress, back to unstarted so
     # list_ready() picks it up again. The lane label is preserved.
-    iss = issue(identifier)
-    tid = iss["team"]["id"]
-    ready_id = ensure_label(tid, "ready", "#16a05a")
-    have = {n["id"] for n in iss["labels"]["nodes"]} | {ready_id}
-    set_labels_and_state(iss, list(have), state_id(tid, "unstarted"))
-    print(f"{identifier} -> requeued (ready + unstarted)")
+    _relabel(issue(identifier), add=[READY], remove=[INPROG], state_type="unstarted")
+    print(f"{identifier} -> requeued ({READY} + unstarted)")
 
 
 def team(identifier):
@@ -225,11 +242,13 @@ OPS = {
     "list-ready": lambda a: list_ready(),
     "mark-ready": lambda a: mark_ready(a[0], a[1]),
     "claim": lambda a: claim(a[0]),
+    "merged": lambda a: merged(a[0]),
+    "review": lambda a: review(a[0]),
+    "block": lambda a: block(a[0]),
     "done": lambda a: done(a[0]),
     "comment": lambda a: comment(a[0], a[1]),
     "repo": lambda a: repo(a[0]),
     "team": lambda a: team(a[0]),
-    "review": lambda a: review(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
 }
