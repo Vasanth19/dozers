@@ -72,7 +72,7 @@ Two things run:
   **Linear access** (Linear MCP, or `LINEAR_API_KEY`).
 
 > Agents only get the text you paste in — a linked file isn't auto-loaded. So
-> concatenate the two: `cat "$DOZERS_HOME"/directors/<role>.md "$DOZERS_HOME"/directors/LINEAR.md`
+> concatenate the two: `"$DOZERS_HOME"/directors/build-prompt.sh <role>`
 > becomes the agent's system prompt.
 
 **Set the repo location first** (agents run from anywhere, so use absolute paths):
@@ -102,7 +102,7 @@ on a timer (`cron`/`launchd`) or interactively:
 
 ```bash
 # Claude Code — one triage+review pass for team CFW:
-claude -p "$(cat "$DOZERS_HOME"/directors/dev-director.md "$DOZERS_HOME"/directors/LINEAR.md)
+claude -p "$("$DOZERS_HOME"/directors/build-prompt.sh dev-director)
 
 Do one pass now for Linear team CFW."
 

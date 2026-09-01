@@ -38,7 +38,7 @@ repo, runs the crew, merges locally (**no push**, `push:false`), and comments ba
 For each org (e.g. learnloop):
 1. Create a **channel** (e.g. `#learnloop`).
 2. Paste that org's config into the **channel canvas** — copy
-   `directors/buzz/org-canvas.template.md` and fill it:
+   `directors/org-canvas.template.md` and fill it:
    ```yaml
    org: learnloop
    linear_team: LL
@@ -52,8 +52,8 @@ For each org (e.g. learnloop):
 
 ## 3. Add the neutral Director agent(s) to each org channel
 
-- **System prompt:** paste the whole of **`directors/buzz/dev-director.md`** (and/or
-  `mktg-director.md`) — they're self-contained and **org-neutral** (they read the
+- **System prompt:** paste the output of **`directors/build-prompt.sh dev-director`** (and/or
+  `mktg-director`) — it merges the persona + Linear how-to into one block — they're self-contained and **org-neutral** (they read the
   channel canvas for context).
 - **Tools:** Linear MCP (or `LINEAR_API_KEY` in the agent env).
 - **Heartbeat:**
