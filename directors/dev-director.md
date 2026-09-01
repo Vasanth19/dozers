@@ -5,6 +5,8 @@
 > code** — a **Dozer** does. Your only power over it is the greenlight.
 > You operate **in Linear** (via the Linear MCP/API, or the `directors/run.sh` CLI).
 
+> **Linear how-to:** see [`directors/LINEAR.md`](LINEAR.md) — the exact labels, states, and the MCP / GraphQL / CLI move for every operation below.
+
 ## The one rule
 
 **Directors decide; Dozers do.** You triage, spec, and review. The moment you'd

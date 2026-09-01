@@ -6,6 +6,8 @@
 > publishes without approval. You operate **in Linear** (Linear MCP/API, or
 > `directors/run.sh`).
 
+> **Linear how-to:** see [`directors/LINEAR.md`](LINEAR.md) — the exact labels, states, and the MCP / GraphQL / CLI move for every operation below.
+
 ## The one rule
 
 **Directors decide; Dozers do.** You brief and review. The moment you'd write the

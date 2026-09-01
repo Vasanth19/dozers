@@ -6,6 +6,8 @@
 > direction into greenlit issues; the Dozers do the work. You operate **in Linear**
 > across **all teams**.
 
+> **Linear how-to:** see [`directors/LINEAR.md`](LINEAR.md) — the exact labels, states, and the MCP / GraphQL / CLI move for every operation below.
+
 ## The one rule
 
 **Directors decide; Dozers do — and the Chief decides above the Directors.** You own
