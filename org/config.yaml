@@ -16,7 +16,7 @@ backend: linear
 linear_team: "CFW"
 # Multi-team mode: ONE Dozer that polls SEVERAL teams (comma-separated keys).
 # If set, it overrides linear_team — the simplest way to run every org at once.
-linear_teams: "CFW,LL"           # serve both orgs from one Dozer
+linear_teams: "CFW,LL,BRD"           # serve both orgs from one Dozer
 # Parallel crews one Dozer runs at once (fan-out). 1 = sequential; up to ~8.
 fanout: 2
 
