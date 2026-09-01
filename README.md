@@ -65,15 +65,22 @@ Dozer drains both and produces artifacts. That's the entire loop, offline.
 Two things run:
 
 - **The Dozer** (does) is just a shell loop — run it anywhere:
-  `dozers/dozer.sh loop` (serve many orgs at once via `linear_teams`, run crews in
-  parallel via `fanout`). It needs `LINEAR_API_KEY` exported.
+  `"$DOZERS_HOME"/dozers/dozer.sh loop` (serve many orgs at once via `linear_teams`,
+  run crews in parallel via `fanout`). It needs `LINEAR_API_KEY` exported.
 - **The Directors** (decide) are AI agents — run **one per role/team**, each loaded
   with its persona **plus** [`directors/LINEAR.md`](directors/LINEAR.md), and given
   **Linear access** (Linear MCP, or `LINEAR_API_KEY`).
 
 > Agents only get the text you paste in — a linked file isn't auto-loaded. So
-> concatenate the two: `cat directors/<role>.md directors/LINEAR.md` becomes the
-> agent's system prompt.
+> concatenate the two: `cat "$DOZERS_HOME"/directors/<role>.md "$DOZERS_HOME"/directors/LINEAR.md`
+> becomes the agent's system prompt.
+
+**Set the repo location first** (agents run from anywhere, so use absolute paths):
+
+```bash
+export DOZERS_HOME=/Users/vasanth/Code/dozers   # absolute path to this repo
+export LINEAR_API_KEY=...                         # e.g. source your vault
+```
 
 ### Buzz (heartbeat-driven, unattended)
 
@@ -95,7 +102,7 @@ on a timer (`cron`/`launchd`) or interactively:
 
 ```bash
 # Claude Code — one triage+review pass for team CFW:
-claude -p "$(cat directors/dev-director.md directors/LINEAR.md)
+claude -p "$(cat "$DOZERS_HOME"/directors/dev-director.md "$DOZERS_HOME"/directors/LINEAR.md)
 
 Do one pass now for Linear team CFW."
 
