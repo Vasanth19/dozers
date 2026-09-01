@@ -20,13 +20,15 @@ POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
 
-# Resolve a task's working dir, most-specific first:
-#   1) repo:<name> hint on the task   2) the task's TEAM/org   3) workdir_default
+# Resolve a task's working dir from the CANONICAL registry (~/ecosystem/ecosystem.yaml),
+# most-specific first:
+#   1) repo:<id> hint on the task   2) the task's Linear TEAM/org   3) config workdir_default
+# Paths live ONLY in ecosystem.yaml — never hardcoded here or in a label.
 resolve_workdir() {
   local hint="$1" team="$2" cfgf="$ROOT/org/config.yaml" path=""
-  _wd() { grep -E "^[[:space:]]+$1:" "$cfgf" 2>/dev/null | head -1 | sed 's/^[[:space:]]*[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
-  [[ -n "$hint" ]] && path="$(_wd "$hint")"
-  [[ -z "$path" && -n "$team" ]] && path="$(_wd "$team")"
+  # Canonical source: ecosystem.yaml (repo id -> local, or Linear team -> org default repo)
+  path="$(python3 "$ROOT/tasks/ecosystem_workdir.py" ${hint:+--repo "$hint"} ${team:+--team "$team"} 2>/dev/null || true)"
+  # Fallback: config workdir_default, then the dozers repo root.
   [[ -z "$path" ]] && path="${WORKDIR_DEFAULT:-$(grep -E '^workdir_default:' "$cfgf" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true)}"
   [[ -z "$path" || "$path" == "." ]] && path="$ROOT"
   path="${path/#\~/$HOME}"

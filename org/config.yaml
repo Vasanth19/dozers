@@ -34,19 +34,16 @@ brand:
   voice: "clear, warm, no hype"
 
 # ── Where the Dozer works ────────────────────────────────────────────────────
-# When a Dozer claims a task it resolves the working directory in this order:
-#   1) the task's repo:<name> hint label      (most specific; for multi-repo orgs)
-#   2) the task's Linear TEAM key             (the org's default checkout)
+# CANONICAL: paths are resolved from ~/ecosystem/ecosystem.yaml via
+# tasks/ecosystem_workdir.py — NEVER hardcoded here or in a label. Order:
+#   1) the task's repo:<id> hint  -> ecosystem.yaml project.id == id   (multi-repo orgs)
+#   2) the task's Linear team key -> the org whose linear_team == KEY, its default repo
 #      → a LearnLoop (LL) task lands in the learnloop repo automatically, no label
-#   3) workdir_default                         (fallback)
+#   3) workdir_default            (last-resort fallback only if the registry misses)
+#
+# The old hardcoded `workdirs:` map was REMOVED 2026-08-31 — ecosystem.yaml is the
+# single source of truth. Register new repos there (id, org, local), not here.
 workdir_default: "."
-workdirs:
-  # Linear team key → that org's default checkout (the common case)
-  CFW: "/Users/vasanth/Code/cfw-social-v2"
-  LL:  "/Users/vasanth/initiatives/learnloop/learnloop"
-  # repo:<name> hint → a specific repo, overrides the team default (multi-repo orgs)
-  cfw-social-v2: "/Users/vasanth/Code/cfw-social-v2"
-  cfw-agent:     "/Users/vasanth/Code/cfw-agent"
 
 # ── Dev lane pipeline knobs (per-repo build/merge behavior) ──────────────────
 integration_branch: "develop"   # branch the Dozer cuts dozer/<id> off and merges back into
