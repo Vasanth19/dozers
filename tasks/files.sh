@@ -12,7 +12,7 @@
 #   tasks/board/done/    finished
 
 BOARD="$ROOT/tasks/board"
-mkdir -p "$BOARD"/{inbox,ready,wip,done}
+mkdir -p "$BOARD"/{inbox,ready,wip,review,done}
 
 # frontmatter helper: read a `key: value` from a task file
 _fm() { grep -E "^$2:" "$1" 2>/dev/null | head -1 | sed "s/^$2:[[:space:]]*//"; }
@@ -63,4 +63,11 @@ task_comment() { # <id> <text>
 task_repo() { # <id> - optional repo: hint from frontmatter
   local id="$1" ff; ff="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
   [[ -n "$ff" ]] && _fm "$ff" repo || true
+}
+task_team() { # <id> - optional team: frontmatter (usually empty for files backend)
+  local id="$1" ff; ff="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
+  [[ -n "$ff" ]] && _fm "$ff" team || true
+}
+task_review() { # <id> - stage for approval: wip -> review (not done)
+  local id="$1"; mv "$BOARD/wip/$id.md" "$BOARD/review/$id.md" 2>/dev/null || true
 }

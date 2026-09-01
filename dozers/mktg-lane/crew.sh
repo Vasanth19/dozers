@@ -1,37 +1,70 @@
 #!/usr/bin/env bash
 # dozers/mktg-lane/crew.sh — the MARKETING lane crew.
 #
-# The engine hands this an already-claimed task and, via env:
-#   WORKDIR        the project checkout to work in (resolved from the repo: hint)
-#   DOZER_PERSONA  path to this lane's persona (dozers/mktg-lane/dozer.md)
-#   REPO_ROOT      the dozers repo root (for artifacts/summaries)
+# The engine has claimed the task and cd'd us into the project. Env in:
+#   WORKDIR        the project checkout (we work here)
+#   DOZER_PERSONA  this lane's persona (dozers/mktg-lane/dozer.md)
+#   REPO_ROOT      the dozers repo root (artifacts + config)
+#
+# Pipeline: load brand voice → produce the asset → STAGE it for approval.
+# It NEVER publishes — the human approval gate is the whole point. The engine
+# then flips the task to needs-review (not done).
+#
+# Config/env: model_cmd (content model, default claude -p), DRY_RUN=1 (placeholder
+#   draft, no model). Drafts are staged under <workdir>/.dozers-review/<id>.md.
 set -euo pipefail
 ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 WORKDIR="${WORKDIR:-.}"; DOZER_PERSONA="${DOZER_PERSONA:-}"
 OUT="$REPO_ROOT/.artifacts/mktg"; mkdir -p "$OUT"
 
-# 0. Enter the project and load the agents.
-cd "$WORKDIR" 2>/dev/null || true
-echo "    [mktg] cwd=$(pwd)"
-[[ -n "$DOZER_PERSONA" ]] && echo "    [mktg] persona: $DOZER_PERSONA"
-[[ -f AGENTS.md ]] && echo "    [mktg] + project AGENTS.md"
-[[ -f CLAUDE.md ]] && echo "    [mktg] + project CLAUDE.md"
+cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
+VOICE="$(grep -E '^[[:space:]]*voice:' "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*voice:[[:space:]]*//; s/"//g' || true)"; VOICE="${VOICE:-clear, warm, no hype}"
+MODEL_CMD="${MODEL_CMD:-$(cfg model_cmd)}"; MODEL_CMD="${MODEL_CMD:-claude -p}"
 
-echo "    [mktg] working #$ID: $TITLE"
-# TODO: hand spec + persona + project agents + skills to your model here.
+cd "$WORKDIR" 2>/dev/null || true
+echo "    [mktg] cwd=$(pwd)  voice=\"$VOICE\""
+[[ -n "$DOZER_PERSONA" ]] && echo "    [mktg] persona: $DOZER_PERSONA" || true
+
+REVIEW_DIR="$WORKDIR/.dozers-review"; mkdir -p "$REVIEW_DIR"
+DRAFT="$REVIEW_DIR/$ID.md"
+
+# ── produce the asset (staged, never published) ──────────────────────────────
+if [[ "${DRY_RUN:-}" == "1" ]]; then
+  cat > "$DRAFT" <<EOF
+# DRAFT — needs approval — #$ID
+brief: $TITLE
+voice: $VOICE
+---
+[placeholder draft produced in DRY_RUN — real copy comes from the content model]
+EOF
+  echo "    [mktg] DRY_RUN — wrote placeholder draft"
+else
+  read -r -d '' PROMPT <<EOF || true
+You are a Dozer producing a marketing asset. Brand voice: $VOICE.
+Persona/rules: $DOZER_PERSONA
+Output ONLY the finished asset (no preamble). Brief #$ID: $TITLE
+EOF
+  eval "$MODEL_CMD \"\$PROMPT\"" > "$DRAFT" 2>/dev/null || { echo "    [mktg] ✗ content model failed" >&2; exit 1; }
+  [[ -s "$DRAFT" ]] || { echo "    [mktg] ✗ empty draft" >&2; exit 1; }
+  echo "    [mktg] produced draft via model"
+fi
+
+echo "    [mktg] staged for approval: $DRAFT  (NOT published)"
 
 cat > "$OUT/$ID.md" <<EOF
-# MARKETING result for #$ID
-task: $TITLE
-workdir: $(pwd)
-built_by: dozers/mktg-lane/crew.sh
+# MARKETING draft for #$ID  (awaiting approval)
+brief: $TITLE
+draft: $DRAFT
+status: NEEDS REVIEW — nothing publishes until a human approves
 EOF
 
+if [[ "${DRY_RUN:-}" == "1" ]]; then made="placeholder draft (dry-run)"; else made="draft via content model"; fi
 cat > "$OUT/$ID.summary" <<EOF
 - Picked up: $TITLE
-- Entered project: $(pwd)
-- Loaded brand voice
-- Produced draft; staged for approval (NOT published)
-- Awaiting human review
+- Loaded brand voice: $VOICE
+- Produced: $made
+- Staged → $DRAFT (NOT published)
+- Awaiting human approval
 EOF
+echo "    [mktg] done #$ID (staged)"

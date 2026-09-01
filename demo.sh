@@ -4,6 +4,11 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export BACKEND=files
+export DRY_RUN=1            # offline demo: don't launch a real model
+DEMO_REPO="$ROOT/.artifacts/demo-project"; rm -rf "$DEMO_REPO"; mkdir -p "$DEMO_REPO"
+( cd "$DEMO_REPO" && git init -q -b main && git config user.email d@d.co && git config user.name demo \
+  && echo "# demo" > README.md && git add -A && git commit -q -m init && git branch develop )
+export WORKDIR_DEFAULT="$DEMO_REPO"
 chmod +x "$ROOT"/directors/run.sh "$ROOT"/dozers/dozer.sh "$ROOT"/dozers/*/crew.sh 2>/dev/null || true
 
 BOARD="$ROOT/tasks/board"

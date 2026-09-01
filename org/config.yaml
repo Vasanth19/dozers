@@ -14,6 +14,11 @@ backend: linear
 # Only used when backend: linear — the Linear team key (Initiative/Project/Issue live here).
 # Export LINEAR_API_KEY too (e.g. `source ~/.gsai/secrets/linear.env`).
 linear_team: "CFW"
+# Multi-team mode: ONE Dozer that polls SEVERAL teams (comma-separated keys).
+# If set, it overrides linear_team — the simplest way to run every org at once.
+linear_teams: ""                 # e.g. "CFW,LL"
+# Parallel crews one Dozer runs at once (fan-out). 1 = sequential; up to ~8.
+fanout: 1
 
 # Only used when backend: github
 repo: "OWNER/REPO"             # e.g. acme/dozers

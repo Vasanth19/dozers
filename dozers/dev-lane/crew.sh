@@ -36,7 +36,7 @@ INTEG="${INTEGRATION_BRANCH:-$(cfg integration_branch)}"; INTEG="${INTEG:-develo
 MODEL_CMD="${MODEL_CMD:-$(cfg model_cmd)}"; MODEL_CMD="${MODEL_CMD:-claude -p}"
 PUSH="${PUSH:-$(cfg push)}"
 PREFIX="${BRANCH_PREFIX:-$(cfg branch_prefix)}"; PREFIX="${PREFIX:-dozer}"
-WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.dozers/worktrees}"; mkdir -p "$WT_ROOT"
+WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.dozers/worktrees}"; WT_ROOT="${WT_ROOT/#\~/$HOME}"; mkdir -p "$WT_ROOT"
 BRANCH="$PREFIX/$ID"
 SLUG="$(basename "$WORKDIR")"
 WT="$WT_ROOT/$SLUG-$ID"
