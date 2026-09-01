@@ -1,73 +1,82 @@
-# Live dev run on learnloop — Buzz Director + Dozer
+# Dozers × Buzz — neutral Directors, one channel per org
 
-Goal: a real learnloop dev task greenlit by a **Buzz Director** and built by a
-**Dozer** end-to-end, on your machine, **no push** (fully reversible).
+The model:
+- **One Dozer** (the doer) runs **unscoped** — it serves *every* org in `linear_teams`.
+- **Neutral Director agents** (the deciders) — the *same* agent definition works for
+  every org. Each org gets its own **Buzz channel**, and that channel's **canvas**
+  holds the org config. The Director reads the canvas to learn which org / Linear team
+  it's serving. Add one org → new channel + canvas, no new agent code.
 
-**Already done for you:**
-- ✅ ab-hustler **stopped** (so nothing collides on the learnloop repo).
-  *Restart it later with:* `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gsai.ab-hustler.plist`
-- ✅ Dozers **configured**: `org/config.yaml` → `linear_teams: "CFW,LL"`, `fanout: 2`,
-  `push: "false"` (nothing leaves your machine), `LL → /Users/vasanth/initiatives/learnloop/learnloop`.
+```
+Buzz:  #cfw-social (canvas: team CFW …)   #learnloop (canvas: team LL …)   #… 
+          │ Dev-Director + Mktg-Director      │ same neutral agents
+          │  read canvas → work team CFW       │  read canvas → work team LL
+          ▼ greenlight ready+lane in Linear    ▼
+   ────────────────────────────────────────────────────────────
+   ONE Dozer:  dozers/dozer.sh loop   (linear_teams: "CFW,LL" → routes each task
+                                        to its org's repo; fanout parallel)
+```
+
+**Already set up:** ab-hustler stopped; `org/config.yaml` → `linear_teams:"CFW,LL"`,
+`fanout:2`, `push:"false"`, `workdirs` map team→repo. Restart ab-hustler later:
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gsai.ab-hustler.plist`
 
 ---
 
-## 0. Prereqs (one terminal)
+## 1. Start the Dozer (unscoped — runs for everybody)
 
 ```bash
 export DOZERS_HOME=/Users/vasanth/Code/dozers
-source ~/ecosystem/vault/linear.env        # exports LINEAR_API_KEY
+source ~/ecosystem/vault/linear.env      # LINEAR_API_KEY
+"$DOZERS_HOME"/dozers/dozer.sh loop        # serves CFW + LL (all of linear_teams)
 ```
+It polls every configured team, and for each `ready`+`lane` issue routes to that org's
+repo, runs the crew, merges locally (**no push**, `push:false`), and comments back.
 
-## 1. Start the Dozer (the doer) — scope it to learnloop for this first run
+## 2. Per org: a Buzz channel + a canvas
 
-```bash
-LINEAR_TEAM=LL "$DOZERS_HOME"/dozers/dozer.sh loop
-```
-It polls team **LL** every 30s, and for any `ready`+`lane:dev` issue it: cuts a
-`dozer/<id>` worktree off `develop` in the learnloop checkout, runs the coding agent
-(`claude -p`) to implement + test, **merges to LOCAL `develop` (no push)**, and posts
-a ≤10-line summary back on the Linear issue. Leave this running.
+For each org (e.g. learnloop):
+1. Create a **channel** (e.g. `#learnloop`).
+2. Paste that org's config into the **channel canvas** — copy
+   `directors/buzz/org-canvas.template.md` and fill it:
+   ```yaml
+   org: learnloop
+   linear_team: LL
+   lanes: [dev, marketing]
+   repos: [learnloop]
+   brand_voice: "clear, warm, no hype"
+   okr: "Linear Initiative 'learnloop' -> Projects + Milestones"
+   escalate_to: "Chief / Vasanth"
+   ```
+   Keep `linear_team` in sync with the Dozer's `linear_teams` + `workdirs`.
 
-> Scoping to `LINEAR_TEAM=LL` for the first run keeps it off the CFW board. Later,
-> drop the override to serve `CFW,LL` together.
+## 3. Add the neutral Director agent(s) to each org channel
 
-## 2. Create the Buzz Director (the decider)
-
-In the Buzz app, create an agent:
-- **System prompt / instructions:** paste the entire contents of
-  **`directors/buzz/dev-director-LL.md`** (it's self-contained — persona + the Linear
-  how-to). *Agents only get pasted text, so paste the whole file.*
-- **Tools:** give it the **Linear MCP** (or set `LINEAR_API_KEY` in its env).
-- **Heartbeat** (so it works the board unattended):
+- **System prompt:** paste the whole of **`directors/buzz/dev-director.md`** (and/or
+  `mktg-director.md`) — they're self-contained and **org-neutral** (they read the
+  channel canvas for context).
+- **Tools:** Linear MCP (or `LINEAR_API_KEY` in the agent env).
+- **Heartbeat:**
   ```
   BUZZ_ACP_HEARTBEAT_INTERVAL=1200
-  BUZZ_ACP_HEARTBEAT_PROMPT=You are the learnloop Dev-Director. Check Linear team LL: triage untriaged issues (spec them in the description, then greenlight with labels ready + lane:dev), and review anything labeled needs-review (approve → Done, or send back with a comment). Decide only; never write code — the Dozer builds what you greenlight.
+  BUZZ_ACP_HEARTBEAT_PROMPT=You are a Director in this org's channel. Read this channel's canvas for your org context (org, linear_team, lanes, repos, brand_voice, okr). Then work that Linear team: triage untriaged issues (spec + greenlight ready + the right lane), and review needs-review items (approve, or send back with a note). Decide only; never execute — the Dozer builds what you greenlight.
   ```
+The same two agent definitions get dropped into every org's channel; the canvas makes
+them org-specific.
 
-## 3. Do the live run
+## 4. The live run
 
-1. **File a small task** in Linear team **LL** (or let the Director find one). Keep it
-   tiny for the first run, e.g. *"Add a /health endpoint returning {ok:true}"*.
-2. The **Director** (on its next heartbeat, or trigger it) triages → writes the spec in
-   the issue description → adds labels **`ready` + `lane:dev`** (+ `repo:` only if the
-   task targets a non-default learnloop repo).
-3. The **Dozer** (step 1) picks it up within ~30s → worktree → `claude -p` implements +
-   runs `npm test` → merges to local `develop` → comments the summary on the issue.
-4. **You review**: the Linear issue shows claim + done comments; the code is on local
-   `develop` in `/Users/vasanth/initiatives/learnloop/learnloop` (not pushed).
+File a small task in an org's Linear team (e.g. LL: *"Add a /health endpoint"*). The
+channel's Director reads the canvas → confirms team LL → specs it → greenlights
+`ready`+`lane:dev`. The unscoped Dozer picks it up → builds it in the learnloop repo →
+merges local `develop` (no push) → comments the summary. You review.
 
-## 4. Verify / rollback
+## Verify / rollback
+- Built code: `git -C /Users/vasanth/initiatives/learnloop/learnloop log --oneline develop | head`
+- Undo (nothing pushed): `git -C /Users/vasanth/initiatives/learnloop/learnloop reset --hard origin/develop`
+- Stop Dozer: Ctrl-C. Restart ab-hustler: the `launchctl bootstrap …` line above.
 
-- **See what it built:** `git -C /Users/vasanth/initiatives/learnloop/learnloop log --oneline develop | head`
-- **Undo the merge (nothing was pushed):**
-  `git -C /Users/vasanth/initiatives/learnloop/learnloop reset --hard origin/develop`
-- **Stop the Dozer:** Ctrl-C the loop.
-- **Restart ab-hustler when done:**
-  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gsai.ab-hustler.plist`
-
-## Safety rails in effect
-
-- `push: "false"` → the Dozer never pushes; all merges are local `develop`.
-- ab-hustler stopped → no second engine touching learnloop.
-- Worktrees are isolated (`dozer/<id>`), cleaned up after each task.
-- First run scoped to `LINEAR_TEAM=LL` → CFW untouched.
+## Adding more orgs later
+Create their Linear team → add its key to `linear_teams` + path to `workdirs` in
+`org/config.yaml` → new Buzz channel + canvas. No agent changes. (Free Linear plan
+caps at 2 teams; more orgs need a paid plan.)
