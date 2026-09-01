@@ -65,3 +65,12 @@ task_team() { printf ""; }   # GitHub has no teams; workdir falls back to defaul
 task_review() { # <id> - add needs-review label, do NOT close
   _gh issue edit "$1" --add-label "needs-review" --remove-label "status:wip" >/dev/null 2>&1 || true
 }
+
+# --- recovery verbs (used by dozers/reaper.sh) --------------------------------
+task_list_inflight() { # open issues claimed (status:wip) but NOT awaiting human review
+  _gh issue list --state open --label "status:wip" --json number,title,labels \
+    --jq '.[] | select((.labels|map(.name)|index("needs-review"))|not) | . as $i | (.labels|map(.name)|map(select(startswith("lane:")))[0] // "lane:none") as $lane | "\($i.number)\t\($lane|ltrimstr("lane:"))\t\($i.title)"'
+}
+task_requeue() { # <id> - put a stranded wip issue back to ready (keeps its lane label)
+  _gh issue edit "$1" --remove-label "status:wip" --add-label "ready" >/dev/null 2>&1 || return 1
+}

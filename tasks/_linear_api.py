@@ -184,6 +184,32 @@ def review(identifier):
     set_labels_and_state(iss, keep)   # stays In Progress + needs-review; NOT done
 
 
+def list_inflight():
+    # Claimed-but-not-finished: state `started`, has a lane, ready is gone, and NOT
+    # awaiting human review (needs-review). These are the tasks a reaper checks for
+    # a live worker; the ones without one get requeued.
+    for i in _all_issues():
+        if i["state"]["type"] != "started":
+            continue
+        labels = i["labels"]["nodes"]
+        if _has(labels, "needs-review"):
+            continue
+        lane = _lane_of(labels)
+        if lane and not _has(labels, "ready"):
+            print(f'{i["identifier"]}\t{lane}\t{i["title"]}')
+
+
+def requeue(identifier):
+    # Undo a claim: re-add `ready` and move the issue back to an unstarted state so
+    # list_ready() picks it up again. The lane label is preserved.
+    iss = issue(identifier)
+    tid = iss["team"]["id"]
+    ready_id = ensure_label(tid, "ready", "#16a05a")
+    have = {n["id"] for n in iss["labels"]["nodes"]} | {ready_id}
+    set_labels_and_state(iss, list(have), state_id(tid, "unstarted"))
+    print(f"{identifier} -> requeued (ready + unstarted)")
+
+
 def team(identifier):
     print(issue(identifier)["team"]["key"])
 
@@ -204,6 +230,8 @@ OPS = {
     "repo": lambda a: repo(a[0]),
     "team": lambda a: team(a[0]),
     "review": lambda a: review(a[0]),
+    "list-inflight": lambda a: list_inflight(),
+    "requeue": lambda a: requeue(a[0]),
 }
 
 if __name__ == "__main__":

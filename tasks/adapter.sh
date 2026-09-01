@@ -18,6 +18,13 @@
 #                            which the cloud Action and a single local loop both satisfy.
 #   task_done  <id>       -> mark the task finished
 #   task_comment <id> <text>  -> leave a note on the task
+#
+# Optional RECOVERY verbs (implemented by files/github/linear; used by
+# dozers/reaper.sh to reclaim work stranded by a crashed Dozer):
+#   task_list_inflight    -> print "<id>\t<lane>\t<title>" per CLAIMED-but-unfinished
+#                            task (excludes anything awaiting human review).
+#   task_requeue <id>     -> undo a claim: put the task back to ready (keep its lane).
+# A backend without these degrades gracefully — the reaper still reaps stale locks.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

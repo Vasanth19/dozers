@@ -42,7 +42,12 @@ run_one() { # <id> <lane> <title>
   # atomic local mutex so parallel Dozers never double-grab the same task
   local lock="$LOCK_DIR/${id//\//_}.lock"
   if ! mkdir "$lock" 2>/dev/null; then echo "  ~ #$id locked locally, skipping"; return 0; fi
-  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+  trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+  # Liveness beacon: record the worker PID so the reaper can tell a live run from a
+  # crashed one (dead PID => stale lock => the task gets requeued). See dozers/reaper.sh.
+  printf 'pid=%s\nhost=%s\ntask=%s\nlane=%s\nts=%s\n' \
+    "$BASHPID" "$(hostname -s 2>/dev/null || echo local)" "$id" "$lane" \
+    "$(date -u +%FT%TZ 2>/dev/null || date)" > "$lock/owner" 2>/dev/null || true
 
   local lane_dir
   case "$lane" in dev) lane_dir="dev-lane";; marketing) lane_dir="mktg-lane";; *) lane_dir="$lane-lane";; esac
@@ -84,9 +89,21 @@ drain() {
   (( any )) || echo "  (nothing ready)"
 }
 
+# Crash recovery: reclaim work stranded by a Dozer that died mid-task (stale locks +
+# orphaned in-flight tasks). Idempotent; runs on startup and on a cadence in `loop`.
+REAPER_ENABLED="${REAPER_ENABLED:-1}"
+recover() { [[ "$REAPER_ENABLED" == 1 && -x "$ROOT/dozers/reaper.sh" ]] && "$ROOT/dozers/reaper.sh" "$@" || true; }
+
 case "${1:-once}" in
-  once) echo "[dozer] draining greenlit work (fanout=$FANOUT)..."; drain ;;
+  once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; recover; drain ;;
+  recover) recover "${2:-}" ;;                              # run the reaper standalone (pass --dry-run)
   loop) echo "[dozer] looping every ${POLL_SECONDS}s, fanout=$FANOUT (Ctrl-C to stop)"
-        while true; do echo "[dozer] $(date '+%H:%M:%S') poll"; drain; sleep "$POLL_SECONDS"; done ;;
-  *) echo "usage: dozer.sh [once|loop]" >&2; exit 1 ;;
+        recover                                             # heal once on startup
+        REAPER_EVERY="${REAPER_EVERY:-10}"; ticks=0         # then re-run every N polls
+        while true; do
+          echo "[dozer] $(date '+%H:%M:%S') poll"; drain
+          ticks=$((ticks+1)); (( REAPER_EVERY > 0 && ticks % REAPER_EVERY == 0 )) && recover
+          sleep "$POLL_SECONDS"
+        done ;;
+  *) echo "usage: dozer.sh [once|loop|recover [--dry-run]]" >&2; exit 1 ;;
 esac

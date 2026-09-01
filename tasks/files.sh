@@ -71,3 +71,14 @@ task_team() { # <id> - optional team: frontmatter (usually empty for files backe
 task_review() { # <id> - stage for approval: wip -> review (not done)
   local id="$1"; mv "$BOARD/wip/$id.md" "$BOARD/review/$id.md" 2>/dev/null || true
 }
+
+# --- recovery verbs (used by dozers/reaper.sh) --------------------------------
+task_list_inflight() { # claimed-but-not-finished tasks: everything in wip/
+  for f in "$BOARD"/wip/*.md; do
+    [[ -e "$f" ]] || continue
+    printf '%s\t%s\t%s\n' "$(basename "$f" .md)" "$(_fm "$f" lane)" "$(_fm "$f" title)"
+  done
+}
+task_requeue() { # <id> - put a stranded wip task back to ready (keeps its lane)
+  local id="$1"; mv "$BOARD/wip/$id.md" "$BOARD/ready/$id.md" 2>/dev/null || return 1
+}
