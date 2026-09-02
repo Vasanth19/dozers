@@ -154,6 +154,8 @@ robust, kept lean:
   │  A Dozer dies mid-task? Its lock goes stale; the reaper reclaims the │
   │  task (requeues it) and KILLS any runaway worker. `dozer.sh doctor`  │
   │  shows what's in-flight, alive or dead, and any orphaned worktrees.  │
+  │  Every poll the loop also writes a heartbeat (last-poll ts + pid +   │
+  │  in-flight count) so a watcher can see the engine is still looping.  │
   └─────────────────────────────────────────────────────────────────────┘
 
   ┌── Seance (resume) ─────────────────────────────────────────────────┐
@@ -231,7 +233,7 @@ safe. A task from any team routes to that org's repo automatically.
 
 | Path | What it is |
 |------|-----------|
-| `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover`). |
+| `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover` / `heartbeat`). |
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
 | `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md`, shared `LINEAR.md`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
