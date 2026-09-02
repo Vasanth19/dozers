@@ -1,138 +1,259 @@
-# dozers
+# 🚜 Dozers
 
-A tiny, shareable operating system for one organization's AI work. **Directors
-decide; Dozers do.** A single label — `ready` + a lane — is the greenlight that wakes a
-Dozer: the only handoff between deciding and doing. No greenlight, no run.
+**A tiny, shareable operating system for an AI workforce. Directors decide; Dozers do.**
 
-It's deliberately small: clone it, change one config value, and you have a working
-agent org. The task backend is a *plug* — **Linear by default** (native OKR tree),
-with GitHub Issues or a zero-dependency local file board as alternatives.
+Dozers turns a task tracker (Linear, GitHub Issues, or a local file board) into an
+autonomous work engine. A **Director** (an AI agent) reads your OKRs, writes a spec,
+and **greenlights** a task with a label. A **Dozer** (a lean shell engine) claims it,
+does the work in an isolated git worktree, and reports back — merging code or staging
+content behind a human gate. No greenlight, no run.
+
+It's deliberately small — a handful of bash + python files you can read in an
+afternoon — but it does the real things: multi-project, parallel fan-out, crash
+recovery, resume-after-crash, and a green-gated merge queue.
 
 ```
-              ┌─────────────────────────────────────────────┐
-              │  YOU (the Keeper) — file work, review results │
-              └───────────────────────┬─────────────────────┘
-                                      │
-   ╔═══════════════ DECIDE (Directors) ═▼══════════════════════╗
-   ║   Chief          governs · OKRs · priorities            ║
-   ║     ├─ Dev-Director     triage → spec → review  (lane:dev) ║
-   ║     └─ Mktg-Director    brief  → review    (lane:marketing)║
-   ╚═══════════════════════════╤═════════════════════════════╝
-                               │  the greenlight:  ready + lane:<x>
-                               ▼        ── the only handoff ──
-   ╔═══════════════ DO (Dozers) ═══════▼══════════════════════╗
-   ║   Dozer engine   polls ready+lane → claims → runs a crew  ║
-   ║   ┌────────────────────┐   ┌───────────────────────────┐ ║
-   ║   │ lane:dev           │   │ lane:marketing            │ ║
-   ║   │ worktree→build→test│   │ produce → human approval  │ ║
-   ║   └────────────────────┘   └───────────────────────────┘ ║
-   ╚══════════════════════════════════════════════════════════╝
+                        ┌───────────────────────────────────────────────┐
+                        │  YOU  —  set OKRs, review, approve, promote     │
+                        └───────────────────────┬───────────────────────┘
+                                                │
+   ╔══════════════════ DECIDE ═══════════════════▼════════════════════════════════╗
+   ║  DIRECTORS  (AI agents — run in Buzz / Codex / Claude Code, one per org)       ║
+   ║                                                                               ║
+   ║     Chief ── governance, cross-team priorities, keeps the OKR tree honest     ║
+   ║       ├── Dev-Director   triage → spec  → greenlight → review → promote        ║
+   ║       └── Mktg-Director  triage → brief → greenlight → review staged draft     ║
+   ╚═══════════════════════════════════╤═══════════════════════════════════════════╝
+                                       │   the greenlight  =  dozer:ready + lane:<x>
+                                       │   (the ONLY handoff — a label on the issue)
+   ╔═══════════════════ CONTROL PLANE ═▼══════════════════════════════════════════╗
+   ║  LINEAR   Initiative → Project → Milestone → Issue → Sub-issue                 ║
+   ║  (Pillar)   (Objective)   (KR)     (Task)    (Sub-task)   · labels carry state ║
+   ╚═══════════════════════════════════╤═══════════════════════════════════════════╝
+                                       │   Dozer polls dozer:ready + lane, per team
+   ╔═══════════════════ DO ════════════▼══════════════════════════════════════════╗
+   ║  THE DOZER  (one process, all teams, ~8 parallel crews, atomic-locked)         ║
+   ║                                                                               ║
+   ║   lane:dev        worktree → agent → test → serial-merge (green-gated)         ║
+   ║   lane:marketing  load voice → produce → stage draft → human approval gate     ║
+   ║                                                                               ║
+   ║   resilience:  reaper (crash recovery) · Seance (resume) · Refinery (merge Q)  ║
+   ╚═══════════════════════════════════════════════════════════════════════════════╝
 
-   task backend (the plug):  GitHub Issues  ·  local files  ·  your own
+     backend plug:   Linear (default)   ·   GitHub Issues   ·   local files
 ```
 
-**Agent instructions** for every role live in [`AGENTS.md`](AGENTS.md) →
-`directors/*.md` (the deciders) and `dozers/*.md` (the doers).
+---
 
-## See it work in 5 seconds (no setup)
+## Why Dozers
+
+Most agent frameworks either (a) run one clever agent that does everything, or (b) wake
+agents on timers to "look for work" and burn tokens deciding. Dozers does neither:
+
+- **Two tiers, one seam.** Deciding and doing never overlap. A Director *only* decides
+  (and labels); a Dozer *only* executes (what's labeled). That single rule keeps the
+  whole system easy to reason about — and cheap: **no LLM in the polling loop.**
+- **Your tracker is the brain.** State lives in Linear (or GitHub) — the issue, its
+  labels, its OKR links. No separate database to drift. Humans and agents see the same
+  board.
+- **You own it.** ~20 files of bash + python. No platform, no lock-in. Swap the backend
+  by implementing a handful of functions.
+
+---
+
+## Quickstart
+
+### See it work in 10 seconds (offline, zero setup)
 
 ```bash
+git clone https://github.com/Vasanth19/dozers && cd dozers
 ./demo.sh
 ```
 
-Runs the local file backend: files two tasks, a Director gives each a lane, the
-Dozer drains both and produces artifacts. That's the entire loop, offline.
+Uses the local file backend: files two tasks, a Director gives each a lane, the Dozer
+drains both — a dev task through worktree→merge, a marketing task to a staged draft —
+and prints what happened. That's the whole loop, offline, no API keys.
 
-## Use it for real (GitHub Issues)
-
-1. Edit `org/config.yaml` → set `repo: your-owner/your-repo` (backend is already `github`).
-2. `gh auth login` (once), then `./setup.sh` to create the labels.
-3. Open an issue describing a task.
-4. A **Director** triages and approves:
-   ```bash
-   directors/run.sh triage            # see untriaged work
-   directors/run.sh ready 42 dev       # approve #42 into the dev lane (the greenlight)
-   ```
-5. A **Dozer** executes:
-   ```bash
-   dozers/dozer.sh once              # drain now
-   # or dozers/dozer.sh loop          — keep draining
-   # or let .github/workflows/dozer.yml run it every 15 min in the cloud
-   ```
-
-## Run the deciders as AI agents (Buzz · Codex · Claude Code)
-
-Two things run:
-
-- **The Dozer** (does) is just a shell loop — run it anywhere:
-  `"$DOZERS_HOME"/dozers/dozer.sh loop` (serve many orgs at once via `linear_teams`,
-  run crews in parallel via `fanout`). It needs `LINEAR_API_KEY` exported.
-- **The Directors** (decide) are AI agents — run **one per role/team**, each loaded
-  with its persona **plus** [`directors/LINEAR.md`](directors/LINEAR.md), and given
-  **Linear access** (Linear MCP, or `LINEAR_API_KEY`).
-
-> Agents only get the text you paste in — a linked file isn't auto-loaded. So
-> concatenate the two: `"$DOZERS_HOME"/directors/build-prompt.sh <role>`
-> becomes the agent's system prompt.
-
-**Set the repo location first** (agents run from anywhere, so use absolute paths):
+### Run it for real (Linear)
 
 ```bash
-export DOZERS_HOME=~/Code/dozers   # absolute path to this repo
-export LINEAR_API_KEY=...                         # e.g. source your vault
+export LINEAR_API_KEY=lin_api_...            # or: source your secrets file
+# edit org/config.yaml → linear_teams: "CFW,LL"  (your Linear team keys)
+
+# 1) start the Dozer (the doer) — serves every configured team, in parallel:
+dozers/dozer.sh loop
+
+# 2) a Director greenlights work (or run one as a Buzz/Codex/Claude agent — see below):
+directors/run.sh triage                       # see untriaged issues
+directors/run.sh ready ENG-42 dev             # greenlight #ENG-42 into the dev lane
 ```
 
-### Buzz (heartbeat-driven, unattended)
+The Dozer picks up `ENG-42` within one poll, builds it in your repo's worktree, runs
+the tests, serial-merges to `develop` (green-gated), and comments a summary on the issue.
 
-Register each Director as a Buzz agent whose system prompt is the merged
-persona + `LINEAR.md`, then let the heartbeat wake it to work its board:
+---
+
+## The core model
+
+### The greenlight — the only handoff
+
+Nothing runs until a Director puts **two labels** on an issue:
+
+```
+   dozer:ready   +   lane:dev            →   a Dozer will build it
+   dozer:ready   +   lane:marketing      →   a Dozer will produce + stage it
+```
+
+That's it. A Director's entire power over a Dozer is that label. No spec, no ladder to
+an OKR → no greenlight → no run.
+
+### Two lanes, two crews
+
+```
+  lane:dev  ─────────────────────────────────────────────────────────────
+     worktree dozer/<id>  →  coding agent implements + tests + commits
+        →  test gate (red = stop)  →  serial-merge to develop (green-gated)
+        →  Director promotes develop → main
+
+  lane:marketing  ────────────────────────────────────────────────────────
+     load brand voice  →  content agent produces the asset
+        →  STAGE it to .dozers-review/  (never auto-published)
+        →  issue flips to dozer:needs-review  →  a human approves
+```
+
+Add a lane by dropping a `dozers/<name>-lane/crew.sh` and greenlighting `lane:<name>`.
+
+### OKR laddering
+
+Every issue must ladder to a **Project** (Objective) / **Milestone** (KR) under an
+**Initiative** (Pillar). Unlinked work is scope drift, not work — a Director won't
+greenlight it.
+
+### Workdir routing
+
+The Dozer works *inside the target project's checkout*, resolved from your
+`ecosystem.yaml` registry — most-specific first:
+
+```
+   repo:<id> label   →  that repo's path
+   task's team/org    →  the org's default repo
+   workdir_default    →  fallback
+```
+
+Paths live in one registry, never hardcoded in a label or in config.
+
+---
+
+## Resilience (the part that lets you walk away)
+
+Dozers borrows the three patterns that make [gastown](https://github.com/gastownhall/gastown)
+robust, kept lean:
+
+```
+  ┌── reaper / watchdog ───────────────────────────────────────────────┐
+  │  A Dozer dies mid-task? Its lock goes stale; the reaper reclaims the │
+  │  task (requeues it) and KILLS any runaway worker. `dozer.sh doctor`  │
+  │  shows what's in-flight, alive or dead, and any orphaned worktrees.  │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌── Seance (resume) ─────────────────────────────────────────────────┐
+  │  A crashed dev task's worktree persists with its committed work. On  │
+  │  the next run the Dozer RESUMES it — continues from the prior commits│
+  │  instead of restarting from scratch (saves time + tokens).           │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌── Refinery (green-gated merge queue) ──────────────────────────────┐
+  │  Merges to develop are serialized per project (a merge lock), and    │
+  │  each merge is re-tested ON develop. A merge that breaks it is        │
+  │  reverted and the task sent back — develop stays green under fan-out. │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Directors — neutral AI agents, configured per org
+
+The Director definitions are **org-neutral** — the *same* agent works for every org.
+Each org gets its own **Buzz channel**, and that channel's **canvas** holds the org
+config (`org`, `linear_team`, `lanes`, `repos`, `brand_voice`, `okr`). The Director
+reads its canvas to learn which team to work. Add an org → new channel + canvas, **no
+new agent code.**
 
 ```bash
-BUZZ_ACP_HEARTBEAT_INTERVAL=1200
-BUZZ_ACP_HEARTBEAT_PROMPT="You are the Director for your team. Check your board (the Linear team your Dozer drains): triage untriaged issues — spec them and greenlight ready+lane — and review anything labeled needs-review (approve, or send back with a note). Act per your persona and directors/LINEAR.md; never execute, only decide."
+# generate a paste-ready system prompt (persona + Linear how-to, always fresh):
+directors/build-prompt.sh dev-director | pbcopy      # → paste into a Buzz/Codex/Claude agent
 ```
 
-Run one Buzz Director per role/team (e.g. a Dev-Director scoped to team `CFW`). Point
-a Dozer at the same teams (`dozers/dozer.sh loop`) and it drains what they greenlight.
+Run them in **Buzz** (heartbeat-driven, unattended), **Codex**, or **Claude Code** —
+see [`BUZZ-SETUP.md`](BUZZ-SETUP.md) for the full runbook (heartbeat env, canvas, etc.).
 
-### Codex / Claude Code (scripted or interactive)
+---
 
-Load a Director as a headless agent with the persona + `LINEAR.md` and Linear access,
-on a timer (`cron`/`launchd`) or interactively:
+## Label lifecycle
 
-```bash
-# Claude Code — one triage+review pass for team CFW:
-claude -p "$("$DOZERS_HOME"/directors/build-prompt.sh dev-director)
+Directors and the Dozer coordinate entirely through labels on the issue:
 
-Do one pass now for Linear team CFW."
+```
+ (untriaged)
+     │  Director: spec it, ladder to a Project
+     ▼
+ dozer:ready + lane:*          ← the greenlight
+     │  Dozer claims
+     ▼
+ dozer:in-progress
+     ├── dev  ──► dozer:merged-develop ──► (Director) director:merged-main ──► Done
+     ├── mktg ──► dozer:needs-review ─────► (human approves) ──────────────► Done
+     └── fail ──► dozer:blocked   (Director fixes, re-greenlights)
 
-# Codex — same idea: feed both files as the system prompt, give it Linear MCP,
-# and run it on a schedule.
+ routing:  lane:dev · lane:marketing · repo:<id>
+ director: director:triaged · director:changes-requested · director:merged-main
 ```
 
-## The layout
+---
+
+## Multi-team & fan-out
+
+One Dozer process serves **all** your orgs and runs crews in parallel:
+
+```yaml
+# org/config.yaml
+linear_teams: "CFW,LL,BRD,GSAI,DEL"   # every team, one process
+fanout: 8                              # up to 8 crews at once
+push: "false"                          # merges stay local until you say otherwise
+```
+
+Each parallel crew works in its own worktree; a per-project merge lock keeps `develop`
+safe. A task from any team routes to that org's repo automatically.
+
+---
+
+## Repo layout
 
 | Path | What it is |
 |------|-----------|
-| `directors/` | The deciders. `chief.md` / `dev-director.md` / `mktg-director.md` = personas; `LINEAR.md` = how they operate in Linear; `run.sh` = the CLI. |
-| `dozers/` | The doers. `dozer.sh` = the engine (multi-team, fan-out); `dev-lane/` & `mktg-lane/` = each lane's `crew.sh` + `dozer.md`. |
-| `tasks/` | The pluggable backend. `adapter.sh` = the interface; `linear.sh` (default) / `github-issues.sh` / `files.sh` = plugs. |
-| `org/` | `OKRS.md` = the north star; `config.yaml` = org, team, lanes, backend. |
-| `.github/` | Labels (the state machine), issue template, optional cloud Dozer. |
-| `AGENTS.md` | The map of all roles and the rules that bind them. |
+| `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover`). |
+| `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
+| `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
+| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md`, shared `LINEAR.md`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
+| `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
+| `org/config.yaml` | Teams, lanes, fan-out, integration branch, model command. |
+| `AGENTS.md` · `BUZZ-SETUP.md` | The role map + the Buzz/Codex/Claude run guide. |
 
 ## Swap the backend
 
-The Directors and Dozers only ever call the backend's handful of functions
-(`task_list_ready`, `task_claim`, `task_done`, …). To move off GitHub, copy
-`tasks/files.sh`, implement those against Linear / a spreadsheet / your own store,
-and point `backend:` at it. Nothing else changes.
+Directors and the Dozer only ever call a small set of functions
+(`task_list_ready`, `task_claim`, `task_merged`, `task_review`, `task_block`,
+`task_comment`, …). To move to Linear / a spreadsheet / your own store, implement those
+in one file and point `backend:` at it. Nothing else changes.
 
-## The rules
+---
 
-1. **The label is the seam.** Nothing crosses from decide to do without `ready` + a lane (the greenlight).
-2. **Directors never execute; Dozers never decide.** The two tiers do not overlap.
-3. **Everything ladders to an OKR.** Unlinked work is scope drift, not work.
-4. **One Chief, one Director per lane, many Dozers.** Start with dev + marketing; grow lanes and teams later (Ops is next).
+## Status
 
-MIT licensed. Grow it later — more lanes, more teams — but it starts as this.
+Early but real. Marketing lane proven live on Linear; dev pipeline mechanics + all
+resilience features (reaper, Seance, Refinery, doctor) tested. It succeeds an internal
+scheduler on a Paperclip → Linear migration. Contributions and forks welcome.
+
+## License
+
+MIT.
