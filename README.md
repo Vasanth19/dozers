@@ -78,7 +78,7 @@ Two things run:
 **Set the repo location first** (agents run from anywhere, so use absolute paths):
 
 ```bash
-export DOZERS_HOME=/Users/vasanth/Code/dozers   # absolute path to this repo
+export DOZERS_HOME=~/Code/dozers   # absolute path to this repo
 export LINEAR_API_KEY=...                         # e.g. source your vault
 ```
 

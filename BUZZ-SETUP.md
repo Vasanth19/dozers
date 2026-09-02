@@ -26,7 +26,7 @@ Buzz:  #cfw-social (canvas: team CFW …)   #learnloop (canvas: team LL …)   #
 ## 1. Start the Dozer (unscoped — runs for everybody)
 
 ```bash
-export DOZERS_HOME=/Users/vasanth/Code/dozers
+export DOZERS_HOME=~/Code/dozers
 source ~/ecosystem/vault/linear.env      # LINEAR_API_KEY
 "$DOZERS_HOME"/dozers/dozer.sh loop        # serves CFW + LL (all of linear_teams)
 ```
@@ -72,8 +72,8 @@ channel's Director reads the canvas → confirms team LL → specs it → greenl
 merges local `develop` (no push) → comments the summary. You review.
 
 ## Verify / rollback
-- Built code: `git -C /Users/vasanth/initiatives/learnloop/learnloop log --oneline develop | head`
-- Undo (nothing pushed): `git -C /Users/vasanth/initiatives/learnloop/learnloop reset --hard origin/develop`
+- Built code: `git -C ~/initiatives/learnloop/learnloop log --oneline develop | head`
+- Undo (nothing pushed): `git -C ~/initiatives/learnloop/learnloop reset --hard origin/develop`
 - Stop Dozer: Ctrl-C. Restart ab-hustler: the `launchctl bootstrap …` line above.
 
 ## Adding more orgs later
