@@ -33,9 +33,23 @@ def expand(p):
     return os.path.expanduser(str(p)).rstrip("/") if p else None
 
 
-def by_repo(reg, repo_id):
+def _slug(s):
+    # basename of a path or a git URL, minus a trailing .git
+    if not s:
+        return ""
+    return os.path.basename(str(s).rstrip("/")).replace(".git", "").lower()
+
+
+def by_repo(reg, hint):
+    """Resolve a repo:<hint> flexibly: match the hint against the project id, its
+    local-folder basename, OR its repo-URL basename. So `cfw-social`, `cfw-social-v2`
+    (repo name), or the folder name all resolve to the same project — the marketing
+    lane never has to know the exact registry id."""
+    h = str(hint).strip().lower()
     for p in reg.get("projects", []) or []:
-        if str(p.get("id")) == repo_id:
+        cands = {str(p.get("id")).lower(), _slug(p.get("local")), _slug(p.get("repo"))}
+        cands.discard("")
+        if h in cands:
             return expand(p.get("local"))
     return None
 
