@@ -12,7 +12,7 @@
 #   tasks/board/done/    finished
 
 BOARD="$ROOT/tasks/board"
-mkdir -p "$BOARD"/{inbox,ready,wip,review,done}
+mkdir -p "$BOARD"/{inbox,ready,wip,review,blocked,done}
 
 # frontmatter helper: read a `key: value` from a task file
 _fm() { grep -E "^$2:" "$1" 2>/dev/null | head -1 | sed "s/^$2:[[:space:]]*//"; }
@@ -70,4 +70,21 @@ task_team() { # <id> - optional team: frontmatter (usually empty for files backe
 }
 task_review() { # <id> - stage for approval: wip -> review (not done)
   local id="$1"; mv "$BOARD/wip/$id.md" "$BOARD/review/$id.md" 2>/dev/null || true
+}
+
+# --- recovery verbs (used by dozers/reaper.sh) --------------------------------
+task_list_inflight() { # claimed-but-not-finished tasks: everything in wip/
+  for f in "$BOARD"/wip/*.md; do
+    [[ -e "$f" ]] || continue
+    printf '%s\t%s\t%s\n' "$(basename "$f" .md)" "$(_fm "$f" lane)" "$(_fm "$f" title)"
+  done
+}
+task_requeue() { # <id> - put a stranded wip task back to ready (keeps its lane)
+  local id="$1"; mv "$BOARD/wip/$id.md" "$BOARD/ready/$id.md" 2>/dev/null || return 1
+}
+task_merged() { # <id> - dev merged to develop -> done folder
+  mv "$BOARD/wip/$1.md" "$BOARD/done/$1.md" 2>/dev/null || true
+}
+task_block() { # <id> - failure off-ramp -> blocked folder
+  mv "$BOARD/wip/$1.md" "$BOARD/blocked/$1.md" 2>/dev/null || true
 }

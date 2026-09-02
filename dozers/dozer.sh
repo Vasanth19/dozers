@@ -20,13 +20,15 @@ POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
 
-# Resolve a task's working dir, most-specific first:
-#   1) repo:<name> hint on the task   2) the task's TEAM/org   3) workdir_default
+# Resolve a task's working dir from the CANONICAL registry (~/ecosystem/ecosystem.yaml),
+# most-specific first:
+#   1) repo:<id> hint on the task   2) the task's Linear TEAM/org   3) config workdir_default
+# Paths live ONLY in ecosystem.yaml — never hardcoded here or in a label.
 resolve_workdir() {
   local hint="$1" team="$2" cfgf="$ROOT/org/config.yaml" path=""
-  _wd() { grep -E "^[[:space:]]+$1:" "$cfgf" 2>/dev/null | head -1 | sed 's/^[[:space:]]*[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
-  [[ -n "$hint" ]] && path="$(_wd "$hint")"
-  [[ -z "$path" && -n "$team" ]] && path="$(_wd "$team")"
+  # Canonical source: ecosystem.yaml (repo id -> local, or Linear team -> org default repo)
+  path="$(python3 "$ROOT/tasks/ecosystem_workdir.py" ${hint:+--repo "$hint"} ${team:+--team "$team"} 2>/dev/null || true)"
+  # Fallback: config workdir_default, then the dozers repo root.
   [[ -z "$path" ]] && path="${WORKDIR_DEFAULT:-$(grep -E '^workdir_default:' "$cfgf" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true)}"
   [[ -z "$path" || "$path" == "." ]] && path="$ROOT"
   path="${path/#\~/$HOME}"
@@ -40,7 +42,12 @@ run_one() { # <id> <lane> <title>
   # atomic local mutex so parallel Dozers never double-grab the same task
   local lock="$LOCK_DIR/${id//\//_}.lock"
   if ! mkdir "$lock" 2>/dev/null; then echo "  ~ #$id locked locally, skipping"; return 0; fi
-  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+  trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+  # Liveness beacon: record the worker PID so the reaper can tell a live run from a
+  # crashed one (dead PID => stale lock => the task gets requeued). See dozers/reaper.sh.
+  printf 'pid=%s\nhost=%s\ntask=%s\nlane=%s\nts=%s\n' \
+    "$BASHPID" "$(hostname -s 2>/dev/null || echo local)" "$id" "$lane" \
+    "$(date -u +%FT%TZ 2>/dev/null || date)" > "$lock/owner" 2>/dev/null || true
 
   local lane_dir
   case "$lane" in dev) lane_dir="dev-lane";; marketing) lane_dir="mktg-lane";; *) lane_dir="$lane-lane";; esac
@@ -60,13 +67,13 @@ run_one() { # <id> <lane> <title>
   local summary_file="$ROOT/.artifacts/$lane/$id.summary"; rm -f "$summary_file" 2>/dev/null || true
   if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" "$crew" "$id" "$title"; then
     local verb
-    if [[ "$lane" == "marketing" ]]; then task_review "$id"; verb="staged for review"; else task_done "$id"; verb="done"; fi
+    if [[ "$lane" == "marketing" ]]; then task_review "$id"; verb="staged for review"; else task_merged "$id"; verb="merged to develop"; fi
     local body
     if [[ -s "$summary_file" ]]; then body="$(head -n 10 "$summary_file")"; else body="- completed via lane:$lane"; fi
     task_comment "$id" "$(printf 'Dozer %s - lane:%s\n%s' "$verb" "$lane" "$body")"
     echo "  ok #$id $verb"
   else
-    task_comment "$id" "Dozer blocked in lane:$lane - needs a look."; echo "  x #$id failed" >&2
+    task_block "$id"; task_comment "$id" "Dozer blocked in lane:$lane - needs a look."; echo "  x #$id failed" >&2
   fi
 }
 
@@ -82,9 +89,41 @@ drain() {
   (( any )) || echo "  (nothing ready)"
 }
 
+# Crash recovery: reclaim work stranded by a Dozer that died mid-task (stale locks +
+# orphaned in-flight tasks). Idempotent; runs on startup and on a cadence in `loop`.
+REAPER_ENABLED="${REAPER_ENABLED:-1}"
+recover() { [[ "$REAPER_ENABLED" == 1 && -x "$ROOT/dozers/reaper.sh" ]] && "$ROOT/dozers/reaper.sh" "$@" || true; }
+
+# Health view (a witness/doctor): what's in flight, is it alive, and orphans.
+doctor() {
+  echo "== dozer doctor =="
+  echo "-- in-flight run-locks ($LOCK_DIR) --"
+  shopt -s nullglob; local any=0 lock id pid ts st
+  for lock in "$LOCK_DIR"/*.lock; do
+    any=1
+    id="$(grep -E '^task=' "$lock/owner" 2>/dev/null | cut -d= -f2)"; [[ -z "$id" ]] && id="$(basename "$lock" .lock)"
+    pid="$(grep -E '^pid=' "$lock/owner" 2>/dev/null | cut -d= -f2)"
+    ts="$(grep -E '^ts=' "$lock/owner" 2>/dev/null | cut -d= -f2)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then st="ALIVE pid=$pid"; else st="DEAD/stale pid=${pid:-?}"; fi
+    printf '   %-14s %-22s since %s\n' "$id" "[$st]" "${ts:-?}"
+  done
+  shopt -u nullglob; (( any )) || echo "   (none)"
+  echo "-- worktrees ($HOME/.dozers/worktrees) --"; ls -1 "$HOME/.dozers/worktrees" 2>/dev/null | sed 's/^/   /' || echo "   (none)"
+  echo "-- backend in-flight (claimed) --"
+  if declare -F task_list_inflight >/dev/null; then task_list_inflight 2>/dev/null | sed 's/^/   /'; else echo "   (backend has no inflight view)"; fi
+}
+
 case "${1:-once}" in
-  once) echo "[dozer] draining greenlit work (fanout=$FANOUT)..."; drain ;;
+  once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; recover; drain ;;
+  recover) recover "${2:-}" ;;                              # run the reaper standalone (pass --dry-run)
+  doctor)  doctor ;;                                        # health view: in-flight, alive?, orphans
   loop) echo "[dozer] looping every ${POLL_SECONDS}s, fanout=$FANOUT (Ctrl-C to stop)"
-        while true; do echo "[dozer] $(date '+%H:%M:%S') poll"; drain; sleep "$POLL_SECONDS"; done ;;
-  *) echo "usage: dozer.sh [once|loop]" >&2; exit 1 ;;
+        recover                                             # heal once on startup
+        REAPER_EVERY="${REAPER_EVERY:-10}"; ticks=0         # then re-run every N polls
+        while true; do
+          echo "[dozer] $(date '+%H:%M:%S') poll"; drain
+          ticks=$((ticks+1)); (( REAPER_EVERY > 0 && ticks % REAPER_EVERY == 0 )) && recover
+          sleep "$POLL_SECONDS"
+        done ;;
+  *) echo "usage: dozer.sh [once|loop|recover [--dry-run]|doctor]" >&2; exit 1 ;;
 esac
