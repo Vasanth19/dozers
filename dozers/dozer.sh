@@ -94,9 +94,29 @@ drain() {
 REAPER_ENABLED="${REAPER_ENABLED:-1}"
 recover() { [[ "$REAPER_ENABLED" == 1 && -x "$ROOT/dozers/reaper.sh" ]] && "$ROOT/dozers/reaper.sh" "$@" || true; }
 
+# Health view (a witness/doctor): what's in flight, is it alive, and orphans.
+doctor() {
+  echo "== dozer doctor =="
+  echo "-- in-flight run-locks ($LOCK_DIR) --"
+  shopt -s nullglob; local any=0 lock id pid ts st
+  for lock in "$LOCK_DIR"/*.lock; do
+    any=1
+    id="$(grep -E '^task=' "$lock/owner" 2>/dev/null | cut -d= -f2)"; [[ -z "$id" ]] && id="$(basename "$lock" .lock)"
+    pid="$(grep -E '^pid=' "$lock/owner" 2>/dev/null | cut -d= -f2)"
+    ts="$(grep -E '^ts=' "$lock/owner" 2>/dev/null | cut -d= -f2)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then st="ALIVE pid=$pid"; else st="DEAD/stale pid=${pid:-?}"; fi
+    printf '   %-14s %-22s since %s\n' "$id" "[$st]" "${ts:-?}"
+  done
+  shopt -u nullglob; (( any )) || echo "   (none)"
+  echo "-- worktrees ($HOME/.dozers/worktrees) --"; ls -1 "$HOME/.dozers/worktrees" 2>/dev/null | sed 's/^/   /' || echo "   (none)"
+  echo "-- backend in-flight (claimed) --"
+  if declare -F task_list_inflight >/dev/null; then task_list_inflight 2>/dev/null | sed 's/^/   /'; else echo "   (backend has no inflight view)"; fi
+}
+
 case "${1:-once}" in
   once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; recover; drain ;;
   recover) recover "${2:-}" ;;                              # run the reaper standalone (pass --dry-run)
+  doctor)  doctor ;;                                        # health view: in-flight, alive?, orphans
   loop) echo "[dozer] looping every ${POLL_SECONDS}s, fanout=$FANOUT (Ctrl-C to stop)"
         recover                                             # heal once on startup
         REAPER_EVERY="${REAPER_EVERY:-10}"; ticks=0         # then re-run every N polls
@@ -105,5 +125,5 @@ case "${1:-once}" in
           ticks=$((ticks+1)); (( REAPER_EVERY > 0 && ticks % REAPER_EVERY == 0 )) && recover
           sleep "$POLL_SECONDS"
         done ;;
-  *) echo "usage: dozer.sh [once|loop|recover [--dry-run]]" >&2; exit 1 ;;
+  *) echo "usage: dozer.sh [once|loop|recover [--dry-run]|doctor]" >&2; exit 1 ;;
 esac

@@ -51,11 +51,16 @@ _lock_state() {
 }
 
 declare -A REAPED=()
-_reap_lock() {   # remove a stale lock dir (idempotent, dedup-safe)
+_reap_lock() {   # kill a runaway worker (if still alive) + remove its stale lock
   local id="$1" lock; lock="$(_lockdir "$id")"
   [[ -d "$lock" ]] || return 0
   [[ -n "${REAPED[$id]:-}" ]] && return 0
   REAPED[$id]=1
+  local pid; pid="$(_field "$lock/owner" pid)"
+  if _alive "$pid"; then   # over-age but process still running => runaway; kill it (watchdog)
+    if [[ "$DRY_RUN" == 1 ]]; then echo "  [dry] would KILL runaway worker pid=$pid ($id)"
+    else kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true; echo "  killed runaway worker pid=$pid ($id)"; fi
+  fi
   if [[ "$DRY_RUN" == 1 ]]; then echo "  [dry] would reap stale lock: $id"
   else rm -rf "$lock" && echo "  reaped stale lock: $id"; fi
 }

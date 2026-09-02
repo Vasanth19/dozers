@@ -25,5 +25,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Drain ready work
         run: |
-          chmod +x dozers/dozer.sh dozers/lanes/*.sh tasks/*.sh
+          chmod +x dozers/dozer.sh dozers/dev-lane/*.sh dozers/mktg-lane/*.sh tasks/*.sh
           ./dozers/dozer.sh once

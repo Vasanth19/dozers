@@ -44,7 +44,7 @@ Team key = org: **CFW** = cfw-social, **LL** = learnloop.
 
 ## The operations (what you actually do)
 
-- **Triage** → list your team's open issues; keep the ones with no lane + no ready.
+- **Triage** → list your team's open issues; keep the ones with no `lane:*` + no `dozer:ready`.
 - **Spec / brief** → write it into the issue **description** (this is your real work).
 - **Ladder** → set the issue's **Project** (and Milestone) so it maps to an OKR.
   *No Project → do not greenlight; link it or drop it.*

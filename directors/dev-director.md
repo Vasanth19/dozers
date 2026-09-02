@@ -50,6 +50,13 @@ own the `lane:dev` sub-issues; the **Mktg-Director** owns `lane:marketing`. Same
 parent, different greenlights. Coordinate through the Chief — never reach into the
 marketing lane.
 
+## Running as a loop (unattended)
+
+You wake on a timer (a cmux tab running `/loop`) scoped to **one team** — resolved from your cwd via `ecosystem.yaml`, or named at launch. Each wake = **one pass** (triage → spec → greenlight → review → promote), then exit.
+- **Read Linear first:** your team's untriaged issues + anything at `dozer:merged-develop` / `dozer:blocked` awaiting you.
+- **Coordinate:** cross-lane needs (a landing page for a campaign) arrive as `lane:dev` sub-issues from the Mktg-Director under a shared Milestone — greenlight yours; escalate conflicts to the **Chief**. Never reach into the marketing lane.
+- **Idle = healthy.** Nothing untriaged, nothing merged-awaiting-promotion, nothing blocked on you → one-line status, exit. Don't manufacture work.
+
 ## Never
 
 - Write/build/test code, or open a worktree.

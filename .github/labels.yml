@@ -1,6 +1,10 @@
-# .github/labels.yml — the state machine, as GitHub labels.
+# .github/labels.yml — the state machine, as GitHub labels (the shareable GitHub backend).
 # Apply with:  gh label create <name> --color <hex> --description "…"
-# (or the ./setup.sh helper). These four labels ARE the workflow.
+# (or the ./setup.sh helper). These labels ARE the workflow for backend=github.
+#
+# NOTE: the LIVE Linear backend (tasks/_linear_api.py) uses the richer, namespaced
+# scheme `dozer:*` / `director:*` (+ lane:/repo:) documented in directors/LINEAR.md.
+# This GitHub seed keeps the simple bare labels for template/clone users.
 
 - name: ready
   color: "16a05a"
@@ -8,15 +12,19 @@
 
 - name: "lane:dev"
   color: "d98419"
-  description: "Code work — routed to dozers/lanes/dev.sh"
+  description: "Code work — routed to dozers/dev-lane/crew.sh"
 
 - name: "lane:marketing"
   color: "cf5a80"
-  description: "Content work — routed to dozers/lanes/marketing.sh (human approval)"
+  description: "Content work — routed to dozers/mktg-lane/crew.sh (human approval)"
 
 - name: "status:wip"
   color: "5b57e0"
   description: "A Dozer has claimed this and is running it"
+
+- name: "needs-review"
+  color: "d876e3"
+  description: "Marketing draft staged — awaiting human approval (not closed)"
 
 - name: "status:done"
   color: "6b7688"
