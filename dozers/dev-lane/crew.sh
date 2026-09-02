@@ -32,6 +32,25 @@ WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.doz
 BRANCH="$PREFIX/$ID"; SLUG="$(basename "$WORKDIR")"
 WT="$WT_ROOT/$SLUG-$ID"; MW="$WT_ROOT/$SLUG-merge"; STATE="$WT_ROOT/$SLUG-$ID.state"
 
+# Detect, don't impose. If the configured integration branch (e.g. develop) is
+# absent from THIS repo, fall back to the repo's own default branch so trunk-based
+# / main-only repos work unchanged — we never create a develop branch here. When
+# develop DOES exist (local or remote) behavior is identical to before.
+_default_branch() {
+  local d
+  d="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"; d="${d#refs/remotes/origin/}"
+  if [[ -n "$d" ]]; then echo "$d"; return; fi
+  if git show-ref --verify --quiet refs/heads/main; then echo "main"; return; fi
+  git rev-parse --abbrev-ref HEAD 2>/dev/null
+}
+if ! git show-ref --verify --quiet "refs/heads/$INTEG" \
+   && ! git show-ref --verify --quiet "refs/remotes/origin/$INTEG"; then
+  _fallback="$(_default_branch)"
+  [[ -n "$_fallback" ]] || fail "integration branch '$INTEG' absent and no default branch in $WORKDIR"
+  echo "    [dev] integration branch '$INTEG' absent — using repo default '$_fallback'"
+  INTEG="$_fallback"
+fi
+
 echo "    [dev] cwd=$(pwd)  integration=$INTEG  branch=$BRANCH"
 [[ -n "$DOZER_PERSONA" ]] && echo "    [dev] persona: $DOZER_PERSONA" || true
 [[ -f AGENTS.md ]] && echo "    [dev] + project AGENTS.md" || true
