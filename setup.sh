@@ -6,7 +6,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "→ making scripts executable"
 chmod +x "$ROOT"/setup.sh "$ROOT"/demo.sh \
          "$ROOT"/directors/run.sh "$ROOT"/dozers/dozer.sh \
-         "$ROOT"/dozers/lanes/*.sh "$ROOT"/tasks/*.sh 2>/dev/null || true
+         "$ROOT"/dozers/reaper.sh "$ROOT"/dozers/service.sh \
+         "$ROOT"/dozers/*-lane/*.sh "$ROOT"/tasks/*.sh "$ROOT"/tests/*.sh 2>/dev/null || true
 
 backend="$(grep -E '^[[:space:]]*backend:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*backend:[[:space:]]*//; s/#.*//; s/[[:space:]]//g; s/"//g; s/'"'"'//g' || true)"
 echo "→ backend = $backend"

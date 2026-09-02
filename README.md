@@ -91,6 +91,25 @@ directors/run.sh ready ENG-42 dev             # greenlight #ENG-42 into the dev 
 The Dozer picks up `ENG-42` within one poll, builds it in your repo's worktree, runs
 the tests, serial-merges to `develop` (green-gated), and comments a summary on the issue.
 
+### Run it as a supervised service (survives crashes, logout, reboot)
+
+`dozers/dozer.sh loop` in a terminal dies silently — a crash, a closed lid, a logout —
+and nothing brings it back. Hand it to the OS supervisor so it **auto-restarts**:
+
+```bash
+# put secrets/config where the service can source them (never baked into the unit):
+echo 'export LINEAR_API_KEY=lin_api_...' >> ~/.dozers/dozer.env
+
+dozers/service.sh install     # macOS → launchd KeepAlive · Linux → systemd Restart=always
+dozers/service.sh status      # is it running? + the engine heartbeat
+dozers/service.sh logs        # tail the loop's log (a silent death is now visible here)
+dozers/service.sh uninstall   # stop + remove
+```
+
+If the loop dies for any reason the supervisor relaunches it (throttled 10s so a
+start-up crash can't hot-loop), and every line it prints lands in `~/.dozers/logs/` —
+so a silent death becomes a visible, diagnosable one.
+
 ---
 
 ## The core model
@@ -154,6 +173,8 @@ robust, kept lean:
   │  A Dozer dies mid-task? Its lock goes stale; the reaper reclaims the │
   │  task (requeues it) and KILLS any runaway worker. `dozer.sh doctor`  │
   │  shows what's in-flight, alive or dead, and any orphaned worktrees.  │
+  │  Every poll the loop also writes a heartbeat (last-poll ts + pid +   │
+  │  in-flight count) so a watcher can see the engine is still looping.  │
   └─────────────────────────────────────────────────────────────────────┘
 
   ┌── Seance (resume) ─────────────────────────────────────────────────┐
@@ -231,8 +252,9 @@ safe. A task from any team routes to that org's repo automatically.
 
 | Path | What it is |
 |------|-----------|
-| `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover`). |
+| `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover` / `heartbeat`). |
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
+| `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
 | `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md`, shared `LINEAR.md`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |

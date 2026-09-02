@@ -19,6 +19,29 @@ cfg() { grep -E "^$1:" "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[
 POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
+# Liveness heartbeat: a single beacon the engine overwrites every poll cycle, so an
+# external watcher (or `doctor`) can tell the loop is still alive and how busy it is.
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-$HOME/.dozers/heartbeat}"
+
+# Snapshot count of in-flight run-locks (tasks claimed across every Dozer on this host,
+# since LOCK_DIR is shared). Cheap directory scan, no backend call.
+inflight_count() {
+  local n=0 lock; shopt -s nullglob
+  for lock in "$LOCK_DIR"/*.lock; do n=$((n+1)); done
+  shopt -u nullglob; printf '%s' "$n"
+}
+
+# Emit the heartbeat: last-poll ts + engine pid + in-flight count. Written atomically
+# (tmp then mv) so a reader never sees a half-written beacon. Best-effort — a failed
+# write must never take down the poll loop. Arg $1 = poll tick number (optional).
+heartbeat() {
+  mkdir -p "$(dirname "$HEARTBEAT_FILE")" 2>/dev/null || true
+  local tmp="$HEARTBEAT_FILE.$$.tmp"
+  printf 'pid=%s\nhost=%s\nts=%s\ninflight=%s\npoll=%s\n' \
+    "$$" "$(hostname -s 2>/dev/null || echo local)" \
+    "$(date -u +%FT%TZ 2>/dev/null || date)" "$(inflight_count)" "${1:-0}" \
+    > "$tmp" 2>/dev/null && mv -f "$tmp" "$HEARTBEAT_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
 
 # Resolve a task's working dir from the CANONICAL registry (~/ecosystem/ecosystem.yaml),
 # most-specific first:
@@ -108,6 +131,18 @@ doctor() {
     printf '   %-14s %-22s since %s\n' "$id" "[$st]" "${ts:-?}"
   done
   shopt -u nullglob; (( any )) || echo "   (none)"
+  echo "-- engine heartbeat ($HEARTBEAT_FILE) --"
+  if [[ -f "$HEARTBEAT_FILE" ]]; then
+    local hpid hts hinf hpoll hst
+    hpid="$(grep -E '^pid='      "$HEARTBEAT_FILE" 2>/dev/null | cut -d= -f2)"
+    hts="$(grep -E '^ts='        "$HEARTBEAT_FILE" 2>/dev/null | cut -d= -f2)"
+    hinf="$(grep -E '^inflight=' "$HEARTBEAT_FILE" 2>/dev/null | cut -d= -f2)"
+    hpoll="$(grep -E '^poll='    "$HEARTBEAT_FILE" 2>/dev/null | cut -d= -f2)"
+    if [[ -n "$hpid" ]] && kill -0 "$hpid" 2>/dev/null; then hst="ALIVE"; else hst="DEAD/stale"; fi
+    printf '   [%s] pid=%s  last-poll=%s  in-flight=%s  poll#=%s\n' "$hst" "${hpid:-?}" "${hts:-?}" "${hinf:-?}" "${hpoll:-?}"
+  else
+    echo "   (no heartbeat yet — engine not looping)"
+  fi
   echo "-- worktrees ($HOME/.dozers/worktrees) --"; ls -1 "$HOME/.dozers/worktrees" 2>/dev/null | sed 's/^/   /' || echo "   (none)"
   echo "-- backend in-flight (claimed) --"
   if declare -F task_list_inflight >/dev/null; then task_list_inflight 2>/dev/null | sed 's/^/   /'; else echo "   (backend has no inflight view)"; fi
@@ -116,14 +151,17 @@ doctor() {
 case "${1:-once}" in
   once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; recover; drain ;;
   recover) recover "${2:-}" ;;                              # run the reaper standalone (pass --dry-run)
+  heartbeat) heartbeat "${2:-0}"; cat "$HEARTBEAT_FILE" ;;  # emit one beat now, print it (scriptable/testable)
   doctor)  doctor ;;                                        # health view: in-flight, alive?, orphans
   loop) echo "[dozer] looping every ${POLL_SECONDS}s, fanout=$FANOUT (Ctrl-C to stop)"
         recover                                             # heal once on startup
         REAPER_EVERY="${REAPER_EVERY:-10}"; ticks=0         # then re-run every N polls
+        heartbeat "$ticks"                                  # beat once before the first drain
         while true; do
           echo "[dozer] $(date '+%H:%M:%S') poll"; drain
-          ticks=$((ticks+1)); (( REAPER_EVERY > 0 && ticks % REAPER_EVERY == 0 )) && recover
+          ticks=$((ticks+1)); heartbeat "$ticks"            # beat each cycle: ts + pid + in-flight
+          (( REAPER_EVERY > 0 && ticks % REAPER_EVERY == 0 )) && recover
           sleep "$POLL_SECONDS"
         done ;;
-  *) echo "usage: dozer.sh [once|loop|recover [--dry-run]|doctor]" >&2; exit 1 ;;
+  *) echo "usage: dozer.sh [once|loop|recover [--dry-run]|heartbeat|doctor]" >&2; exit 1 ;;
 esac
