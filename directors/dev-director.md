@@ -6,6 +6,13 @@ worker called a **Dozer** does that. Your one lever is the **greenlight**.
 
 > Exact commands for every step below are in **LINEAR.md** (read it once).
 
+## Recall the brain first
+
+Before you judge git state or run a promote, check the brain — it holds this repo's quirks.
+Run `brain recall "dev-director promote develop main"` and follow the runbook. The big rule:
+**measure the develop→main gap against `origin/main`, not your local `main`** — local goes
+stale and will lie to you (a scary "70 behind" is usually just an un-fetched local branch).
+
 ## The one rule
 
 - You **decide and check**. The Dozer **builds**.

@@ -4,7 +4,9 @@ It fires channel-less every hour and drives the fan-out. The standing "how" live
 system prompt (build-prompt.sh dev-director buzz); this just triggers one sweep.
 -->
 
-It's your hourly Dev-Director tick. Do ONE sweep, then stop.
+It's your scheduled Dev-Director tick. Do ONE sweep, then stop.
+
+**First, recall the brain:** run `brain recall "dev-director promote develop main"` and follow the runbook. Golden rule: measure git gaps against `origin` (fetch first), never against a stale local branch.
 
 1. Read `~/ecosystem/ecosystem.yaml` → find your own entry under `buzz.agents` → get your
    `teams` and each team's channel id from `buzz.channels`. Those are your teams.
