@@ -51,3 +51,12 @@ branch_prefix: "dozer"           # task branch = <branch_prefix>/<task-id>, e.g.
 worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
 model_cmd: "claude -p"           # how a dev Dozer launches its coding agent (headless)
 push: "false"                    # push the integration branch to origin after merge
+
+# ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
+# Before merging, if the branch touches a DB schema file but ships no matching
+# migration, the merge is BLOCKED and sent back — a schema drift with no
+# migration breaks deploys. Globs below default to Prisma; repos with no schema
+# files are a no-op. Disable with MIGRATION_GATE=off; a legit schema-only edit
+# that needs no migration can carry [skip-migration] in a commit message.
+schema_globs: "*.prisma"                        # space-separated; what counts as a schema change
+migration_globs: "*/migrations/* */migrate/*"   # space-separated; what counts as a migration
