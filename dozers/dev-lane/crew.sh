@@ -32,6 +32,34 @@ link_deps() {  # $1 = target worktree dir
   done
 }
 
+# Migration gate (LL-31 guardrail): a change that touches a DB schema MUST ship
+# with a matching migration, else deploys drift and break. We block the merge
+# BEFORE it happens — fail-fast, sent back to the Director. Globs are configurable
+# (org/config.yaml) and default to Prisma; repos with no schema files → no-op.
+# Escape hatch: put [skip-migration] in a commit message for a legit schema edit
+# that genuinely needs no migration (e.g. a datasource/generator-only change).
+migration_gate() {  # $1 = worktree dir, $2 = compare base (integration branch)
+  local wt="$1" cmp="$2" changed f g schema_hits="" mig=0 sg mg
+  sg="${SCHEMA_GLOBS:-$(cfg schema_globs)}"; sg="${sg:-*.prisma}"
+  mg="${MIGRATION_GLOBS:-$(cfg migration_globs)}"; mg="${mg:-*/migrations/* */migrate/*}"
+  [[ "${MIGRATION_GATE:-on}" == "off" ]] && { echo "    [dev] migration gate: off"; return 0; }
+  read -ra SG_ARR <<< "$sg"; read -ra MG_ARR <<< "$mg"
+  changed="$(git -C "$wt" diff --name-only "$cmp"..."$BRANCH" 2>/dev/null || true)"
+  [[ -z "$changed" ]] && return 0
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    for g in "${MG_ARR[@]}"; do [[ "$f" == $g ]] && mig=1; done
+    for g in "${SG_ARR[@]}"; do [[ "$f" == $g ]] && schema_hits+="      $f"$'\n'; done
+  done <<< "$changed"
+  [[ -z "$schema_hits" ]] && return 0                 # no schema touched → nothing to gate
+  (( mig )) && { echo "    [dev] migration gate: schema change ships with a migration ✓"; return 0; }
+  if git -C "$wt" log --format=%B "$cmp".."$BRANCH" 2>/dev/null | grep -qF '[skip-migration]'; then
+    echo "    [dev] migration gate: schema change, no migration — overridden by [skip-migration]"; return 0
+  fi
+  fail "schema change with no matching migration (LL-31 guardrail) — add a migration (or [skip-migration] if none is needed); worktree kept, sent back
+$schema_hits"
+}
+
 cd "$WORKDIR" 2>/dev/null || fail "workdir missing: $WORKDIR"
 git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git repo: $WORKDIR"
 
@@ -112,6 +140,9 @@ else
   else echo "    [dev] ⚠ no test command detected — proceeding"; fi
   git -C "$WT" diff --quiet "$base" -- 2>/dev/null && fail "agent produced no commits on $BRANCH"
 fi
+
+# ── 2b. Migration gate (LL-31): block a schema change with no matching migration ──
+migration_gate "$WT" "$base"
 
 # ── 3. Refinery: serialize merges (per-project lock) + green-gate the integration ──
 MLOCK="$WT_ROOT/.merge-$SLUG.lock"; _t=$SECONDS
