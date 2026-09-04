@@ -21,6 +21,17 @@ OUT="$REPO_ROOT/.artifacts/dev"; mkdir -p "$OUT"
 cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
 fail() { echo "    [dev] ✗ $*" >&2; exit 1; }
 
+# Symlink uncommitted build deps (node_modules, env files) from the real checkout
+# into a worktree so `npm test` resolves them. Needed for BOTH the task worktree
+# AND the merge worktree — the green-gate runs tests in the fresh merge worktree,
+# which otherwise has no node_modules and reverts every merge (GSAI-23).
+link_deps() {  # $1 = target worktree dir
+  local d="$1" x
+  for x in node_modules .env .env.local .env.development; do
+    [[ -e "$WORKDIR/$x" && ! -e "$d/$x" ]] && ln -s "$WORKDIR/$x" "$d/$x" 2>/dev/null || true
+  done
+}
+
 cd "$WORKDIR" 2>/dev/null || fail "workdir missing: $WORKDIR"
 git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git repo: $WORKDIR"
 
@@ -70,9 +81,7 @@ else
   git worktree add -B "$BRANCH" "$WT" "$base" >/dev/null 2>&1 || fail "could not create worktree $WT off $base"
   echo "    [dev] worktree $WT (off $base)"; echo 1 > "$STATE"
 fi
-for x in node_modules .env .env.local .env.development; do
-  [[ -e "$WORKDIR/$x" && ! -e "$WT/$x" ]] && ln -s "$WORKDIR/$x" "$WT/$x" 2>/dev/null || true
-done
+link_deps "$WT"
 
 # ── 2. coding agent (implements + tests + commits INSIDE the worktree) ─────────
 read -r -d '' PROMPT <<EOF || true
@@ -112,6 +121,7 @@ echo "    [dev] merge lock acquired ($SLUG)"
 
 git worktree remove --force "$MW" >/dev/null 2>&1 || true
 git worktree add "$MW" "$INTEG" >/dev/null 2>&1 || git worktree add -B "$INTEG" "$MW" "$base"
+link_deps "$MW"   # so the green-gate's `npm test` has node_modules — else every merge reverts
 PREMERGE="$(git -C "$MW" rev-parse HEAD)"
 if git -C "$MW" merge --no-ff "$BRANCH" -m "merge $BRANCH into $INTEG — #$ID $TITLE" >/dev/null 2>&1; then
   echo "    [dev] merged $BRANCH → $INTEG"
