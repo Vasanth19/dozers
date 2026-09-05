@@ -248,6 +248,59 @@ safe. A task from any team routes to that org's repo automatically.
 
 ---
 
+## Model routing — which brain each role runs on
+
+Every crew launches a headless coding/content agent. **Which** agent is a per-role knob,
+not a hardcoded command: point the dev lane at a cheap open model and keep marketing on
+Claude, or flip either back, without touching a crew.
+
+```yaml
+# org/config.yaml
+models:
+  default:   { provider: claude, model: "" }      # fallback for any role not listed
+  dev:       { provider: claude, model: "" }      # "" = the provider's default model
+  marketing: { provider: claude, model: "" }
+ollama_env: "~/ecosystem/vault/ollama-cloud.env"  # where OLLAMA_API_KEY lives (vault-first)
+```
+
+A **role** is the lane name today (`dev`, `marketing`); `default` catches anything else.
+
+| Provider | Runs | Model id | Notes |
+|---|---|---|---|
+| `claude` | `claude -p` | any Claude model (`--model`) | the default; uses your normal Claude Code auth |
+| `ollama-cloud` | `claude -p` against `https://ollama.com` | `glm-5.2` (default), `kimi-k2.7-code`, `deepseek-v4-flash`, `deepseek-v3.2`, `minimax-m3`, `kimi-k2.6` | Anthropic-compatible endpoint; Bearer `OLLAMA_API_KEY` |
+| `ollama-local` | `claude -p` against `http://localhost:11434` | required, e.g. `qwen2.5:7b-instruct` | **best-effort.** The daemon does speak `/v1/messages`, but Claude Code as its client is unproven — a 7B model did not finish a headless turn in 5 min. No default model on purpose. |
+| `codex` | `codex exec` | any Codex model (`--model`) | OpenAI Codex CLI, non-interactive |
+
+**Override for one run** — env always beats config:
+
+```bash
+DOZER_MODEL_DEV="ollama-cloud:glm-5.2"        dozers/dozer.sh once
+DOZER_MODEL_MARKETING="claude:claude-opus-4-6" dozers/dozer.sh once
+DOZER_MODEL_<ROLE>="<provider>[:<model>]"      # the general form
+```
+
+Setting `MODEL_CMD` directly still works and bypasses routing entirely (the legacy
+escape hatch, as does the flat `model_cmd:` in config).
+
+**Inspect and test it:**
+
+```bash
+dozers/model.sh show                      # role -> provider/model table (prints no secrets)
+dozers/model.sh env dev                   # the eval-able export block a crew uses
+dozers/model.sh smoke ollama-cloud glm-5.2  # one tiny real call; pass/fail + latency
+```
+
+Each crew logs `[dev] model: <provider>/<model>` and puts the same line in the task
+summary, so the comment the Dozer posts back says which brain did the work.
+
+**Fail fast, always.** A role pointed at a provider whose key or model is missing stops
+the crew with a non-zero exit and a message naming what's absent. It never quietly falls
+back to `claude` — a silently-swapped brain is worse than a failed run. The key is read
+from the vault only inside the resolver; it is never logged, echoed, or printed by `show`.
+
+---
+
 ## Repo layout
 
 | Path | What it is |
@@ -258,7 +311,8 @@ safe. A task from any team routes to that org's repo automatically.
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
 | `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md`, shared `LINEAR.md`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
-| `org/config.yaml` | Teams, lanes, fan-out, integration branch, model command. |
+| `dozers/model.sh` · `tasks/model_route.py` | Per-role model routing — `show` / `env <role>` / `smoke <provider>`. |
+| `org/config.yaml` | Teams, lanes, fan-out, integration branch, per-role model routing. |
 | `AGENTS.md` · `BUZZ-SETUP.md` | The role map + the Buzz/Codex/Claude run guide. |
 
 ## Swap the backend

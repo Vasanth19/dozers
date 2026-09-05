@@ -10,8 +10,14 @@
 # It NEVER publishes — the human approval gate is the whole point. The engine
 # then flips the task to needs-review (not done).
 #
-# Config/env: model_cmd (content model, default claude -p), DRY_RUN=1 (placeholder
-#   draft, no model). Drafts are staged under <workdir>/.dozers-review/<id>.md.
+# Config/env: DRY_RUN=1 (placeholder draft, no model). Drafts are staged under
+#   <workdir>/.dozers-review/<id>.md.
+#
+# Model routing: the brain this lane runs on comes from org/config.yaml
+#   `models.marketing` (provider + model), resolved by dozers/model.sh. Override
+#   per-run with DOZER_MODEL_MARKETING="<provider>[:<model>]" (e.g. ollama-cloud:glm-5.2),
+#   or bypass routing entirely by exporting MODEL_CMD. A route that can't be satisfied
+#   FAILS the crew — no silent fallback.
 set -euo pipefail
 ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -20,10 +26,23 @@ OUT="$REPO_ROOT/.artifacts/mktg"; mkdir -p "$OUT"
 
 cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
 VOICE="$(grep -E '^[[:space:]]*voice:' "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*voice:[[:space:]]*//; s/"//g' || true)"; VOICE="${VOICE:-clear, warm, no hype}"
-MODEL_CMD="${MODEL_CMD:-$(cfg model_cmd)}"; MODEL_CMD="${MODEL_CMD:-claude -p}"
+
+# ── Model routing (see dozers/model.sh). MODEL_CMD already in the env wins (legacy
+# override); otherwise resolve this ROLE's route. Fail fast — a bad provider or a
+# missing key stops the crew, it never silently falls back to claude.
+DOZER_ROLE="${DOZER_ROLE:-marketing}"
+if [[ -n "${MODEL_CMD:-}" ]]; then
+  DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
+else
+  _route="$("$REPO_ROOT/dozers/model.sh" env "$DOZER_ROLE")" \
+    || { echo "    [mktg] ✗ model routing failed for role '$DOZER_ROLE'" >&2; exit 1; }
+  eval "$_route"; unset _route
+fi
+MODEL_DESC="${DOZER_MODEL_PROVIDER:-claude}/${DOZER_MODEL_NAME:-default}"
 
 cd "$WORKDIR" 2>/dev/null || true
 echo "    [mktg] cwd=$(pwd)  voice=\"$VOICE\""
+echo "    [mktg] model: $MODEL_DESC"
 [[ -n "$DOZER_PERSONA" ]] && echo "    [mktg] persona: $DOZER_PERSONA" || true
 
 REVIEW_DIR="$WORKDIR/.dozers-review"; mkdir -p "$REVIEW_DIR"
@@ -62,6 +81,7 @@ EOF
 if [[ "${DRY_RUN:-}" == "1" ]]; then made="placeholder draft (dry-run)"; else made="draft via content model"; fi
 cat > "$OUT/$ID.summary" <<EOF
 - Picked up: $TITLE
+- model: $MODEL_DESC
 - Loaded brand voice: $VOICE
 - Produced: $made
 - Staged → $DRAFT (NOT published)
