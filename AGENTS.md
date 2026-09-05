@@ -45,5 +45,18 @@ between them is the greenlight — a `ready` label + a lane. No greenlight, no r
 - Dozers are run by **`dozers/dozer.sh`** (`once` / `loop`), which claims a greenlit
   task and hands it to the lane crew in **`dozers/lanes/<lane>.sh`**.
 
+## Which model a role runs on
+
+A Dozer's brain is configurable per **role** (today the lane name: `dev`, `marketing`),
+not baked into the crew. `org/config.yaml` → `models:` maps each role to a `provider`
+(`claude` | `ollama-cloud` | `ollama-local` | `codex`) and an optional model id;
+`dozers/model.sh` resolves that into the crew's `MODEL_CMD` plus any provider env. Check
+the current wiring with `dozers/model.sh show`, prove a provider works with
+`dozers/model.sh smoke <provider> [model]`, and override a single run with
+`DOZER_MODEL_<ROLE>="<provider>[:<model>]"` (e.g. `DOZER_MODEL_DEV=ollama-cloud:glm-5.2`).
+Ship default is `claude` for every role. A route that can't be satisfied **fails the
+crew** — there is no silent fallback to another model, because a run that quietly used a
+different brain is a run you can't trust.
+
 > Ops is a planned third lane (Ops-Director / Ops-Dozer / `lane:ops`) — not shipped
 > yet. The system starts with **dev** and **marketing**.

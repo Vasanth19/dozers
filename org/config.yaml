@@ -49,5 +49,16 @@ workdir_default: "."
 integration_branch: "develop"   # branch the Dozer cuts dozer/<id> off and merges back into
 branch_prefix: "dozer"           # task branch = <branch_prefix>/<task-id>, e.g. dozer/CFW-9
 worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
-model_cmd: "claude -p"           # how a dev Dozer launches its coding agent (headless)
+model_cmd: "claude -p"           # LEGACY flat default — superseded by `models:` below (still honoured via MODEL_CMD)
 push: "false"                    # push the integration branch to origin after merge
+
+# ── Model routing — which brain each ROLE runs on. Swap a role's provider any time. ──
+# provider: claude | ollama-cloud | ollama-local | codex     model: provider-specific id ("" = provider default)
+# Env override wins:  DOZER_MODEL_<ROLE>="<provider>[:<model>]"  e.g. DOZER_MODEL_DEV=ollama-cloud:glm-5.2
+# Role = the lane name today (dev, marketing); `default` covers any role not listed.
+# Inspect with `dozers/model.sh show`; test a provider with `dozers/model.sh smoke <provider> [model]`.
+models:
+  default:   { provider: claude, model: "" }
+  dev:       { provider: claude, model: "" }
+  marketing: { provider: claude, model: "" }
+ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY
