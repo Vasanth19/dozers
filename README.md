@@ -32,7 +32,7 @@ recovery, resume-after-crash, and a green-gated merge queue.
    ╚═══════════════════════════════════╤═══════════════════════════════════════════╝
                                        │   Dozer polls dozer:ready + lane, per team
    ╔═══════════════════ DO ════════════▼══════════════════════════════════════════╗
-   ║  THE DOZER  (one process, all teams, ~8 parallel crews, atomic-locked)         ║
+   ║  THE DOZER  (one process, all teams, `fanout` parallel crews, atomic-locked)   ║
    ║                                                                               ║
    ║   lane:dev        worktree → agent → test → serial-merge (green-gated)         ║
    ║   lane:marketing  load voice → produce → stage draft → human approval gate     ║
@@ -238,9 +238,10 @@ One Dozer process serves **all** your orgs and runs crews in parallel:
 
 ```yaml
 # org/config.yaml
-linear_teams: "CFW,LL,BRD,GSAI,DEL"   # every team, one process
-fanout: 8                              # up to 8 crews at once
-push: "false"                          # merges stay local until you say otherwise
+linear_teams: "CFW,LL,BRD,GSAI,DLY"   # every team, one process
+fanout: 5                              # 5 crews at once
+push: "false"                          # merges stay on the local integration branch —
+                                       # nothing is pushed to origin until you say otherwise
 ```
 
 Each parallel crew works in its own worktree; a per-project merge lock keeps `develop`
@@ -309,7 +310,8 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
 | `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
-| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md`, shared `LINEAR.md`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
+| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
+| `directors/LINEAR.md` | The board contract every Director inherits — the exact label move per operation, plus the **board protocol**: `@Vas` + `board:to_review` → one `#now` ping → reconcile-first next wake → `board:responded`. |
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
 | `dozers/model.sh` · `tasks/model_route.py` | Per-role model routing — `show` / `env <role>` / `smoke <provider>`. |
 | `org/config.yaml` | Teams, lanes, fan-out, integration branch, per-role model routing. |
