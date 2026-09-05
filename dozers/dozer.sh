@@ -87,7 +87,11 @@ run_one() { # <id> <lane> <title>
   workdir="$(resolve_workdir "$hint" "$team")"
   echo "    cwd -> $workdir  ${team:+[team:$team]}${hint:+ (repo:$hint)}"
 
-  local summary_file="$ROOT/.artifacts/$lane/$id.summary"; rm -f "$summary_file" 2>/dev/null || true
+  # The crew leaves TWO artifacts: <id>.summary on success, <id>.fail (the reason) on
+  # failure — the latter goes into the block comment so a Director never has to read
+  # loop.err.log to learn why (GSAI-26 #3).
+  local summary_file="$ROOT/.artifacts/$lane/$id.summary" fail_file="$ROOT/.artifacts/$lane/$id.fail"
+  rm -f "$summary_file" "$fail_file" 2>/dev/null || true
   if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" "$crew" "$id" "$title"; then
     local verb
     if [[ "$lane" == "marketing" ]]; then task_review "$id"; verb="staged for review"; else task_merged "$id"; verb="merged to develop"; fi
@@ -96,7 +100,12 @@ run_one() { # <id> <lane> <title>
     task_comment "$id" "$(printf 'Dozer %s - lane:%s\n%s' "$verb" "$lane" "$body")"
     echo "  ok #$id $verb"
   else
-    task_block "$id"; task_comment "$id" "Dozer blocked in lane:$lane - needs a look."; echo "  x #$id failed" >&2
+    local reason
+    if [[ -s "$fail_file" ]]; then reason="$(head -c 2000 "$fail_file")"
+    else reason="crew exited without recording a reason — see the Dozer loop log (~/.dozers/logs/loop.err.log)"; fi
+    task_block "$id"
+    task_comment "$id" "$(printf 'Dozer blocked in lane:%s - needs a look.\nReason: %s' "$lane" "$reason")"
+    echo "  x #$id failed: $reason" >&2
   fi
 }
 

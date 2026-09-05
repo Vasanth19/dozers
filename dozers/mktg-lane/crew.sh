@@ -23,6 +23,10 @@ ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 WORKDIR="${WORKDIR:-.}"; DOZER_PERSONA="${DOZER_PERSONA:-}"
 OUT="$REPO_ROOT/.artifacts/mktg"; mkdir -p "$OUT"
+# fail: print the reason AND record it in $OUT/<id>.fail so the engine puts it in the
+# block comment (GSAI-26 #3) — same contract as the dev lane.
+fail() { echo "    [mktg] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
+rm -f "$OUT/$ID.fail" 2>/dev/null || true
 
 cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
 VOICE="$(grep -E '^[[:space:]]*voice:' "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*voice:[[:space:]]*//; s/"//g' || true)"; VOICE="${VOICE:-clear, warm, no hype}"
@@ -35,7 +39,7 @@ if [[ -n "${MODEL_CMD:-}" ]]; then
   DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
 else
   _route="$("$REPO_ROOT/dozers/model.sh" env "$DOZER_ROLE")" \
-    || { echo "    [mktg] ✗ model routing failed for role '$DOZER_ROLE'" >&2; exit 1; }
+    || fail "model routing failed for role '$DOZER_ROLE'"
   eval "$_route"; unset _route
 fi
 MODEL_DESC="${DOZER_MODEL_PROVIDER:-claude}/${DOZER_MODEL_NAME:-default}"
@@ -64,8 +68,8 @@ You are a Dozer producing a marketing asset. Brand voice: $VOICE.
 Persona/rules: $DOZER_PERSONA
 Output ONLY the finished asset (no preamble). Brief #$ID: $TITLE
 EOF
-  eval "$MODEL_CMD \"\$PROMPT\"" > "$DRAFT" 2>/dev/null || { echo "    [mktg] ✗ content model failed" >&2; exit 1; }
-  [[ -s "$DRAFT" ]] || { echo "    [mktg] ✗ empty draft" >&2; exit 1; }
+  eval "$MODEL_CMD \"\$PROMPT\"" > "$DRAFT" 2>/dev/null || fail "content model failed"
+  [[ -s "$DRAFT" ]] || fail "empty draft"
   echo "    [mktg] produced draft via model"
 fi
 
