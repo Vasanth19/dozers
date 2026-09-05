@@ -10,8 +10,14 @@
 #     per-project lock, and each merge is GREEN-GATED — verified on the integration
 #     branch after merging; a merge that breaks it is reverted and the task sent back.
 #
-# Env: WORKDIR, DOZER_PERSONA, REPO_ROOT. Config: integration_branch, model_cmd, push,
+# Env: WORKDIR, DOZER_PERSONA, REPO_ROOT. Config: integration_branch, push,
 #   branch_prefix, worktree_root. DRY_RUN=1 stubs the model + tests.
+#
+# Model routing: the brain this lane runs on comes from org/config.yaml `models.dev`
+#   (provider + model), resolved by dozers/model.sh. Override per-run with
+#   DOZER_MODEL_DEV="<provider>[:<model>]" (e.g. ollama-cloud:glm-5.2), or bypass
+#   routing entirely by exporting MODEL_CMD. A route that can't be satisfied FAILS the
+#   crew — no silent fallback.
 set -euo pipefail
 ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -25,7 +31,18 @@ cd "$WORKDIR" 2>/dev/null || fail "workdir missing: $WORKDIR"
 git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git repo: $WORKDIR"
 
 INTEG="${INTEGRATION_BRANCH:-$(cfg integration_branch)}"; INTEG="${INTEG:-develop}"
-MODEL_CMD="${MODEL_CMD:-$(cfg model_cmd)}"; MODEL_CMD="${MODEL_CMD:-claude -p}"
+# ── Model routing: which brain runs this lane (see dozers/model.sh + config `models:`).
+# MODEL_CMD already in the env wins (legacy/manual override). Otherwise resolve the
+# ROLE's route — fail fast: a bad provider or a missing key stops the crew, it never
+# silently falls back to claude.
+DOZER_ROLE="${DOZER_ROLE:-dev}"
+if [[ -n "${MODEL_CMD:-}" ]]; then
+  DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
+else
+  _route="$("$REPO_ROOT/dozers/model.sh" env "$DOZER_ROLE")" || fail "model routing failed for role '$DOZER_ROLE'"
+  eval "$_route"; unset _route
+fi
+MODEL_DESC="${DOZER_MODEL_PROVIDER:-claude}/${DOZER_MODEL_NAME:-default}"
 PUSH="${PUSH:-$(cfg push)}"
 PREFIX="${BRANCH_PREFIX:-$(cfg branch_prefix)}"; PREFIX="${PREFIX:-dozer}"
 WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.dozers/worktrees}"; WT_ROOT="${WT_ROOT/#\~/$HOME}"; mkdir -p "$WT_ROOT"
@@ -52,6 +69,7 @@ if ! git show-ref --verify --quiet "refs/heads/$INTEG" \
 fi
 
 echo "    [dev] cwd=$(pwd)  integration=$INTEG  branch=$BRANCH"
+echo "    [dev] model: $MODEL_DESC"
 [[ -n "$DOZER_PERSONA" ]] && echo "    [dev] persona: $DOZER_PERSONA" || true
 [[ -f AGENTS.md ]] && echo "    [dev] + project AGENTS.md" || true
 
@@ -154,6 +172,7 @@ if [[ "${DRY_RUN:-}" == "1" ]]; then agent_line="stub commit (dry-run)"; tests_l
 else agent_line="implemented + committed"; tests_line="gate passed"; gate_line="$INTEG green after merge"; fi
 cat > "$OUT/$ID.summary" <<EOF
 - Picked up: $TITLE$([[ $RESUMING == 1 ]] && echo " (RESUMED, attempt $attempt)")
+- model: $MODEL_DESC
 - Worktree $BRANCH off $INTEG (isolated)
 - Coding agent: $agent_line
 - Tests: $tests_line
