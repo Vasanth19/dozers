@@ -205,19 +205,33 @@ def repo(identifier):
             print(n["name"][len("repo:"):]); return
 
 
+def _is_inflight(i):
+    """Claimed-but-not-finished — the ONLY thing a reaper may requeue.
+
+    A claim (claim()) is exactly: dozer:in-progress + state started. So in-flight
+    requires that label — a started issue with just a lane: label is a Director's or
+    a human's own work, NOT a stranded Dozer (2026-09-04 incident: the reaper
+    requeued GSAI-21/23/24/25 — director-owned, merged-develop and blocked issues —
+    because this filter only looked at state + lane). Anything already at an
+    off-ramp (needs-review, merged-develop, blocked) is finished Dozer work, not
+    in flight, even if the in-progress label lingers.
+    """
+    labels = i["labels"]["nodes"]
+    if i["state"]["type"] != "started":
+        return False
+    if not _has(labels, INPROG) or _has(labels, READY):
+        return False
+    if any(_has(labels, off) for off in (NEEDSREVIEW, MERGEDDEV, BLOCKED)):
+        return False
+    return bool(_lane_of(labels))
+
+
 def list_inflight():
-    # Claimed-but-not-finished: state `started`, has a lane, no dozer:ready, and NOT
-    # awaiting human review. These are what a reaper checks for a live worker; the ones
-    # without one get requeued.
+    # These are what the reaper checks for a live worker; the ones without one get
+    # requeued. See _is_inflight for the (deliberately strict) definition.
     for i in _all_issues():
-        if i["state"]["type"] != "started":
-            continue
-        labels = i["labels"]["nodes"]
-        if _has(labels, NEEDSREVIEW):
-            continue
-        lane = _lane_of(labels)
-        if lane and not _has(labels, READY):
-            print(f'{i["identifier"]}\t{lane}\t{i["title"]}')
+        if _is_inflight(i):
+            print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}')
 
 
 def requeue(identifier):
