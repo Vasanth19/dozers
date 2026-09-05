@@ -24,6 +24,10 @@ is `dozers/lanes/dev.sh`, run as a crew of steps:
 4. **Test.** Run the project's test command. **Red = not done.** Fail hard; do not
    paper over a failure or mark the task complete with tests failing.
 5. **Merge.** Serial-merge the worktree back to the integration branch (`develop`).
+   Two gates guard the merge: the **migration gate** blocks before merging if the
+   branch changes a DB schema but ships no matching migration (LL-31 guardrail —
+   a legit schema-only edit can carry `[skip-migration]` in a commit message), and
+   the **green-gate** reverts the merge if the integration branch stops passing.
 
 ## Which repo
 

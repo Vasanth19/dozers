@@ -52,6 +52,15 @@ worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
 model_cmd: "claude -p"           # LEGACY flat default — superseded by `models:` below (still honoured via MODEL_CMD)
 push: "false"                    # push the integration branch to origin after merge
 
+# ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
+# Before merging, if the branch touches a DB schema file but ships no matching
+# migration, the merge is BLOCKED and sent back — a schema drift with no
+# migration breaks deploys. Globs below default to Prisma; repos with no schema
+# files are a no-op. Disable with MIGRATION_GATE=off; a legit schema-only edit
+# that needs no migration can carry [skip-migration] in a commit message.
+schema_globs: "*.prisma"                        # space-separated; what counts as a schema change
+migration_globs: "*/migrations/* */migrate/*"   # space-separated; what counts as a migration
+
 # ── Model routing — which brain each ROLE runs on. Swap a role's provider any time. ──
 # provider: claude | ollama-cloud | ollama-local | codex     model: provider-specific id ("" = provider default)
 # Env override wins:  DOZER_MODEL_<ROLE>="<provider>[:<model>]"  e.g. DOZER_MODEL_DEV=ollama-cloud:glm-5.2
