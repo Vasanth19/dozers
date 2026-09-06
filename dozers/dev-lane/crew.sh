@@ -20,6 +20,10 @@
 #   it's clean; a dirty checkout fails fast. Otherwise a throwaway merge worktree.
 #   On failure the reason lands in .artifacts/dev/<id>.fail for the block comment.
 #
+# Test gate (GSAI-27): NO detectable test command is a hard STOP, not a shrug.
+#   Opt out per repo only — .dozers-no-test-gate marker, `no_test_gate: true` in the
+#   repo's ecosystem.yaml entry, or TEST_GATE=off for a single deliberate run.
+#
 # Model routing: the brain this lane runs on comes from org/config.yaml `models.dev`
 #   (provider + model), resolved by dozers/model.sh. Override per-run with
 #   DOZER_MODEL_DEV="<provider>[:<model>]" (e.g. ollama-cloud:glm-5.2), or bypass
@@ -69,6 +73,59 @@ install_deps() {  # $1 = worktree dir, $2 = label for the failure message
   ( cd "$d" && $cmd ) >"$OUT/$ID.deps.log" 2>&1 \
     || fail "$what deps install failed ($cmd in $d) — see $OUT/$ID.deps.log; last lines:
 $(tail -n 5 "$OUT/$ID.deps.log" 2>/dev/null | sed 's/^/      /')"
+}
+
+# ── Test gate (GSAI-27) ──────────────────────────────────────────────────────
+# The Dozer's whole safety claim is "a merge that breaks the integration branch is
+# reverted and the task sent back". That claim is VACUOUS when no test command is
+# found: the old ladder ended in `⚠ no test command detected — proceeding` and merged
+# anyway, with the warning going only to loop.out.log. cfw-social has no `test` script,
+# so five merges (CFW-31/93/104/134/173) landed ungated on 2026-09-05 and nothing said
+# so. Now an undetectable test command FAILS the crew — the issue lands on
+# dozer:blocked with the reason in the Linear comment, and the Director decides.
+#
+# Opt-out is PER REPO, never a global default (a gate you can switch off everywhere at
+# once is not a gate). Any one of:
+#   1) a `.dozers-no-test-gate` marker file in the repo (or in the worktree)
+#   2) `no_test_gate: true` on that repo's project entry in ~/ecosystem/ecosystem.yaml
+#   3) TEST_GATE=off in the env — one deliberate run, set by a Director
+TEST_CMD=""   # set by resolve_test_cmd; empty means "waived for this repo"
+
+detect_test_cmd() {  # $1 = dir → echoes the command; returns 1 when there is none
+  local d="$1"
+  if   [[ -f "$d/package.json" ]] && grep -q '"test"[[:space:]]*:' "$d/package.json"; then echo "npm test"
+  elif [[ -f "$d/Makefile" ]] && grep -qE '^test:' "$d/Makefile"; then echo "make test"
+  else return 1; fi
+}
+
+test_gate_waiver() {  # $1 = dir → echoes WHY the gate is off for this repo, else 1
+  local d="$1" flag
+  [[ "${TEST_GATE:-on}" == "off" ]] && { echo "TEST_GATE=off for this run"; return 0; }
+  [[ -f "$WORKDIR/.dozers-no-test-gate" || -f "$d/.dozers-no-test-gate" ]] \
+    && { echo ".dozers-no-test-gate marker in the repo"; return 0; }
+  flag="$(python3 "$REPO_ROOT/tasks/ecosystem_workdir.py" --flag no_test_gate --path "$WORKDIR" 2>/dev/null || true)"
+  [[ "$flag" == "true" ]] && { echo "no_test_gate: true in ecosystem.yaml"; return 0; }
+  return 1
+}
+
+# Sets $TEST_CMD for a dir, or explains why there is nothing to run. Returns 1 when
+# the gate is ungated AND unwaived, so callers that must clean up first (the
+# green-gate has already merged) can revert before failing; $NO_TEST_MSG holds the
+# reason. Callers with nothing to undo just `|| fail "$NO_TEST_MSG"`.
+NO_TEST_MSG=""
+resolve_test_cmd() {  # $1 = dir, $2 = stage label
+  local d="$1" stage="$2" why
+  TEST_CMD=""; NO_TEST_MSG=""
+  if TEST_CMD="$(detect_test_cmd "$d")"; then echo "    [dev] $stage: test command \`$TEST_CMD\`"; return 0; fi
+  TEST_CMD=""
+  if why="$(test_gate_waiver "$d")"; then
+    echo "    [dev] ⚠ $stage: no test command — gate waived for this repo ($why)"; return 0
+  fi
+  NO_TEST_MSG="$stage: no test command detected in $d — refusing to merge ungated (GSAI-27).
+      Add a \`test\` script to package.json (or a \`test:\` target in the Makefile),
+      or opt this repo out deliberately: a .dozers-no-test-gate file in the repo,
+      \`no_test_gate: true\` on its ecosystem.yaml entry, or TEST_GATE=off for one run."
+  return 1
 }
 
 # Migration gate (LL-31 guardrail): a change that touches a DB schema MUST ship
@@ -187,11 +244,9 @@ if [[ "${DRY_RUN:-}" == "1" ]]; then
 else
   ( cd "$WT" && eval "$MODEL_CMD \"\$PROMPT\"" ) || fail "coding agent failed (worktree kept for resume)"
   install_deps "$WT" "task worktree"   # no-op if the agent (or link_deps) already provided node_modules
-  if [[ -f "$WT/package.json" ]] && grep -q '"test"' "$WT/package.json"; then
-    ( cd "$WT" && npm test ) || fail "tests failed — not merging (worktree kept for resume)"
-  elif [[ -f "$WT/Makefile" ]] && grep -qE '^test:' "$WT/Makefile"; then
-    ( cd "$WT" && make test ) || fail "tests failed — not merging (worktree kept for resume)"
-  else echo "    [dev] ⚠ no test command detected — proceeding"; fi
+  resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
+  [[ -z "$TEST_CMD" ]] || ( cd "$WT" && eval "$TEST_CMD" ) \
+    || fail "tests failed — not merging (worktree kept for resume)"
   git -C "$WT" diff --quiet "$base" -- 2>/dev/null && fail "agent produced no commits on $BRANCH"
 fi
 
@@ -241,15 +296,24 @@ else
   fi
 fi
 # green-gate: the integration branch must STILL pass after the merge, else revert it.
+# The same hole is closed here (GSAI-27): a merge with nothing to run is NOT green,
+# it is unverified — revert it and send the task back, exactly as a red one.
+GATE_WAIVED=0
 if [[ "${DRY_RUN:-}" != "1" ]]; then
-  gate=1
-  if [[ -f "$MW/package.json" ]] && grep -q '"test"' "$MW/package.json"; then ( cd "$MW" && npm test ) || gate=0
-  elif [[ -f "$MW/Makefile" ]] && grep -qE '^test:' "$MW/Makefile"; then ( cd "$MW" && make test ) || gate=0; fi
+  gate=1; gate_why=""
+  if ! resolve_test_cmd "$MW" "green-gate"; then
+    gate=0; gate_why="$NO_TEST_MSG"
+  elif [[ -z "$TEST_CMD" ]]; then
+    GATE_WAIVED=1
+  elif ! ( cd "$MW" && eval "$TEST_CMD" ); then
+    gate=0; gate_why="merge broke $INTEG"
+  fi
   if (( ! gate )); then
     git -C "$MW" reset --hard "$PREMERGE" >/dev/null 2>&1 || true
-    fail "merge broke $INTEG — reverted to keep it green; task sent back"
+    fail "$gate_why — reverted to keep $INTEG green; task sent back"
   fi
-  echo "    [dev] green-gate: $INTEG still passing after merge"
+  (( GATE_WAIVED )) && echo "    [dev] green-gate: waived (no test command, opted out)" \
+                    || echo "    [dev] green-gate: $INTEG still passing after merge"
 fi
 [[ "$PUSH" == "true" ]] && ( git -C "$MW" push origin "$INTEG" >/dev/null 2>&1 && echo "    [dev] pushed $INTEG" || echo "    [dev] ⚠ push failed" )
 
@@ -266,6 +330,7 @@ project: $WORKDIR
 branch: $BRANCH → $INTEG (merged, green-gated, cleaned up)
 EOF
 if [[ "${DRY_RUN:-}" == "1" ]]; then agent_line="stub commit (dry-run)"; tests_line="skipped (dry-run)"; gate_line="skipped (dry-run)"
+elif (( GATE_WAIVED )); then agent_line="implemented + committed"; tests_line="no test command — gate waived for this repo"; gate_line="not verified (test gate opted out)"
 else agent_line="implemented + committed"; tests_line="gate passed"; gate_line="$INTEG green after merge"; fi
 cat > "$OUT/$ID.summary" <<EOF
 - Picked up: $TITLE$([[ $RESUMING == 1 ]] && echo " (RESUMED, attempt $attempt)")

@@ -52,6 +52,13 @@ worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
 model_cmd: "claude -p"           # LEGACY flat default — superseded by `models:` below (still honoured via MODEL_CMD)
 push: "false"                    # push the integration branch to origin after merge
 
+# ── Test gate (GSAI-27) — deliberately NOT configurable here ────────────────
+# The dev lane refuses to merge a repo where no test command can be detected: an
+# unverified merge is not a green one. There is no knob in this file on purpose —
+# a switch that turns the gate off for every repo at once is not a gate. Opt a
+# SINGLE repo out with a `.dozers-no-test-gate` file in it, or `no_test_gate: true`
+# on its ~/ecosystem/ecosystem.yaml project entry; TEST_GATE=off waives one run.
+
 # ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
 # Before merging, if the branch touches a DB schema file but ships no matching
 # migration, the merge is BLOCKED and sent back — a schema drift with no
