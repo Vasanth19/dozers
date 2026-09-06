@@ -315,7 +315,30 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
 | `dozers/model.sh` · `tasks/model_route.py` | Per-role model routing — `show` / `env <role>` / `smoke <provider>`. |
 | `org/config.yaml` | Teams, lanes, fan-out, integration branch, per-role model routing. |
+| `tests/` · `Makefile` | The regression suite. `make test` runs `tests/run-all.sh`, which runs every `tests/*-test.sh`. |
 | `AGENTS.md` · `BUZZ-SETUP.md` | The role map + the Buzz/Codex/Claude run guide. |
+
+## Tests
+
+```bash
+make test                                  # the whole suite (this is the repo's test command)
+bash tests/run-all.sh tests/reaper-test.sh # one test
+TEST_TIMEOUT=300 make test                 # per-test watchdog, default 240s
+```
+
+Each test drives the *real* engine, crews and gates against throwaway repos and a stub
+agent — no model call, no network, no writes outside `mktemp`. Add one as
+`tests/<thing>-test.sh` and the runner picks it up; nothing to register.
+
+The runner **scrubs the environment** before every test (`MODEL_CMD`, `DOZER_MODEL_*`,
+`DOZER_PERSONA`, the `ANTHROPIC_*` routing block, the lane knobs, `LINEAR_API_KEY`).
+That matters because the dev lane runs this very command *from inside a crew*, where
+all of those are exported: without the scrub, tests that drive the crews would assert
+on the inherited route instead of the one under test, and the suite would pass in your
+shell but fail in the harness.
+
+This repo is deliberately **not** opted out of its own test gate — `make test` exists so
+the harness that blocks ungated merges can clear its own gate honestly.
 
 ## Swap the backend
 

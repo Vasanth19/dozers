@@ -39,14 +39,27 @@ s = re.sub(r'(?m)^ollama_env:.*$', 'ollama_env: "%s"' % vault, s)
 open(p, 'w').write(s)
 PY
 
-# Every invocation below is scoped to the temp config. Also scrub any inherited
-# OLLAMA_API_KEY / DOZER_MODEL_* so the host's environment can't colour the result.
+# Every invocation below is scoped to the temp config and to a SCRUBBED environment,
+# so the host's shell can't colour the result. The list has to cover what a crew
+# *exports*, not just the DOZER_MODEL_<ROLE> overrides: when this suite runs inside a
+# Dozer crew (which is exactly where the GSAI-27 test gate runs it) MODEL_CMD and the
+# resolved DOZER_MODEL_PROVIDER/NAME/SOURCE are already in the environment, and the
+# CREW cases below would then assert on the inherited route instead of the one under
+# test — MODEL_CMD leaking in even makes the "fails fast on a bad route" case pass
+# through the legacy-override branch and never fail. (GSAI-30)
+SCRUB_ENV=( -u OLLAMA_API_KEY -u MODEL_CMD
+            -u DOZER_MODEL_DEV -u DOZER_MODEL_MARKETING -u DOZER_MODEL_SMOKE
+            -u DOZER_MODEL_PROVIDER -u DOZER_MODEL_NAME -u DOZER_MODEL_SOURCE
+            -u DOZER_ROLE -u DOZER_PERSONA
+            -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_MODEL
+            -u ANTHROPIC_SMALL_FAST_MODEL )
+
 # route [VAR=val ...] <subcommand> [args]
 route() {
   local -a envs=()
   while [[ "${1:-}" == *=* ]]; do envs+=("$1"); shift; done
-  env -u OLLAMA_API_KEY -u DOZER_MODEL_DEV -u DOZER_MODEL_MARKETING -u DOZER_MODEL_SMOKE \
-      DOZER_CONFIG="$CFG" ${envs[@]+"${envs[@]}"} bash "$ROOT/dozers/model.sh" "$@"
+  env "${SCRUB_ENV[@]}" DOZER_CONFIG="$CFG" ${envs[@]+"${envs[@]}"} \
+      bash "$ROOT/dozers/model.sh" "$@"
 }
 
 echo "== model routing =="
@@ -144,7 +157,7 @@ has "$out" "export MODEL_CMD='codex exec --model gpt-5-codex'" \
 # ── CREW: MODEL_CMD in the env wins; an unroutable role fails the crew ────────
 WD="$TMP/proj"; mkdir -p "$WD"
 crew() { # <extra env...>  — run the mktg crew in DRY_RUN against a temp workdir
-  env -u OLLAMA_API_KEY -u DOZER_MODEL_MARKETING DOZER_CONFIG="$CFG" DRY_RUN=1 \
+  env "${SCRUB_ENV[@]}" DOZER_CONFIG="$CFG" DRY_RUN=1 \
     WORKDIR="$WD" REPO_ROOT="$ROOT" "$@" bash "$ROOT/dozers/mktg-lane/crew.sh" MRT-1 "routing smoke"
 }
 set +e
