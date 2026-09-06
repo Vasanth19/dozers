@@ -52,6 +52,13 @@ worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
 model_cmd: "claude -p"           # LEGACY flat default — superseded by `models:` below (still honoured via MODEL_CMD)
 push: "false"                    # push the integration branch to origin after merge
 
+# ── Test gate (GSAI-27) — deliberately NOT configurable here ────────────────
+# The dev lane refuses to merge a repo where no test command can be detected: an
+# unverified merge is not a green one. There is no knob in this file on purpose —
+# a switch that turns the gate off for every repo at once is not a gate. Opt a
+# SINGLE repo out with a `.dozers-no-test-gate` file in it, or `no_test_gate: true`
+# on its ~/ecosystem/ecosystem.yaml project entry; TEST_GATE=off waives one run.
+
 # ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
 # Before merging, if the branch touches a DB schema file but ships no matching
 # migration, the merge is BLOCKED and sent back — a schema drift with no
@@ -60,6 +67,22 @@ push: "false"                    # push the integration branch to origin after m
 # that needs no migration can carry [skip-migration] in a commit message.
 schema_globs: "*.prisma"                        # space-separated; what counts as a schema change
 migration_globs: "*/migrations/* */migrate/*"   # space-separated; what counts as a migration
+
+# ── Liveness alarm (dozers/heartbeat-check.sh, GSAI-31) ─────────────────────
+# Where the watchdog shouts when the engine stops beating. Channel ids and pubkeys
+# are addresses, not secrets — the KEY it signs with is read from the vault below.
+# Leave alarm_channel empty to disable posting (the check still logs its verdict).
+alarm_channel: "79c94c7b-4969-4320-a379-c4edc67df34b"   # Buzz channel: cfw.social
+alarm_mention: "557d141c51da17bab381925acbd26fc4bb2805cfd4d461c337b355d27f2477f6"  # @Fizz (chief)
+alarm_env: "~/ecosystem/vault/buzz.env"                 # vault file holding BUZZ_PRIVATE_KEY + BUZZ_RELAY_URL
+# NOTE (2026-09-05): buzz.env's BUZZ_PRIVATE_KEY was deliberately CLEARED on 2026-09-03 —
+# the Guzz identity moved into the macOS Keychain as a Buzz Desktop managed agent, and the
+# CLI has no Keychain path (`buzz --help`: BUZZ_PRIVATE_KEY required, hex or nsec). So no
+# CLI-driven job can post to Buzz right now, this watchdog included. Point alarm_env at a
+# dedicated bot identity once one is minted; until then `heartbeat-check.sh install`
+# refuses to load an agent that cannot shout. Do NOT repoint this at buzz-owner.env —
+# that is Vasanth's own key, and an alarm signed as him is a lie about who is speaking.
+alarm_interval: 300                                     # how often the launchd agent runs the check (s)
 
 # ── Model routing — which brain each ROLE runs on. Swap a role's provider any time. ──
 # provider: claude | ollama-cloud | ollama-local | codex     model: provider-specific id ("" = provider default)

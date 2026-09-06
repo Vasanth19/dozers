@@ -5,8 +5,8 @@
 # schema file (Prisma by default) but ships no matching migration, the merge is
 # blocked and the task sent back — a schema drift with no migration breaks
 # deploys (the LL-31 incident). This drives the real crew end-to-end against a
-# throwaway repo (no test runner, so the gate is the only thing under test) and
-# checks three scenarios:
+# throwaway repo (no test runner — TEST_GATE=off waives the GSAI-27 test gate so the
+# migration gate is the only thing under test) and checks three scenarios:
 #   BLOCK   — schema edited, no migration            → crew fails, develop unchanged
 #   ALLOW   — schema edited + migration added         → crew succeeds, develop advances
 #   OVERRIDE— schema edited, no migration, [skip-migration] in commit → succeeds
@@ -39,7 +39,7 @@ run_crew() {  # $1 = proj dir, $2 = task id, $3 = stub script path
   local proj="$1" id="$2" stub="$3" rc=0
   REPO_ROOT="$TMP" WORKDIR="$proj" \
     WORKTREE_ROOT="$TMP/wt-$id" INTEGRATION_BRANCH="develop" \
-    MODEL_CMD="bash $stub" PUSH="false" DOZER_PERSONA="test" \
+    MODEL_CMD="bash $stub" PUSH="false" DOZER_PERSONA="test" TEST_GATE=off \
     bash "$CREW" "$id" "migration gate $id" >"$TMP/$id.log" 2>&1 || rc=$?
   echo "$rc"
 }

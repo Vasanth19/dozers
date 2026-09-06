@@ -104,6 +104,11 @@ dozers/service.sh install     # macOS → launchd KeepAlive · Linux → systemd
 dozers/service.sh status      # is it running? + the engine heartbeat
 dozers/service.sh logs        # tail the loop's log (a silent death is now visible here)
 dozers/service.sh uninstall   # stop + remove
+
+# ...and something that NOTICES when the engine stops beating, so you don't have to look
+dozers/heartbeat-check.sh creds     # can it actually shout? (checks creds before you trust it)
+dozers/heartbeat-check.sh install   # a launchd agent that alarms on a stalled engine
+dozers/heartbeat-check.sh status    # the current verdict, no alarm
 ```
 
 If the loop dies for any reason the supervisor relaunches it (throttled 10s so a
@@ -131,7 +136,8 @@ an OKR → no greenlight → no run.
 ```
   lane:dev  ─────────────────────────────────────────────────────────────
      worktree dozer/<id>  →  coding agent implements + tests + commits
-        →  test gate (red = stop)  →  serial-merge to develop (green-gated)
+        →  test gate (red = stop; NO tests = stop too)
+        →  serial-merge to develop (green-gated)
         →  Director promotes develop → main
 
   lane:marketing  ────────────────────────────────────────────────────────
@@ -173,8 +179,14 @@ robust, kept lean:
   │  A Dozer dies mid-task? Its lock goes stale; the reaper reclaims the │
   │  task (requeues it) and KILLS any runaway worker. `dozer.sh doctor`  │
   │  shows what's in-flight, alive or dead, and any orphaned worktrees.  │
-  │  Every poll the loop also writes a heartbeat (last-poll ts + pid +   │
-  │  in-flight count) so a watcher can see the engine is still looping.  │
+  │  The loop also keeps a heartbeat beacon fresh (ts + pid + LIVE       │
+  │  in-flight count + its own beat cadence) on a ticker independent of  │
+  │  the drain — so it keeps beating THROUGH a long crew run instead of  │
+  │  freezing until the drain ends. The ticker dies with the engine, so  │
+  │  a beacon can never outlive the process it vouches for.              │
+  │  `dozers/heartbeat-check.sh` is the other half: a launchd agent that │
+  │  reads the beacon and alarms when it stops — silent when a stale     │
+  │  beacon is just a long task, loud when nothing is running at all.    │
   └─────────────────────────────────────────────────────────────────────┘
 
   ┌── Seance (resume) ─────────────────────────────────────────────────┐
@@ -185,8 +197,9 @@ robust, kept lean:
 
   ┌── Refinery (green-gated merge queue) ──────────────────────────────┐
   │  Merges to develop are serialized per project (a merge lock), and    │
-  │  each merge is re-tested ON develop. A merge that breaks it is        │
-  │  reverted and the task sent back — develop stays green under fan-out. │
+  │  each merge is re-tested ON develop. A merge that breaks it — or that │
+  │  leaves nothing to run — is reverted and the task sent back, so        │
+  │  develop stays genuinely green under fan-out.                          │
   └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -308,6 +321,7 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 |------|-----------|
 | `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover` / `heartbeat`). |
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
+| `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms when it stops beating (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
 | `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
 | `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
@@ -315,7 +329,30 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
 | `dozers/model.sh` · `tasks/model_route.py` | Per-role model routing — `show` / `env <role>` / `smoke <provider>`. |
 | `org/config.yaml` | Teams, lanes, fan-out, integration branch, per-role model routing. |
+| `tests/` · `Makefile` | The regression suite. `make test` runs `tests/run-all.sh`, which runs every `tests/*-test.sh`. |
 | `AGENTS.md` · `BUZZ-SETUP.md` | The role map + the Buzz/Codex/Claude run guide. |
+
+## Tests
+
+```bash
+make test                                  # the whole suite (this is the repo's test command)
+bash tests/run-all.sh tests/reaper-test.sh # one test
+TEST_TIMEOUT=300 make test                 # per-test watchdog, default 240s
+```
+
+Each test drives the *real* engine, crews and gates against throwaway repos and a stub
+agent — no model call, no network, no writes outside `mktemp`. Add one as
+`tests/<thing>-test.sh` and the runner picks it up; nothing to register.
+
+The runner **scrubs the environment** before every test (`MODEL_CMD`, `DOZER_MODEL_*`,
+`DOZER_PERSONA`, the `ANTHROPIC_*` routing block, the lane knobs, `LINEAR_API_KEY`).
+That matters because the dev lane runs this very command *from inside a crew*, where
+all of those are exported: without the scrub, tests that drive the crews would assert
+on the inherited route instead of the one under test, and the suite would pass in your
+shell but fail in the harness.
+
+This repo is deliberately **not** opted out of its own test gate — `make test` exists so
+the harness that blocks ungated merges can clear its own gate honestly.
 
 ## Swap the backend
 
