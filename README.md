@@ -135,7 +135,8 @@ an OKR → no greenlight → no run.
 
 ```
   lane:dev  ─────────────────────────────────────────────────────────────
-     worktree dozer/<id>  →  coding agent implements + tests + commits
+     worktree dozer/<id>  →  test-gate PREFLIGHT (NO tests = stop, before any spend)
+        →  coding agent implements + tests + commits
         →  test gate (red = stop; NO tests = stop too)
         →  serial-merge to develop (green-gated)
         →  Director promotes develop → main

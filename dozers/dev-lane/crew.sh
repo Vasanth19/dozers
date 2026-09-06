@@ -23,6 +23,9 @@
 # Test gate (GSAI-27): NO detectable test command is a hard STOP, not a shrug.
 #   Opt out per repo only — .dozers-no-test-gate marker, `no_test_gate: true` in the
 #   repo's ecosystem.yaml entry, or TEST_GATE=off for a single deliberate run.
+#   Checked THREE times: a PREFLIGHT before the model (GSAI-32 — the answer is already
+#   knowable from the checkout, so don't pay for a run that can never merge), again on
+#   the task worktree after the agent, and once more at the green-gate.
 #
 # Model routing: the brain this lane runs on comes from org/config.yaml `models.dev`
 #   (provider + model), resolved by dozers/model.sh. Override per-run with
@@ -218,6 +221,35 @@ else
     || fail "could not create worktree $WT off $base: ${_wt_err:-unknown git error}"
   echo "    [dev] worktree $WT (off $base)"; echo 1 > "$STATE"
 fi
+
+# ── 1b. Test-gate PREFLIGHT (GSAI-32) ──────────────────────────────────────────
+# The gate below runs only AFTER the coding agent, so a repo with no detectable test
+# command burned a full model run — the single most expensive step in the lane — just
+# to be told the merge could never be gated. Nothing about that verdict depends on the
+# agent: `detect_test_cmd` reads package.json / Makefile out of the checkout we already
+# have. So ask now, and stop before spending anything. Same gate, same waivers, same
+# blocked-with-a-reason outcome for the Director — only cheaper and sooner.
+#
+# Deliberately BEFORE link_deps/install_deps too: an ungatable repo shouldn't pay for
+# an `npm ci` either.
+#
+# One legitimate case would otherwise be locked out: a task whose whole JOB is to add
+# the test command (GSAI-30 did exactly that for this repo — under a preflight it would
+# have blocked itself before it could ever run). TEST_GATE=bootstrap skips THIS check
+# only; the post-agent gate and the green-gate still run in full, so the task still
+# blocks unless the agent actually delivered a test command. That is the difference
+# from TEST_GATE=off, which waives the gate everywhere for the run.
+if [[ "${DRY_RUN:-}" != "1" ]]; then
+  if [[ "${TEST_GATE:-on}" == "bootstrap" ]]; then
+    echo "    [dev] ⚠ preflight skipped (TEST_GATE=bootstrap) — post-agent gate + green-gate still enforced"
+  else
+    resolve_test_cmd "$WT" "preflight" || fail "$NO_TEST_MSG
+      Caught BEFORE the coding agent ran — no model time was spent (GSAI-32).
+      If THIS task is the one that adds the test command, re-greenlight it with
+      TEST_GATE=bootstrap, which skips only this preflight and still gates the merge."
+  fi
+fi
+
 link_deps "$WT"
 [[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree"
 
