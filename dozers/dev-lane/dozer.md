@@ -29,8 +29,11 @@ is `dozers/lanes/dev.sh`, run as a crew of steps:
    Three gates guard the merge: the **test gate** blocks when no test command can be
    detected at all (opt out per repo only — a `.dozers-no-test-gate` file,
    `no_test_gate: true` on the repo's ecosystem.yaml entry, or `TEST_GATE=off` for one
-   deliberate run); the **migration gate** blocks before merging if the branch changes
-   a DB schema but ships no matching migration (LL-31 guardrail — a legit schema-only
+   deliberate run) — and it is checked as a **preflight before you are even started**,
+   so an ungatable repo never burns a model run (GSAI-32); a task whose job IS to add
+   the missing test command is greenlit with `TEST_GATE=bootstrap`, which skips only
+   that preflight and still gates the merge. The **migration gate** blocks before
+   merging if the branch changes a DB schema but ships no matching migration (LL-31 guardrail — a legit schema-only
    edit can carry `[skip-migration]` in a commit message); and the **green-gate**
    reverts the merge if the integration branch stops passing — or if, after merging,
    there is nothing left to run.
