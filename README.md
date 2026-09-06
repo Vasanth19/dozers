@@ -131,7 +131,8 @@ an OKR → no greenlight → no run.
 ```
   lane:dev  ─────────────────────────────────────────────────────────────
      worktree dozer/<id>  →  coding agent implements + tests + commits
-        →  test gate (red = stop)  →  serial-merge to develop (green-gated)
+        →  test gate (red = stop; NO tests = stop too)
+        →  serial-merge to develop (green-gated)
         →  Director promotes develop → main
 
   lane:marketing  ────────────────────────────────────────────────────────
@@ -185,8 +186,9 @@ robust, kept lean:
 
   ┌── Refinery (green-gated merge queue) ──────────────────────────────┐
   │  Merges to develop are serialized per project (a merge lock), and    │
-  │  each merge is re-tested ON develop. A merge that breaks it is        │
-  │  reverted and the task sent back — develop stays green under fan-out. │
+  │  each merge is re-tested ON develop. A merge that breaks it — or that │
+  │  leaves nothing to run — is reverted and the task sent back, so        │
+  │  develop stays genuinely green under fan-out.                          │
   └─────────────────────────────────────────────────────────────────────┘
 ```
 

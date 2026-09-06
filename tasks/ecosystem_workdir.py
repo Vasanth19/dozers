@@ -7,6 +7,14 @@ hardcode a repo path in a label or in dozer config. This helper maps:
   --repo <id>    a project id (e.g. cfw-social, cfw-website, cfw-render)  -> its local path
   --team <KEY>   a Linear team key (e.g. CFW, LL) -> that org's default repo path
 
+It also answers the reverse question (GSAI-27) — given a path on disk, what does the
+registry say ABOUT that project:
+
+  --flag <name> --path <dir>   -> print that key's value from the project entry whose
+                                  `local` is <dir> (e.g. --flag no_test_gate). Exits
+                                  non-zero (silent) when the project or key is absent,
+                                  so a caller can treat "no answer" as "not set".
+
 Resolution the Dozer uses (most-specific first):
   1) repo:<id> hint on the task   -> project.id == id
   2) the task's Linear team       -> org.linear_team == KEY, then the org's first live repo
@@ -72,12 +80,36 @@ def by_team(reg, team_key):
     return None
 
 
+def flag_for_path(reg, name, path):
+    """Look up a per-repo setting from the project entry that owns <path>.
+
+    Per-repo only, by design: there is deliberately no org-wide or global default
+    here — a gate you can switch off everywhere at once is not a gate.
+    """
+    want = os.path.realpath(expand(path) or "")
+    if not want:
+        return None
+    for p in reg.get("projects", []) or []:
+        local = expand(p.get("local"))
+        if local and os.path.realpath(local) == want:
+            return p.get(name)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="")
     ap.add_argument("--team", default="")
+    ap.add_argument("--flag", default="")
+    ap.add_argument("--path", default="")
     a = ap.parse_args()
     reg = load()
+    if a.flag:
+        v = flag_for_path(reg, a.flag, a.path)
+        if v is None:
+            return 1
+        print("true" if v is True else ("false" if v is False else str(v)))
+        return 0
     path = None
     if a.repo:
         path = by_repo(reg, a.repo)
