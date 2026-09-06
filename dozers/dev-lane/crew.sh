@@ -11,7 +11,14 @@
 #     branch after merging; a merge that breaks it is reverted and the task sent back.
 #
 # Env: WORKDIR, DOZER_PERSONA, REPO_ROOT. Config: integration_branch, push,
-#   branch_prefix, worktree_root. DRY_RUN=1 stubs the model + tests.
+#   branch_prefix, worktree_root. DRY_RUN=1 stubs the model + tests (+ deps install).
+#   DEPS_INSTALL=off skips the lockfile install that otherwise runs when a worktree
+#   has a package.json but no node_modules (GSAI-26).
+#
+# Merge target (GSAI-26): if the integration branch is already checked out somewhere
+#   (e.g. the main checkout sits on develop) the merge happens IN that checkout when
+#   it's clean; a dirty checkout fails fast. Otherwise a throwaway merge worktree.
+#   On failure the reason lands in .artifacts/dev/<id>.fail for the block comment.
 #
 # Model routing: the brain this lane runs on comes from org/config.yaml `models.dev`
 #   (provider + model), resolved by dozers/model.sh. Override per-run with
@@ -25,7 +32,10 @@ WORKDIR="${WORKDIR:-.}"; DOZER_PERSONA="${DOZER_PERSONA:-}"
 OUT="$REPO_ROOT/.artifacts/dev"; mkdir -p "$OUT"
 
 cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
-fail() { echo "    [dev] ✗ $*" >&2; exit 1; }
+# fail: print the reason AND record it in $OUT/<id>.fail so the engine can put it
+# in the block comment (GSAI-26 #3) — Directors shouldn't have to read loop.err.log.
+fail() { echo "    [dev] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
+rm -f "$OUT/$ID.fail" 2>/dev/null || true
 
 # Symlink uncommitted build deps (node_modules, env files) from the real checkout
 # into a worktree so `npm test` resolves them. Needed for BOTH the task worktree
@@ -36,6 +46,29 @@ link_deps() {  # $1 = target worktree dir
   for x in node_modules .env .env.local .env.development; do
     [[ -e "$WORKDIR/$x" && ! -e "$d/$x" ]] && ln -s "$WORKDIR/$x" "$d/$x" 2>/dev/null || true
   done
+}
+
+# Deps by lockfile (GSAI-26 #2): a worktree with a package.json but NO node_modules
+# (nothing to symlink — the real checkout never had deps installed, e.g. cfw-website)
+# would run `npm test` bare → "vitest: command not found" → gate=0 → every merge
+# reverted (CFW-31 failed 18 attempts that way). Install from the lockfile first, so
+# a failure here is reported as the INSTALL's — never disguised as "merge broke
+# develop". No lockfile → no install (a deps-free package.json is legitimate) and the
+# test run speaks for itself. DEPS_INSTALL=off disables. Output → $OUT/<id>.deps.log
+# (never inside the worktree — it may be a live checkout).
+install_deps() {  # $1 = worktree dir, $2 = label for the failure message
+  local d="$1" what="$2" cmd
+  [[ -f "$d/package.json" ]] || return 0
+  [[ -e "$d/node_modules" ]] && return 0
+  [[ "${DEPS_INSTALL:-on}" == "off" ]] && { echo "    [dev] $what: deps install off"; return 0; }
+  if   [[ -f "$d/pnpm-lock.yaml" ]];    then cmd="pnpm install --frozen-lockfile --prefer-offline"
+  elif [[ -f "$d/package-lock.json" ]]; then cmd="npm ci"
+  elif [[ -f "$d/yarn.lock" ]];         then cmd="yarn install --frozen-lockfile"
+  else echo "    [dev] ⚠ $what: package.json but no lockfile and no node_modules — not installing"; return 0; fi
+  echo "    [dev] $what: node_modules missing — $cmd"
+  ( cd "$d" && $cmd ) >"$OUT/$ID.deps.log" 2>&1 \
+    || fail "$what deps install failed ($cmd in $d) — see $OUT/$ID.deps.log; last lines:
+$(tail -n 5 "$OUT/$ID.deps.log" 2>/dev/null | sed 's/^/      /')"
 }
 
 # Migration gate (LL-31 guardrail): a change that touches a DB schema MUST ship
@@ -124,10 +157,12 @@ if [[ -d "$WT" ]] && git -C "$WT" rev-parse --verify -q "refs/heads/$BRANCH" >/d
 else
   git worktree prune >/dev/null 2>&1 || true
   git worktree remove --force "$WT" >/dev/null 2>&1 || true
-  git worktree add -B "$BRANCH" "$WT" "$base" >/dev/null 2>&1 || fail "could not create worktree $WT off $base"
+  _wt_err="$(git worktree add -B "$BRANCH" "$WT" "$base" 2>&1 >/dev/null)" \
+    || fail "could not create worktree $WT off $base: ${_wt_err:-unknown git error}"
   echo "    [dev] worktree $WT (off $base)"; echo 1 > "$STATE"
 fi
 link_deps "$WT"
+[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree"
 
 # ── 2. coding agent (implements + tests + commits INSIDE the worktree) ─────────
 read -r -d '' PROMPT <<EOF || true
@@ -151,6 +186,7 @@ if [[ "${DRY_RUN:-}" == "1" ]]; then
   git -C "$WT" add -A && git -C "$WT" commit -q -m "dozer #$ID: $TITLE (dry-run stub, attempt $attempt)" || true
 else
   ( cd "$WT" && eval "$MODEL_CMD \"\$PROMPT\"" ) || fail "coding agent failed (worktree kept for resume)"
+  install_deps "$WT" "task worktree"   # no-op if the agent (or link_deps) already provided node_modules
   if [[ -f "$WT/package.json" ]] && grep -q '"test"' "$WT/package.json"; then
     ( cd "$WT" && npm test ) || fail "tests failed — not merging (worktree kept for resume)"
   elif [[ -f "$WT/Makefile" ]] && grep -qE '^test:' "$WT/Makefile"; then
@@ -168,9 +204,29 @@ until mkdir "$MLOCK" 2>/dev/null; do (( SECONDS - _t > 300 )) && fail "merge loc
 trap 'rmdir "$MLOCK" 2>/dev/null || true' EXIT
 echo "    [dev] merge lock acquired ($SLUG)"
 
-git worktree remove --force "$MW" >/dev/null 2>&1 || true
-git worktree add "$MW" "$INTEG" >/dev/null 2>&1 || git worktree add -B "$INTEG" "$MW" "$base"
+# Where does the merge happen? A branch can be checked out in only ONE worktree, so
+# when $INTEG is already checked out somewhere (the main cfw-social checkout sits on
+# develop — GSAI-26 #1) a fresh merge worktree can't take it and every merge failed.
+# Merge IN that checkout when it's clean for tracked files; refuse loudly when dirty.
+# Never --detach + update-ref: that desyncs the live checkout's index from its branch.
+MW_OWNED=1
+git worktree prune >/dev/null 2>&1 || true
+_integ_at="$(git worktree list --porcelain 2>/dev/null \
+  | awk -v b="branch refs/heads/$INTEG" '/^worktree /{p=substr($0,10)} $0==b{print p; exit}')"
+if [[ -n "$_integ_at" && "$(cd "$_integ_at" 2>/dev/null && pwd -P)" != "$(cd "$MW" 2>/dev/null && pwd -P)" ]]; then
+  if [[ -n "$(git -C "$_integ_at" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+    fail "integration branch $INTEG is checked out dirty at $_integ_at; cannot merge — commit or stash there, then re-greenlight"
+  fi
+  MW="$_integ_at"; MW_OWNED=0
+  echo "    [dev] $INTEG is checked out at $MW (clean) — merging there"
+else
+  git worktree remove --force "$MW" >/dev/null 2>&1 || true
+  git worktree add "$MW" "$INTEG" >/dev/null 2>&1 \
+    || git worktree add -B "$INTEG" "$MW" "$base" >/dev/null 2>&1 \
+    || fail "could not create merge worktree $MW on $INTEG"
+fi
 link_deps "$MW"   # so the green-gate's `npm test` has node_modules — else every merge reverts
+[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$MW" "green-gate"
 PREMERGE="$(git -C "$MW" rev-parse HEAD)"
 if git -C "$MW" merge --no-ff "$BRANCH" -m "merge $BRANCH into $INTEG — #$ID $TITLE" >/dev/null 2>&1; then
   echo "    [dev] merged $BRANCH → $INTEG"
@@ -198,7 +254,7 @@ fi
 [[ "$PUSH" == "true" ]] && ( git -C "$MW" push origin "$INTEG" >/dev/null 2>&1 && echo "    [dev] pushed $INTEG" || echo "    [dev] ⚠ push failed" )
 
 # ── 4. cleanup (success): drop worktrees + branch + state; merge lock released on EXIT ──
-git worktree remove --force "$MW" >/dev/null 2>&1 || true
+(( MW_OWNED )) && { git worktree remove --force "$MW" >/dev/null 2>&1 || true; }
 git worktree remove --force "$WT" >/dev/null 2>&1 || true
 git branch -D "$BRANCH" >/dev/null 2>&1 || true
 rm -f "$STATE" 2>/dev/null || true
@@ -218,6 +274,6 @@ cat > "$OUT/$ID.summary" <<EOF
 - Coding agent: $agent_line
 - Tests: $tests_line
 - Merge: serialized (per-project lock) + green-gate — $gate_line
-- Merged → $INTEG; worktree + branch cleaned
+- Merged → $INTEG$( (( MW_OWNED )) || echo " (in existing checkout $MW)" ); worktree + branch cleaned
 EOF
 echo "    [dev] done #$ID"
