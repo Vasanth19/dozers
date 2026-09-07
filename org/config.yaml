@@ -72,19 +72,24 @@ schema_globs: "*.prisma"                        # space-separated; what counts a
 migration_globs: "*/migrations/* */migrate/*"   # space-separated; what counts as a migration
 
 # ── Liveness alarm (dozers/heartbeat-check.sh, GSAI-31) ─────────────────────
-# Where the watchdog shouts when the engine stops beating. Channel ids and pubkeys
-# are addresses, not secrets — the KEY it signs with is read from the vault below.
-# Leave alarm_channel empty to disable posting (the check still logs its verdict).
-alarm_channel: "79c94c7b-4969-4320-a379-c4edc67df34b"   # Buzz channel: cfw.social
+# Where the watchdog shouts when the engine stops beating (or beats but stops
+# dispatching). PRIMARY: Linear — the alarm IS the `board:to_review` label on the
+# standing tracking issue below; the Board view filters on exactly that label, so it is
+# the only write that reaches a human. OPTIONAL second hop: Buzz — sent when
+# BUZZ_PRIVATE_KEY is present, skipped quietly when it is not; a missing optional
+# channel never suppresses the primary one. Ids/channels/pubkeys are addresses, not
+# secrets — the keys are read from the vault files below (vault-first).
+alarm_issue: "GSAI-38"                                  # standing tracking issue the alarm flags (GSAI: Housekeeping)
+alarm_linear_env: "~/ecosystem/vault/linear.env"        # vault file holding LINEAR_API_KEY
+alarm_channel: "79c94c7b-4969-4320-a379-c4edc67df34b"   # Buzz channel: cfw.social (optional hop)
 alarm_mention: "557d141c51da17bab381925acbd26fc4bb2805cfd4d461c337b355d27f2477f6"  # @Fizz (chief)
 alarm_env: "~/ecosystem/vault/buzz.env"                 # vault file holding BUZZ_PRIVATE_KEY + BUZZ_RELAY_URL
-# NOTE (2026-09-05): buzz.env's BUZZ_PRIVATE_KEY was deliberately CLEARED on 2026-09-03 —
+# NOTE (2026-09-07): buzz.env's BUZZ_PRIVATE_KEY was deliberately CLEARED on 2026-09-03 —
 # the Guzz identity moved into the macOS Keychain as a Buzz Desktop managed agent, and the
-# CLI has no Keychain path (`buzz --help`: BUZZ_PRIVATE_KEY required, hex or nsec). So no
-# CLI-driven job can post to Buzz right now, this watchdog included. Point alarm_env at a
-# dedicated bot identity once one is minted; until then `heartbeat-check.sh install`
-# refuses to load an agent that cannot shout. Do NOT repoint this at buzz-owner.env —
-# that is Vasanth's own key, and an alarm signed as him is a lie about who is speaking.
+# CLI has no Keychain path. Until a dedicated bot identity is minted the Buzz hop is
+# skipped and Linear carries the alarm alone (`heartbeat-check.sh creds` shows which
+# channels can deliver). Do NOT repoint alarm_env at buzz-owner.env — that is Vasanth's
+# own key, and an alarm signed as him is a lie about who is speaking.
 alarm_interval: 300                                     # how often the launchd agent runs the check (s)
 
 # ── Model routing — which brain each ROLE runs on. Swap a role's provider any time. ──
