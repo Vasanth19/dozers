@@ -95,5 +95,5 @@ alarm_interval: 300                                     # how often the launchd 
 models:
   default:   { provider: claude, model: "" }
   dev:       { provider: claude, model: "" }
-  marketing: { provider: claude, model: "" }
+  marketing: { provider: ollama-cloud, model: "glm-5.2" }   # flipped 2026-09-07 (Vas): first role off Claude; smoke + crew e2e PASS. Revert: provider: claude, model: ""
 ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY
