@@ -262,6 +262,92 @@ def comment(identifier, text):
         {"id": iss["id"], "b": text})
 
 
+# --- engine alarm surface (dozers/heartbeat-check.sh, GSAI-31) -------------------
+# The watchdog's alarm is a LABEL, not a comment. The Board view filters on exactly
+# {"labels":{"name":{"eq":"board:to_review"}}}, and LINEAR_API_KEY authenticates as the
+# workspace's only human, so a comment alone notifies nobody (Linear never notifies you
+# about your own comment). Apply the label first; the comment is the detail.
+# Authorship is told apart by marker comments, never by author — every write here
+# carries `by:heartbeat-check`, and a later comment WITHOUT it is a human's answer.
+BOARD_REVIEW = "board:to_review"
+BOARD_RESPONDED = "board:responded"
+HB_BY = "by:heartbeat-check"
+
+
+def _now_iso():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _issue_comments(identifier):
+    d = gql('query($i:String!){ issue(id:$i){ comments(first:100){ nodes{ body createdAt url } } } }',
+            {"i": identifier})
+    iss = d["issue"]
+    if not iss:
+        die(f"no issue '{identifier}'")
+    return sorted(iss["comments"]["nodes"], key=lambda c: c["createdAt"])
+
+
+def _comment_url(identifier, body):
+    iss = issue(identifier)
+    d = gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ success comment{ url } } }',
+            {"id": iss["id"], "b": body})
+    return (d["commentCreate"].get("comment") or {}).get("url") or ""
+
+
+def alarm_probe(identifier):
+    """Can the alarm reach its surface? Resolves the tracking issue and reports it —
+    a real round-trip with the real key, so `creds` proves delivery, not just presence."""
+    iss = issue(identifier)
+    flagged = _has(iss["labels"]["nodes"], BOARD_REVIEW)
+    print(f'{iss["identifier"]}\t{iss["state"]["type"]}\t{"flagged" if flagged else "clear"}\t{iss["title"]}')
+
+
+def alarm_raise(identifier, body):
+    """Flag the tracking issue: board:to_review on, reopened if closed, then the detail."""
+    iss = issue(identifier)
+    reopen = iss["state"]["type"] in ("completed", "canceled")
+    _relabel(iss, add=[BOARD_REVIEW], remove=[BOARD_RESPONDED],
+             state_type="unstarted" if reopen else None)
+    marked = f"{body}\n\n<!-- board-ask id:{_now_iso()} {HB_BY} -->"
+    url = _comment_url(identifier, marked)
+    print(f'{identifier} -> {BOARD_REVIEW}{" (reopened)" if reopen else ""} {url}')
+
+
+def alarm_clear(identifier, body):
+    """The outage ended. If a human commented since the alarm, hand the ball back to the
+    Director (board:responded); otherwise just take the flag down. Never leave a stale
+    flag on the Board."""
+    iss = issue(identifier)
+    comments = _issue_comments(identifier)
+    last_ask = None
+    for c in comments:
+        if "board-ask" in c["body"] and HB_BY in c["body"]:
+            last_ask = c["createdAt"]
+    human = any(c["createdAt"] > last_ask and HB_BY not in c["body"]
+                for c in comments) if last_ask else False
+    if human:
+        _relabel(iss, add=[BOARD_RESPONDED], remove=[BOARD_REVIEW])
+    else:
+        _relabel(iss, remove=[BOARD_REVIEW])
+    marked = f"{body}\n\n<!-- board-clear id:{_now_iso()} {HB_BY} human_answered:{'yes' if human else 'no'} -->"
+    url = _comment_url(identifier, marked)
+    print(f'{identifier} -> {BOARD_RESPONDED if human else "flag removed"} {url}')
+
+
+def count_ready():
+    """How many greenlit (dozer:ready + lane:) issues are queued across the configured
+    teams — the third alarm row (alive but not dispatching) needs the number, not the list."""
+    n = 0
+    for i in _all_issues():
+        if i["state"]["type"] not in ("backlog", "unstarted", "triage"):
+            continue
+        labels = i["labels"]["nodes"]
+        if _has(labels, READY) and _lane_of(labels):
+            n += 1
+    print(n)
+
+
 OPS = {
     "list-untriaged": lambda a: list_untriaged(),
     "list-ready": lambda a: list_ready(),
@@ -277,6 +363,10 @@ OPS = {
     "description": lambda a: description(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
+    "alarm-probe": lambda a: alarm_probe(a[0]),
+    "alarm-raise": lambda a: alarm_raise(a[0], a[1]),
+    "alarm-clear": lambda a: alarm_clear(a[0], a[1]),
+    "count-ready": lambda a: count_ready(),
 }
 
 if __name__ == "__main__":

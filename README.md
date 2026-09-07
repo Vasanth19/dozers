@@ -106,9 +106,11 @@ dozers/service.sh logs        # tail the loop's log (a silent death is now visib
 dozers/service.sh uninstall   # stop + remove
 
 # ...and something that NOTICES when the engine stops beating, so you don't have to look
-dozers/heartbeat-check.sh creds     # can it actually shout? (checks creds before you trust it)
-dozers/heartbeat-check.sh install   # a launchd agent that alarms on a stalled engine
+dozers/heartbeat-check.sh creds     # can it actually shout? (a real round-trip to the tracking issue)
+dozers/heartbeat-check.sh install   # a launchd agent that alarms on a stalled/non-dispatching engine
 dozers/heartbeat-check.sh status    # the current verdict, no alarm
+# The alarm is a LABEL: `board:to_review` on the standing issue in `alarm_issue:` (org/config.yaml),
+# which is exactly what the Linear Board view filters on. Buzz is an optional second hop.
 ```
 
 If the loop dies for any reason the supervisor relaunches it (throttled 10s so a
@@ -195,7 +197,11 @@ robust, kept lean:
   │  a beacon can never outlive the process it vouches for.              │
   │  `dozers/heartbeat-check.sh` is the other half: a launchd agent that │
   │  reads the beacon and alarms when it stops — silent when a stale     │
-  │  beacon is just a long task, loud when nothing is running at all.    │
+  │  beacon is just a long task, loud when nothing is running at all,    │
+  │  and loud when the loop beats but stops claiming (poll= frozen with  │
+  │  idle slots and greenlit work queued). The alarm is the              │
+  │  `board:to_review` label on a standing Linear issue — the Board view │
+  │  is the surface; the flag comes down by itself on recovery.          │
   └─────────────────────────────────────────────────────────────────────┘
 
   ┌── Seance (resume) ─────────────────────────────────────────────────┐
@@ -329,7 +335,7 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 |------|-----------|
 | `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover` / `heartbeat`). |
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
-| `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms when it stops beating (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
+| `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms (Linear `board:to_review` on `alarm_issue`, Buzz optional) when it stops beating or stops dispatching (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
 | `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
 | `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md`, shared `LINEAR.md`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
