@@ -33,6 +33,16 @@ lanes:
 brand:
   voice: "clear, warm, no hype"
 
+# ── Marketing-lane stage backstop (GSAI-33) ─────────────────────────────────
+# The crew's content model runs ISOLATED from the operator's harness (claude --safe-mode:
+# no output styles, hooks, CLAUDE.md, MCP) so nothing personal can land in a publishable
+# draft. This regex (grep -E, one line) is the belt behind that buckle: any draft line
+# matching it is stripped on stage, moved into the reviewer handoff note, and logged as
+# a leak. Default = the "👨 Daddy says" footer that hit 24/24 drafts on 2026-09-06.
+# Leave unset for the default; it is a backstop, not the fix — if it ever fires, the
+# isolation broke and that is the bug to chase.
+# output_style_footer: "^[[:space:]]*(👨[[:space:]]*)?Daddy says"
+
 # ── Where the Dozer works ────────────────────────────────────────────────────
 # CANONICAL: paths are resolved from ~/ecosystem/ecosystem.yaml via
 # tasks/ecosystem_workdir.py — NEVER hardcoded here or in a label. Order:
