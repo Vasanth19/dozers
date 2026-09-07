@@ -13,6 +13,13 @@
 # Config/env: DRY_RUN=1 (placeholder draft, no model). Drafts are staged under
 #   <workdir>/.dozers-review/<id>.md.
 #
+# Two kinds of brief (GSAI-7). The engine hands the issue description in as a file
+# (DOZER_BRIEF). A brief whose description carries a `production:` line pointing at a
+# `<brand>/creatives/productions/<MM.DD-slug>/` folder is a VIDEO brief and runs the
+# HeyGen pipeline in dozers/mktg-lane/video.sh (match render → stale gate → download →
+# compose → stage). Every other brief is a COPY brief and takes the path below,
+# unchanged. Both end staged, never published.
+#
 # Model routing: the brain this lane runs on comes from org/config.yaml
 #   `models.marketing` (provider + model), resolved by dozers/model.sh. Override
 #   per-run with DOZER_MODEL_MARKETING="<provider>[:<model>]" (e.g. ollama-cloud:glm-5.2),
@@ -51,6 +58,17 @@ echo "    [mktg] model: $MODEL_DESC"
 
 REVIEW_DIR="$WORKDIR/.dozers-review"; mkdir -p "$REVIEW_DIR"
 DRAFT="$REVIEW_DIR/$ID.md"
+
+# ── route: video brief → the HeyGen pipeline (GSAI-7) ────────────────────────
+# A `production:` line in the brief is the whole signal. The video script owns its
+# own fail/summary artifacts (same contract), so we hand over completely.
+DOZER_BRIEF="${DOZER_BRIEF:-}"
+if [[ -n "$DOZER_BRIEF" && -f "$DOZER_BRIEF" ]] \
+   && grep -qiE '^[[:space:]]*([-*][[:space:]]+)?(\*\*|__)?[[:space:]]*production[[:space:]]*(\*\*|__)?[[:space:]]*:' "$DOZER_BRIEF"; then
+  echo "    [mktg] video brief (production: line) → dozers/mktg-lane/video.sh"
+  export MODEL_CMD MODEL_DESC DOZER_MODEL_PROVIDER DOZER_MODEL_NAME DOZER_BRIEF WORKDIR REPO_ROOT
+  exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/video.sh" "$ID" "$TITLE"
+fi
 
 # ── produce the asset (staged, never published) ──────────────────────────────
 if [[ "${DRY_RUN:-}" == "1" ]]; then

@@ -145,6 +145,14 @@ an OKR → no greenlight → no run.
      load brand voice  →  content agent produces the asset
         →  STAGE it to .dozers-review/  (never auto-published)
         →  issue flips to dozer:needs-review  →  a human approves
+
+  lane:marketing, VIDEO brief (a `production:` line in the issue description)
+     match the human-submitted HeyGen render by title  (no render = blocked
+        with the exact submit ask — Avatar III, 2 credits)
+        →  STALE gate: script hash vs the render's record (changed = blocked)
+        →  download raw-avatar.mp4 + ffprobe-assert  →  compose with the brand's
+           current recipe  →  STAGE mp4 + cover + captions + the posts/quick
+           payload it WOULD send  →  dozer:needs-review. Never publishes.
 ```
 
 Add a lane by dropping a `dozers/<name>-lane/crew.sh` and greenlighting `lane:<name>`.
