@@ -58,6 +58,9 @@ push: "false"                    # push the integration branch to origin after m
 # a switch that turns the gate off for every repo at once is not a gate. Opt a
 # SINGLE repo out with a `.dozers-no-test-gate` file in it, or `no_test_gate: true`
 # on its ~/ecosystem/ecosystem.yaml project entry; TEST_GATE=off waives one run.
+# The gate is checked as a PREFLIGHT before the coding agent too (GSAI-32), so an
+# ungatable repo costs no model time. TEST_GATE=bootstrap skips only that preflight —
+# for the one task whose job IS to add the test command; the merge is still gated.
 
 # ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
 # Before merging, if the branch touches a DB schema file but ships no matching

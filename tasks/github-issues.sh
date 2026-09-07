@@ -62,6 +62,7 @@ task_repo() { # <id> - repo:<name> hint label, or empty
   _gh issue view "$1" --json labels --jq '(.labels|map(.name)|map(select(startswith("repo:")))|.[0]//"")|sub("^repo:";"")'
 }
 task_team() { printf ""; }   # GitHub has no teams; workdir falls back to default/repo hint
+task_description() { _gh issue view "$1" --json body --jq '.body // ""'; }   # the issue body — the brief (GSAI-7)
 task_review() { # <id> - add needs-review label, do NOT close
   _gh issue edit "$1" --add-label "needs-review" --remove-label "status:wip" >/dev/null 2>&1 || true
 }

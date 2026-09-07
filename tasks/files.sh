@@ -68,6 +68,12 @@ task_team() { # <id> - optional team: frontmatter (usually empty for files backe
   local id="$1" ff; ff="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
   [[ -n "$ff" ]] && _fm "$ff" team || true
 }
+task_description() { # <id> - the task body below the frontmatter (the brief, GSAI-7)
+  local id="$1" ff; ff="$(ls "$BOARD"/*/"$id".md 2>/dev/null | head -1 || true)"
+  [[ -n "$ff" ]] || return 0
+  # Frontmatter = the leading run of `key: value` lines; everything after it is the body.
+  awk 'body{print;next} /^[A-Za-z_][A-Za-z0-9_-]*:[[:space:]]/{next} {body=1; print}' "$ff"
+}
 task_review() { # <id> - stage for approval: wip -> review (not done)
   local id="$1"; mv "$BOARD/wip/$id.md" "$BOARD/review/$id.md" 2>/dev/null || true
 }

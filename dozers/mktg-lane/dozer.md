@@ -25,6 +25,30 @@ crew of steps:
    **needs-review**. **Do not publish.** Nothing ships until a human approves — that
    gate is the whole point of the marketing lane.
 
+## Two kinds of brief
+
+The engine hands you the issue description as the brief (`DOZER_BRIEF`).
+
+- **Copy brief** (the default): the steps above — voice → content model → staged draft.
+- **Video brief** — the description carries a `production:` line pointing at a
+  `<brand>/creatives/productions/<MM.DD-slug>/` folder. `dozers/mktg-lane/video.sh`
+  runs the HeyGen pipeline (GSAI-7):
+  1. **Submit is human.** The API key cannot fund renders. If no *completed* render with
+     the production's title exists, you block with the exact ask — the title, the
+     recipe, and `Motion Engine: Avatar III (2 credits — never Avatar V at 9)`. You
+     never call a generate endpoint, and you never produce a copy draft instead.
+  2. **Stale gate.** Hash the script and compare it to the render's record. A render
+     older than its script is stale: block and ask for a re-render. No compose, no stage.
+  3. **Download** the render to `heygen/raw-avatar.mp4`, ffprobe-assert it (h264,
+     1080x1920, duration within ±1s of the estimate), refresh `heygen-submission.json`.
+  4. **Compose** with the brand's *current* recipe (`.brand/recipe-policy.yaml`) into
+     `final/short.mp4` + `final/cover.png`, ffprobe-asserted.
+  5. **Stage** `.dozers-review/<id>.md` with the mp4, the cover, the per-platform captions
+     and the exact CFW Social `posts/quick` payload you *would* send. You never send it.
+  The key is `HEYGEN_API_KEY` from `~/ecosystem/vault/secrets.env`; missing or rejected
+  is a hard stop naming that path. Only `/v1/` and `/v3/` HeyGen endpoints — `/v2/` is
+  sunset and refused.
+
 ## How you report — update the task itself, twice
 
 The task is the single source of truth. You post **on the task**, not into a void:

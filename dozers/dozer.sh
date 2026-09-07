@@ -152,7 +152,20 @@ run_one() { # <id> <lane> <title>
   # loop.err.log to learn why (GSAI-26 #3).
   local summary_file="$ROOT/.artifacts/$lane/$id.summary" fail_file="$ROOT/.artifacts/$lane/$id.fail"
   rm -f "$summary_file" "$fail_file" 2>/dev/null || true
-  if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" "$crew" "$id" "$title"; then
+
+  # The brief (GSAI-7): the task's description, handed to the crew as a FILE so a lane
+  # can route on what the Director wrote — the marketing lane treats a `production:`
+  # line as a video brief. Best-effort: a backend without task_description, or a
+  # fetch that fails, leaves an empty brief and the crew runs on the title alone.
+  local brief_file="$ROOT/.artifacts/$lane/$id.brief"
+  mkdir -p "$(dirname "$brief_file")" 2>/dev/null || true
+  if declare -F task_description >/dev/null 2>&1; then
+    task_description "$id" > "$brief_file" 2>/dev/null || : > "$brief_file"
+  else
+    : > "$brief_file"
+  fi
+
+  if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" DOZER_BRIEF="$brief_file" "$crew" "$id" "$title"; then
     local verb
     if [[ "$lane" == "marketing" ]]; then task_review "$id"; verb="staged for review"; else task_merged "$id"; verb="merged to develop"; fi
     local body
