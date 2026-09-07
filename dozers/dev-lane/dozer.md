@@ -24,7 +24,10 @@ is `dozers/lanes/dev.sh`, run as a crew of steps:
 4. **Test.** Run the project's test command. **Red = not done.** Fail hard; do not
    paper over a failure or mark the task complete with tests failing. **No test
    command is also not done** — a repo with nothing to run blocks (GSAI-27); add
-   the missing `test` script rather than merging unverified.
+   the missing `test` script rather than merging unverified. **Hung = failed, not
+   waiting** — every command the crew runs (agent, install, tests, push) is
+   time-bound (GSAI-37, `timeout_*` in `org/config.yaml`); one that exceeds its bound
+   is killed and the task blocks with the timeout named. Nothing holds a slot.
 5. **Merge.** Serial-merge the worktree back to the integration branch (`develop`).
    Three gates guard the merge: the **test gate** blocks when no test command can be
    detected at all (opt out per repo only — a `.dozers-no-test-gate` file,

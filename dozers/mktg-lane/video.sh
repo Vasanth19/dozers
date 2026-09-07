@@ -66,6 +66,15 @@ log()  { echo "    [mktg/video] $*"; }
 fail() { echo "    [mktg/video] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
 rm -f "$OUT/$ID.fail" 2>/dev/null || true
 
+# ── Time bounds (GSAI-37): the compose step is either a model run (timeout_model /
+# DOZER_TIMEOUT_MODEL) or a COMPOSE_CMD pipeline (timeout_compose / DOZER_TIMEOUT_COMPOSE).
+# Either hanging fails THIS task with the timeout named; it never holds the slot.
+# (The HeyGen calls already carry curl -m; the download is bounded at 900s.)
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
+TIMEBOX_CONFIG="$REPO_ROOT/org/config.yaml"
+T_MODEL="$(timebox_secs model 3600)"     || fail "bad timeout_model / DOZER_TIMEOUT_MODEL"
+T_COMPOSE="$(timebox_secs compose 1800)" || fail "bad timeout_compose / DOZER_TIMEOUT_COMPOSE"
+
 for tool in curl ffprobe ffmpeg python3 shasum; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing tool '$tool' — the video lane needs curl, ffmpeg/ffprobe, python3, shasum"
 done
@@ -352,7 +361,10 @@ FINAL_DIR="$PROD_DIR/final"; mkdir -p "$FINAL_DIR"
 SHORT="$FINAL_DIR/short.mp4"; COVER="$FINAL_DIR/cover.png"
 export PRODUCTION_DIR="$PROD_DIR" RECIPE RECIPE_DIR RAW_AVATAR="$RAW" OUT_MP4="$SHORT" OUT_COVER="$COVER" BRAND_DIR SCRIPT_FILE
 if [[ -n "${COMPOSE_CMD:-}" ]]; then
-  ( cd "$PROD_DIR" && eval "$COMPOSE_CMD" ) || fail "compose (COMPOSE_CMD) failed for recipe $RECIPE"
+  if ! timebox "$T_COMPOSE" "compose (COMPOSE_CMD)" "$PROD_DIR" "$COMPOSE_CMD"; then
+    (( TIMEBOX_HIT )) && fail "compose (COMPOSE_CMD) timed out after ${T_COMPOSE}s (DOZER_TIMEOUT_COMPOSE / timeout_compose in org/config.yaml) — killed its process group; recipe $RECIPE"
+    fail "compose (COMPOSE_CMD) failed for recipe $RECIPE"
+  fi
   COMPOSED_VIA="COMPOSE_CMD"
 elif [[ "${DRY_RUN:-}" == "1" ]]; then
   # No model: pass the avatar through so the output contract is still exercised.
@@ -379,7 +391,10 @@ Required outputs (nothing else is checked):
   - final/cover.png — the cover frame
 Do NOT publish, schedule, or upload anything anywhere. Do not touch files outside this production folder except the recipe's own scratch dirs. When both outputs exist, stop.
 EOF
-  ( cd "$PROD_DIR" && eval "$MODEL_CMD \"\$PROMPT\"" ) || fail "compose model run failed for recipe $RECIPE"
+  if ! timebox "$T_MODEL" "compose model run" "$PROD_DIR" "$MODEL_CMD \"\$PROMPT\""; then
+    (( TIMEBOX_HIT )) && fail "compose model run timed out after ${T_MODEL}s (DOZER_TIMEOUT_MODEL / timeout_model in org/config.yaml) — killed its process group; recipe $RECIPE"
+    fail "compose model run failed for recipe $RECIPE"
+  fi
   COMPOSED_VIA="$MODEL_DESC via $RECIPE"
 fi
 [[ -s "$SHORT" ]] || fail "compose produced no final/short.mp4 (recipe $RECIPE, via $COMPOSED_VIA)"

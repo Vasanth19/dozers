@@ -62,6 +62,18 @@ push: "false"                    # push the integration branch to origin after m
 # ungatable repo costs no model time. TEST_GATE=bootstrap skips only that preflight —
 # for the one task whose job IS to add the test command; the merge is still gated.
 
+# ── Time bounds on crew commands (GSAI-37) ──────────────────────────────────
+# Every command a crew hands to a repo or a model runs under dozers/timebox.sh and is
+# killed (whole process group) when it exceeds its bound; the task then FAILS with the
+# timeout named in the block comment. A hang costs one issue, never a slot or the
+# engine. Whole seconds; 0 = deliberately unbounded (visible in the log, never a
+# default). Per-run override: DOZER_TIMEOUT_<NAME> (e.g. DOZER_TIMEOUT_TEST=1800).
+timeout_model: 3600     # the coding / content agent run (a resumable crew re-picks committed work)
+timeout_test: 900       # one test run — task worktree and green-gate alike
+timeout_deps: 900       # a lockfile install (npm ci / pnpm / yarn)
+timeout_push: 300       # git push of the integration branch (only when push: "true")
+timeout_compose: 1800   # the video lane's COMPOSE_CMD pipeline (its model compose uses timeout_model)
+
 # ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
 # Before merging, if the branch touches a DB schema file but ships no matching
 # migration, the merge is BLOCKED and sent back — a schema drift with no

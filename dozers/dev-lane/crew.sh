@@ -32,6 +32,14 @@
 #   DOZER_MODEL_DEV="<provider>[:<model>]" (e.g. ollama-cloud:glm-5.2), or bypass
 #   routing entirely by exporting MODEL_CMD. A route that can't be satisfied FAILS the
 #   crew — no silent fallback.
+#
+# Time bounds (GSAI-37): every command this crew hands to a repo or a model runs under
+#   dozers/timebox.sh — the coding agent, the lockfile install, the test run in the task
+#   worktree, the green-gate run, the push. A command that exceeds its bound is killed
+#   (whole process group, so a hung grandchild goes too) and the crew FAILS naming the
+#   timeout; nothing merges. Knobs: org/config.yaml `timeout_model / _test / _deps /
+#   _push`, env DOZER_TIMEOUT_<NAME> per run. Before this a single asleep `pnpm test`
+#   held a slot for 8 hours and, through the engine's wave `wait`, every other slot too.
 set -euo pipefail
 ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -43,6 +51,24 @@ cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 
 # in the block comment (GSAI-26 #3) — Directors shouldn't have to read loop.err.log.
 fail() { echo "    [dev] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
 rm -f "$OUT/$ID.fail" 2>/dev/null || true
+
+# ── Time bounds (GSAI-37) — resolved up front so a bad value fails before any spend ──
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
+TIMEBOX_CONFIG="$REPO_ROOT/org/config.yaml"
+T_MODEL="$(timebox_secs model 3600)" || fail "bad timeout_model / DOZER_TIMEOUT_MODEL"
+T_TEST="$(timebox_secs test 900)"    || fail "bad timeout_test / DOZER_TIMEOUT_TEST"
+T_DEPS="$(timebox_secs deps 900)"    || fail "bad timeout_deps / DOZER_TIMEOUT_DEPS"
+T_PUSH="$(timebox_secs push 300)"    || fail "bad timeout_push / DOZER_TIMEOUT_PUSH"
+# run_tests: the one place a test command is executed, so both runs (task worktree and
+# green-gate) get the same bound. Returns the command's status; 124 + TIMEBOX_HIT=1 on
+# a hang. Callers turn TIMEBOX_HIT into a failure text that NAMES the timeout.
+run_tests() {  # $1 = dir, $2 = stage label
+  timebox "$T_TEST" "$2 tests (\`$TEST_CMD\`)" "$1" "$TEST_CMD"
+}
+timed_out_msg() {  # $1 = what, $2 = seconds, $3 = knob name → the failure text for a hang
+  printf '%s timed out after %ss (DOZER_TIMEOUT_%s / timeout_%s in org/config.yaml) — killed its process group' \
+    "$1" "$2" "${3^^}" "$3"
+}
 
 # Symlink uncommitted build deps (node_modules, env files) from the real checkout
 # into a worktree so `npm test` resolves them. Needed for BOTH the task worktree
@@ -73,8 +99,9 @@ install_deps() {  # $1 = worktree dir, $2 = label for the failure message
   elif [[ -f "$d/yarn.lock" ]];         then cmd="yarn install --frozen-lockfile"
   else echo "    [dev] ⚠ $what: package.json but no lockfile and no node_modules — not installing"; return 0; fi
   echo "    [dev] $what: node_modules missing — $cmd"
-  ( cd "$d" && $cmd ) >"$OUT/$ID.deps.log" 2>&1 \
-    || fail "$what deps install failed ($cmd in $d) — see $OUT/$ID.deps.log; last lines:
+  timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$OUT/$ID.deps.log" 2>&1 && return 0
+  (( TIMEBOX_HIT )) && fail "$(timed_out_msg "$what deps install (\`$cmd\` in $d)" "$T_DEPS" deps) — see $OUT/$ID.deps.log"
+  fail "$what deps install failed ($cmd in $d) — see $OUT/$ID.deps.log; last lines:
 $(tail -n 5 "$OUT/$ID.deps.log" 2>/dev/null | sed 's/^/      /')"
 }
 
@@ -274,11 +301,16 @@ if [[ "${DRY_RUN:-}" == "1" ]]; then
   printf 'dozer #%s attempt %s: %s\n' "$ID" "$attempt" "$TITLE" >> "$WT/.dozer-log"
   git -C "$WT" add -A && git -C "$WT" commit -q -m "dozer #$ID: $TITLE (dry-run stub, attempt $attempt)" || true
 else
-  ( cd "$WT" && eval "$MODEL_CMD \"\$PROMPT\"" ) || fail "coding agent failed (worktree kept for resume)"
+  if ! timebox "$T_MODEL" "coding agent" "$WT" "$MODEL_CMD \"\$PROMPT\""; then
+    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "coding agent" "$T_MODEL" model); worktree kept for resume"
+    fail "coding agent failed (worktree kept for resume)"
+  fi
   install_deps "$WT" "task worktree"   # no-op if the agent (or link_deps) already provided node_modules
   resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
-  [[ -z "$TEST_CMD" ]] || ( cd "$WT" && eval "$TEST_CMD" ) \
-    || fail "tests failed — not merging (worktree kept for resume)"
+  if [[ -n "$TEST_CMD" ]] && ! run_tests "$WT" "task worktree"; then
+    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
+    fail "tests failed — not merging (worktree kept for resume)"
+  fi
   git -C "$WT" diff --quiet "$base" -- 2>/dev/null && fail "agent produced no commits on $BRANCH"
 fi
 
@@ -337,8 +369,12 @@ if [[ "${DRY_RUN:-}" != "1" ]]; then
     gate=0; gate_why="$NO_TEST_MSG"
   elif [[ -z "$TEST_CMD" ]]; then
     GATE_WAIVED=1
-  elif ! ( cd "$MW" && eval "$TEST_CMD" ); then
-    gate=0; gate_why="merge broke $INTEG"
+  elif ! run_tests "$MW" "green-gate"; then
+    gate=0
+    # A hang on the integration branch is not "red", it is unverified — same outcome
+    # (revert + send back) but the reason must say TIMEOUT, not "broke develop".
+    if (( TIMEBOX_HIT )); then gate_why="$(timed_out_msg "green-gate tests (\`$TEST_CMD\` on $INTEG)" "$T_TEST" test)"
+    else gate_why="merge broke $INTEG"; fi
   fi
   if (( ! gate )); then
     git -C "$MW" reset --hard "$PREMERGE" >/dev/null 2>&1 || true
@@ -347,7 +383,11 @@ if [[ "${DRY_RUN:-}" != "1" ]]; then
   (( GATE_WAIVED )) && echo "    [dev] green-gate: waived (no test command, opted out)" \
                     || echo "    [dev] green-gate: $INTEG still passing after merge"
 fi
-[[ "$PUSH" == "true" ]] && ( git -C "$MW" push origin "$INTEG" >/dev/null 2>&1 && echo "    [dev] pushed $INTEG" || echo "    [dev] ⚠ push failed" )
+if [[ "$PUSH" == "true" ]]; then
+  if timebox "$T_PUSH" "push" "$MW" "git push origin \"$INTEG\" >/dev/null 2>&1"; then echo "    [dev] pushed $INTEG"
+  elif (( TIMEBOX_HIT )); then echo "    [dev] ⚠ push timed out after ${T_PUSH}s (DOZER_TIMEOUT_PUSH / timeout_push) — $INTEG merged locally, not pushed"
+  else echo "    [dev] ⚠ push failed"; fi
+fi
 
 # ── 4. cleanup (success): drop worktrees + branch + state; merge lock released on EXIT ──
 (( MW_OWNED )) && { git worktree remove --force "$MW" >/dev/null 2>&1 || true; }

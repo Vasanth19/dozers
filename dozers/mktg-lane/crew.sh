@@ -35,6 +35,13 @@ OUT="$REPO_ROOT/.artifacts/mktg"; mkdir -p "$OUT"
 fail() { echo "    [mktg] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
 rm -f "$OUT/$ID.fail" 2>/dev/null || true
 
+# ── Time bound on the model run (GSAI-37): a content model that hangs must FAIL this
+# task, not hold a slot forever. Bound = timeout_model in org/config.yaml, or
+# DOZER_TIMEOUT_MODEL for one run; resolved before any spend so a bad value fails first.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
+TIMEBOX_CONFIG="$REPO_ROOT/org/config.yaml"
+T_MODEL="$(timebox_secs model 3600)" || fail "bad timeout_model / DOZER_TIMEOUT_MODEL"
+
 cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
 VOICE="$(grep -E '^[[:space:]]*voice:' "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*voice:[[:space:]]*//; s/"//g' || true)"; VOICE="${VOICE:-clear, warm, no hype}"
 
@@ -86,7 +93,10 @@ You are a Dozer producing a marketing asset. Brand voice: $VOICE.
 Persona/rules: $DOZER_PERSONA
 Output ONLY the finished asset (no preamble). Brief #$ID: $TITLE
 EOF
-  eval "$MODEL_CMD \"\$PROMPT\"" > "$DRAFT" 2>/dev/null || fail "content model failed"
+  if ! timebox "$T_MODEL" "content model" "$PWD" "$MODEL_CMD \"\$PROMPT\" > \"\$DRAFT\" 2>/dev/null"; then
+    (( TIMEBOX_HIT )) && fail "content model timed out after ${T_MODEL}s (DOZER_TIMEOUT_MODEL / timeout_model in org/config.yaml) — killed its process group; nothing staged"
+    fail "content model failed"
+  fi
   [[ -s "$DRAFT" ]] || fail "empty draft"
   echo "    [mktg] produced draft via model"
 fi
