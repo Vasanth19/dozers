@@ -245,6 +245,17 @@ def team(identifier):
     print(issue(identifier)["team"]["key"])
 
 
+def description(identifier):
+    # The issue description IS the brief (GSAI-7): the engine hands it to the crew so a
+    # lane can route on what the Director wrote (e.g. a `production:` line marks a video
+    # brief), not just the title. Empty description -> prints nothing, exit 0.
+    d = gql('query($i:String!){ issue(id:$i){ description } }', {"i": identifier})
+    iss = d["issue"]
+    if not iss:
+        die(f"no issue '{identifier}'")
+    sys.stdout.write(iss.get("description") or "")
+
+
 def comment(identifier, text):
     iss = issue(identifier)
     gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ success } }',
@@ -263,6 +274,7 @@ OPS = {
     "comment": lambda a: comment(a[0], a[1]),
     "repo": lambda a: repo(a[0]),
     "team": lambda a: team(a[0]),
+    "description": lambda a: description(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
 }

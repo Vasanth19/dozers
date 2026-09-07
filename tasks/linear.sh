@@ -38,6 +38,7 @@ task_comment()        { local id="$1"; shift; python3 "$_LIN" comment "$id" "$*"
 
 task_repo()          { python3 "$_LIN" repo "$1"; }   # repo:<name> hint, or empty
 task_team()          { python3 "$_LIN" team "$1"; }   # the task's Linear team key
+task_description()   { python3 "$_LIN" description "$1"; }   # the issue body — the brief (GSAI-7)
 task_review()        { python3 "$_LIN" review "$1"; }   # mktg: stage for human approval (dozer:needs-review)
 task_merged()        { python3 "$_LIN" merged "$1"; }   # dev: merged to develop (dozer:merged-develop)
 task_block()         { python3 "$_LIN" block "$1"; }    # failure off-ramp (dozer:blocked)

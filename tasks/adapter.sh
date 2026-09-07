@@ -25,6 +25,11 @@
 #                            task (excludes anything awaiting human review).
 #   task_requeue <id>     -> undo a claim: put the task back to ready (keep its lane).
 # A backend without these degrades gracefully — the reaper still reaps stale locks.
+#
+# Optional BRIEF verb (GSAI-7; implemented by files/github/linear):
+#   task_description <id> -> print the task body (the Director's brief). The engine
+#                            hands it to the crew as a file (DOZER_BRIEF) so a lane can
+#                            route on the brief's content, e.g. a `production:` line.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
