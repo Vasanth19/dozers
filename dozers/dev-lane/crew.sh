@@ -52,10 +52,35 @@ rm -f "$OUT/$ID.fail" 2>/dev/null || true
 # into a worktree so `npm test` resolves them. Needed for BOTH the task worktree
 # AND the merge worktree — the green-gate runs tests in the fresh merge worktree,
 # which otherwise has no node_modules and reverts every merge (GSAI-23).
+#
+# Monorepos (GSAI-67): pnpm/npm/yarn workspaces put each package's binaries in
+# <pkg>/node_modules/.bin — `vitest` lives in apps/web/node_modules, NOT the root.
+# Linking only the root node_modules left every workspace package bare, so the
+# gate ran `vitest: command not found` and reverted clean merges. Now every nested
+# node_modules in the real checkout (packages/*, apps/*, any depth up to 5, never
+# descending INTO a node_modules or .git) is linked at the same relative path —
+# only when that package dir exists in the worktree (it's on the branch). The env
+# files beside each package are linked the same way.
+DEP_ENTRIES=( node_modules .env .env.local .env.development )
 link_deps() {  # $1 = target worktree dir
-  local d="$1" x
-  for x in node_modules .env .env.local .env.development; do
-    [[ -e "$WORKDIR/$x" && ! -e "$d/$x" ]] && ln -s "$WORKDIR/$x" "$d/$x" 2>/dev/null || true
+  local d="$1" x pkg rel src nm
+  [[ "$(cd "$WORKDIR" 2>/dev/null && pwd -P)" == "$(cd "$d" 2>/dev/null && pwd -P)" ]] && return 0
+  link_deps_dir "$WORKDIR" "$d"
+  # nested: each package dir in the real checkout that has its own node_modules.
+  # (no -mindepth: it would stop -prune applying at depth 1 and find would walk the
+  # whole root node_modules; the root entry is skipped in the loop instead.)
+  while IFS= read -r nm; do
+    [[ -n "$nm" && "$nm" != "$WORKDIR/node_modules" ]] || continue
+    pkg="$(dirname "$nm")"; rel="${pkg#"$WORKDIR"/}"
+    [[ -d "$d/$rel" ]] || continue     # package not on this branch — nothing to run there
+    link_deps_dir "$pkg" "$d/$rel" && echo "    [dev] linked deps for $rel/"
+  done < <(find "$WORKDIR" -maxdepth 5 \( -name .git -o -name node_modules \) -prune \
+             -name node_modules -print 2>/dev/null)
+}
+link_deps_dir() {  # $1 = source dir (real checkout), $2 = target dir (worktree)
+  local s="$1" t="$2" x
+  for x in "${DEP_ENTRIES[@]}"; do
+    [[ -e "$s/$x" && ! -e "$t/$x" ]] && ln -s "$s/$x" "$t/$x" 2>/dev/null || true
   done
 }
 
