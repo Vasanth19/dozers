@@ -171,8 +171,8 @@ The Dozer works *inside the target project's checkout*, resolved from your
 `ecosystem.yaml` registry — most-specific first:
 
 ```
-   repo:<id> label   →  that repo's path
-   task's team/org    →  the org's default repo
+   repo:<id> label   →  that repo's path (searched in projects: then infrastructure:)
+   task's team/org    →  the org's default repo (projects: only — infra has no org)
    workdir_default    →  fallback
 ```
 
