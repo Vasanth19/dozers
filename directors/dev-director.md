@@ -29,6 +29,10 @@ stale and will lie to you (a scary "70 behind" is usually just an un-fetched loc
 
 ## Do this every hour (one pass)
 
+0. **Reconcile the board first.** Run the **Board protocol** in `LINEAR.md`: mirror
+   anything Vas answered in Buzz `#now` or `~/ecosystem/board/inbox/` back into the
+   issue, swap `board:to_review` → `board:responded` where he replied, and act on every
+   `board:responded` issue you own **this same pass**. Nothing waits a second round.
 1. **Look at Linear.** Pull your team's issues.
 2. **Triage the new ones** (no `lane:*`, no `dozer:ready`):
    - Junk or not worth it → cancel with a one-line why.
@@ -43,6 +47,21 @@ stale and will lie to you (a scary "70 behind" is usually just an un-fetched loc
 5. **Keep it moving.** Greenlit work sitting un-grabbed for a while = the Dozer may be
    down → escalate. Don't run it yourself.
 
+## Many teams? Fan out — never wander
+
+You may own **more than one team** (your teams are data: `ecosystem.yaml` →
+`buzz.agents[<your name>].teams` — never guess them). Same behaviour in both runtimes:
+
+- **Told one team** (a launch arg, or your channel's canvas) → one pass, that team only.
+- **Told nothing** → **fan out**: reconcile the board once yourself across all your teams
+  (step 0 above — it is cross-team and must not race), then **spawn one worker per team in
+  parallel** (a Sonnet sub-agent, or `claude -p`), **max 4 running at once**. Each worker
+  runs steps 1–5 for exactly one team and returns **one line**:
+  `TEAM: greenlit N, reviewed N, promoted N, blocked N, needs-Vas: <ID or none>`.
+- **Consolidate** the workers' lines into **one** digest. Post it to the team channels /
+  `@Fizz`. Post to `#now` **only** for what needs Vas, via the Board protocol.
+- A worker never leaves its team and never writes feature code.
+
 ## When something is stuck
 
 - **Can you fix it in Linear?** (missing spec, wrong label, needs a Project link,
@@ -53,6 +72,9 @@ stale and will lie to you (a scary "70 behind" is usually just an un-fetched loc
 
 - Only for the big stuff: **money, risky/irreversible actions, cross-team trade-offs.**
 - Say it in **one short line**: what's blocked, why, and the yes/no you need.
+- Ask it the **one** way that gets an answer back: the **Board protocol** in `LINEAR.md`
+  (`@Vas` comment + `board-ask` marker + `board:to_review`, then one `#now` ping). An ask
+  that skips the label never reaches his Board view — it's the same as not asking.
 
 ## Idle = healthy
 

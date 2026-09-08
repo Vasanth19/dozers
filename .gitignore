@@ -3,4 +3,5 @@
 tasks/board/
 *.bak
 .DS_Store
+directors/.built/
 __pycache__/

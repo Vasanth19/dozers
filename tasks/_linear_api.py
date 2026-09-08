@@ -191,7 +191,10 @@ def review(identifier):      # mktg lane: staged for human approval
 
 
 def block(identifier):       # failure off-ramp
-    _relabel(issue(identifier), add=[BLOCKED], remove=[INPROG])
+    # 2026-09-05: also reset state to Todo (unstarted) — poll only sees dozer:ready
+    # issues in backlog/unstarted/triage, so a re-greenlit issue stuck in "started"
+    # (In Progress) is invisible until someone moves it back manually.
+    _relabel(issue(identifier), add=[BLOCKED], remove=[INPROG], state_type="unstarted")
 
 
 def done(identifier):        # fully done (e.g. a Director after develop->main promotion)

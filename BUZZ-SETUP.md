@@ -13,13 +13,14 @@ Buzz:  #cfw-social (canvas: team CFW …)   #learnloop (canvas: team LL …)   #
           │  read canvas → work team CFW       │  read canvas → work team LL
           ▼ greenlight ready+lane in Linear    ▼
    ────────────────────────────────────────────────────────────
-   ONE Dozer:  dozers/dozer.sh loop   (linear_teams: "CFW,LL" → routes each task
-                                        to its org's repo; fanout parallel)
+   ONE Dozer:  dozers/dozer.sh loop   (linear_teams: "CFW,LL,BRD,GSAI,DLY" → routes each
+                                        task to its org's repo; fanout parallel)
 ```
 
-**Already set up:** ab-hustler stopped; `org/config.yaml` → `linear_teams:"CFW,LL"`,
-`fanout:2`, `push:"false"`, `workdirs` map team→repo. Restart ab-hustler later:
-`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gsai.ab-hustler.plist`
+**Already set up:** `org/config.yaml` → `linear_teams:"CFW,LL,BRD,GSAI,DLY"`, `fanout:5`,
+`push:"false"` (merges stay on the local integration branch — nothing reaches origin).
+Workdirs resolve from `~/ecosystem/ecosystem.yaml`, never a hardcoded map. The loop runs
+unattended under launchd as `com.dozers.loop` (`dozers/service.sh install|status|logs`).
 
 ---
 
@@ -74,7 +75,7 @@ merges local `develop` (no push) → comments the summary. You review.
 ## Verify / rollback
 - Built code: `git -C ~/initiatives/learnloop/learnloop log --oneline develop | head`
 - Undo (nothing pushed): `git -C ~/initiatives/learnloop/learnloop reset --hard origin/develop`
-- Stop Dozer: Ctrl-C. Restart ab-hustler: the `launchctl bootstrap …` line above.
+- Stop the Dozer: Ctrl-C a foreground loop, or `dozers/service.sh` / `launchctl bootout gui/$(id -u)/com.dozers.loop` for the supervised one.
 
 ## Adding more orgs later
 Create their Linear team → add its key to `linear_teams` + path to `workdirs` in
