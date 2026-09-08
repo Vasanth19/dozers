@@ -12,6 +12,9 @@
 # Config (org/config.yaml or env): linear_teams ("CFW,LL"), fanout (1..8),
 #   workdir_default, workdirs (team/repo -> path). One process can serve all teams.
 set -euo pipefail
+# 2026-09-05 crash loop: launchd's com.dozers.loop resolved a stale Homebrew
+# `claude` (2.1.201) ahead of ~/.npm-global/bin/claude (2.1.261), crashing crews.
+export PATH="$HOME/.npm-global/bin:$PATH"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/tasks/adapter.sh"
 

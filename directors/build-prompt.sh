@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # directors/build-prompt.sh <role> [runtime]  — print a paste-ready system prompt.
 #
-#   role     = chief | dev-director | mktg-director
+#   role     = chief | dev-director | mktg-director | ops-director
 #   runtime  = buzz | claude   (optional — appends runtimes/<runtime>.md)
 #
 # One brain, no drift: the role playbook + shared Linear how-to live once; this merges
@@ -10,7 +10,7 @@
 #
 #   directors/build-prompt.sh dev-director buzz | pbcopy   # paste into the Buzz agent
 set -euo pipefail
-role="${1:?usage: build-prompt.sh <chief|dev-director|mktg-director> [buzz|claude]}"
+role="${1:?usage: build-prompt.sh <chief|dev-director|mktg-director|ops-director> [buzz|claude]}"
 runtime="${2:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

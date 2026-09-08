@@ -16,7 +16,7 @@ backend: linear
 linear_team: "CFW"
 # Multi-team mode: ONE Dozer that polls SEVERAL teams (comma-separated keys).
 # If set, it overrides linear_team — the simplest way to run every org at once.
-linear_teams: "CFW,LL,BRD,GSAI,DEL"           # serve both orgs from one Dozer
+linear_teams: "CFW,LL,BRD,GSAI,DLY"           # serve both orgs from one Dozer
 # Parallel crews one Dozer runs at once (fan-out). 1 = sequential; up to ~8.
 fanout: 5                                     # 5 parallel crews (Vas, 2026-09-04). History: 8 saturated shared Claude Code usage (throttled to 3 on 2026-09-03); per-role model routing (models:) now lets roles move off Claude to relieve that.
 
@@ -110,5 +110,5 @@ alarm_interval: 300                                     # how often the launchd 
 models:
   default:   { provider: claude, model: "" }
   dev:       { provider: claude, model: "" }
-  marketing: { provider: claude, model: "" }
+  marketing: { provider: ollama-cloud, model: "glm-5.2" }   # flipped 2026-09-07 (Vas): first role off Claude; smoke + crew e2e PASS. Revert: provider: claude, model: ""
 ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY
