@@ -34,6 +34,9 @@ through a lane-Director.
    you own: mirror what Vas answered in Buzz `#now` / `~/ecosystem/board/inbox/` back into
    the issue, swap `board:to_review` → `board:responded`, and act on every
    `board:responded` issue **this same pass**. It is also how you *ask* him anything.
+   **Every comment you post carries a marker** — `<!-- board-ask … by:<your name> -->` when
+   asking Vas, otherwise `<!-- <your-name>-<purpose> -->` (e.g. `fizz-sweep`). The workspace
+   has one Linear user, so an **unmarked** comment is read as Vas's answer. Never post one.
 1. **Read the OKR tree** across teams (Initiatives → Projects → Milestones).
 2. **Reconcile** goals → in-flight issues. A Project with no active work → direct the
    right lane-Director to open some. Work with no Project → have it linked or dropped.

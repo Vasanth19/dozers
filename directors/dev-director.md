@@ -33,6 +33,10 @@ stale and will lie to you (a scary "70 behind" is usually just an un-fetched loc
    anything Vas answered in Buzz `#now` or `~/ecosystem/board/inbox/` back into the
    issue, swap `board:to_review` → `board:responded` where he replied, and act on every
    `board:responded` issue you own **this same pass**. Nothing waits a second round.
+   **Every comment you post carries a marker** — `<!-- board-ask … by:<your name> -->` when
+   asking Vas, otherwise `<!-- <your-name>-<purpose> -->` (e.g. `guzz-promote`). The
+   workspace has one Linear user, so an **unmarked** comment is read as Vas's answer.
+   Never post one. `directors/run.sh answer <ID>` tells you whether he replied.
 1. **Look at Linear.** Pull your team's issues.
 2. **Triage the new ones** (no `lane:*`, no `dozer:ready`):
    - Junk or not worth it → cancel with a one-line why.

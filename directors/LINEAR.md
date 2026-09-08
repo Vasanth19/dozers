@@ -36,6 +36,12 @@ Linear is the truth; Buzz `#now` and `~/ecosystem/board/` are mirrors. The works
 the shared views **Board** (`board:to_review`, https://linear.app/hyphenlabs/view/f849a4eaf123) and
 **Board · responded** (https://linear.app/hyphenlabs/view/80bf520dbb90).
 
+**The marker contract — one sentence: an agent comment MUST carry a marker; an unmarked comment is Vas.**
+A marker is an HTML comment `<!-- <name>-<purpose> … -->` on its own last line — `board-ask`, `board-mirror`,
+`board-clear` are the protocol's; **every other comment you post also gets one**, named after you:
+`<!-- honey-preflight -->`, `<!-- fizz-sweep -->`, `<!-- guzz-promote -->`, `<!-- ops-director-hold -->`.
+Never post an unmarked comment — it will be read as Vas's answer and can close a question he never saw.
+
 **To ASK Vas** (only a real decision/approval — never a status ping): comment on the issue, first line
 `@Vas <question> — options: (a) … (b) …`, last line the marker `<!-- board-ask id:<ISO-8601> by:<your name> -->`.
 Add label **`board:to_review`**. Then one line in `#now` (Buzz runtime: post via your channel tools; Claude
@@ -44,9 +50,14 @@ runtime: the CLI, your own key from `~/ecosystem/vault/buzz.env`):
 An **artifact to judge** also gets `ln -s <abs-path> ~/ecosystem/board/review/<ID>-<slug>`. Keep your marker id — it is how you find the answer.
 
 **Every awake, reconcile FIRST — before triage.** For each issue you own with `board:to_review`:
-1. Read its comments. Find your newest `board-ask` marker. Any **later** comment carrying **no `board-*` marker**
-   is Vas's answer → swap `board:to_review` → **`board:responded`**, post one ack line in `#now`,
+1. Read its comments. Find the newest `board-ask` marker. Any **later** comment carrying **no marker at all**
+   (no `<!-- … -->` of *any* name — not `board-*`, not `honey-*`, not anyone's) is Vas's answer → swap
+   `board:to_review` → **`board:responded`**, post one ack line in `#now`,
    `rm -f ~/ecosystem/board/review/<ID>-*` and `mv ~/ecosystem/board/inbox/*<ID>*.md ~/ecosystem/board/inbox/_done/`.
+   A later comment that carries **any** marker is an agent's (yours, another Director's, the watchdog's) — it is
+   **never** his answer, whatever the marker's name. Don't eyeball it: `directors/run.sh answer <ID>` (or
+   `tasks/_linear_api.py board-answer <ID>`) applies exactly this rule — exit 0 = answered (swap), 3 = waiting
+   (leave it), 2 = no ask.
 2. No later unmarked comment → leave it alone. Never re-ping, never re-ask.
 
 **Pull in answers he typed elsewhere** (same awake, run before step 1):

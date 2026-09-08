@@ -17,8 +17,11 @@ Label lifecycle (dozer:* = execution; lane:/repo: = routing):
   mktg done  -> dozer:needs-review                  (human approval gate)
   failed     -> dozer:blocked
 Each mutation resolves the *issue's own* team, so multi-team ops are correct.
+
+Board protocol (GSAI-41): `board-answer <ID>` is the read-only reconcile probe —
+exit 0 = Vas answered (prints the answers), 3 = still waiting, 2 = no board-ask.
 """
-import json, os, sys, urllib.request
+import json, os, re, sys, urllib.request
 
 API = "https://api.linear.app/graphql"
 KEY = os.environ.get("LINEAR_API_KEY")
@@ -265,6 +268,64 @@ def comment(identifier, text):
         {"id": iss["id"], "b": text})
 
 
+# --- board protocol: who wrote a comment? (GSAI-41) ------------------------------
+# The workspace has ONE Linear user, so every agent comment is posted as Vasanth.
+# Authorship is told apart by MARKER, never by author. The contract, in one sentence:
+#
+#   An agent comment MUST carry a marker; an unmarked comment is Vas.
+#
+# A marker is any HTML comment in the body — `<!-- board-ask id:… by:Honey -->`,
+# `<!-- board-mirror src:… -->`, `<!-- honey-preflight -->`, `<!-- fizz-sweep -->` …
+# The old rule ("no `board-*` marker ⇒ Vas") read a Director's own `<!-- honey-preflight -->`
+# as his answer and silently flipped a live question to board:responded (GSAI-29).
+# So the match is deliberately BROAD: any `<!-- … -->` at all means "an agent wrote this".
+# Over-matching leaves a real answer un-swapped for one awake (visible, on the Board);
+# under-matching loses the question for good (invisible). Fail toward visible.
+MARKER_RE = re.compile(r"<!--.*?-->", re.S)
+ASK_RE = re.compile(r"<!--\s*board-ask\b[^>]*-->")
+
+
+def is_agent_comment(body):
+    """True when the body carries ANY `<!-- … -->` marker — i.e. an agent wrote it."""
+    return bool(MARKER_RE.search(body or ""))
+
+
+def _latest_ask(comments):
+    """The newest `board-ask` marker comment (comments sorted by createdAt), or None."""
+    asks = [c for c in comments if ASK_RE.search(c.get("body") or "")]
+    return asks[-1] if asks else None
+
+
+def board_answers(comments):
+    """Vas's answers to the newest ask: every comment AFTER the latest `board-ask` that
+    carries NO marker. Pure — takes the sorted comment list, no I/O.
+    Returns (ask, answers): ask is None when there is no board-ask at all."""
+    comments = sorted(comments, key=lambda c: c["createdAt"])
+    ask = _latest_ask(comments)
+    if ask is None:
+        return None, []
+    later = [c for c in comments if c["createdAt"] > ask["createdAt"]]
+    return ask, [c for c in later if not is_agent_comment(c.get("body"))]
+
+
+def board_answer(identifier):
+    """CLI: did Vas answer the newest board-ask on <issue>?  Read-only.
+    stdout: one line per answer `<createdAt>\t<first line>` ; exit 0 = answered,
+    3 = still waiting (nothing unmarked after the ask), 2 = no board-ask on the issue.
+    A Director swaps board:to_review -> board:responded ONLY on exit 0."""
+    ask, answers = board_answers(_issue_comments(identifier))
+    if ask is None:
+        print(f"{identifier}: no board-ask marker on this issue", file=sys.stderr)
+        sys.exit(2)
+    if not answers:
+        print(f"{identifier}: waiting — no unmarked comment after the ask at {ask['createdAt']}",
+              file=sys.stderr)
+        sys.exit(3)
+    for c in answers:
+        first = (c.get("body") or "").strip().splitlines()[0] if (c.get("body") or "").strip() else ""
+        print(f"{c['createdAt']}\t{first}")
+
+
 # --- engine alarm surface (dozers/heartbeat-check.sh, GSAI-31) -------------------
 # The watchdog's alarm is a LABEL, not a comment. The Board view filters on exactly
 # {"labels":{"name":{"eq":"board:to_review"}}}, and LINEAR_API_KEY authenticates as the
@@ -327,7 +388,9 @@ def alarm_clear(identifier, body):
     for c in comments:
         if "board-ask" in c["body"] and HB_BY in c["body"]:
             last_ask = c["createdAt"]
-    human = any(c["createdAt"] > last_ask and HB_BY not in c["body"]
+    # GSAI-41: "human" = no marker AT ALL, not merely "not ours" — a Director's own
+    # marked comment (`<!-- honey-preflight -->`, another board-ask) is never Vas.
+    human = any(c["createdAt"] > last_ask and not is_agent_comment(c["body"])
                 for c in comments) if last_ask else False
     if human:
         _relabel(iss, add=[BOARD_RESPONDED], remove=[BOARD_REVIEW])
@@ -370,6 +433,7 @@ OPS = {
     "alarm-raise": lambda a: alarm_raise(a[0], a[1]),
     "alarm-clear": lambda a: alarm_clear(a[0], a[1]),
     "count-ready": lambda a: count_ready(),
+    "board-answer": lambda a: board_answer(a[0]),
 }
 
 if __name__ == "__main__":

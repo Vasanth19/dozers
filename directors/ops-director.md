@@ -44,6 +44,10 @@ Your home is the **`GSAI: Housekeeping`** project, plus any infra issue on any t
    Vas answered in Buzz `#now` / `~/ecosystem/board/inbox/` back into the issue, swap
    `board:to_review` → `board:responded`, and act on every `board:responded` issue you own
    **this same pass**.
+   **Every comment you post carries a marker** — `<!-- board-ask … by:<your name> -->` when
+   asking Vas, otherwise `<!-- <your-name>-<purpose> -->` (e.g. `ops-director-hold`). The
+   workspace has one Linear user, so an **unmarked** comment is read as Vas's answer. Never
+   post one. `directors/run.sh answer <ID>` tells you whether he replied.
 1. **Sweep the health surfaces.** launchd jobs in `jobs-registry.yaml`, the Dozer
    heartbeat, `structure-guard.sh`, disk/log growth, dead vault entries.
 2. **Triage** the ops issues with no `lane:*` and no `dozer:ready`. Junk → cancel with a

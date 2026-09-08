@@ -82,6 +82,12 @@ aisle so the library compounds.
    `board:to_review` → `board:responded`, and act on every `board:responded` issue **this
    same pass**. It is also the only way to *ask* him — an approval ask without
    `board:to_review` never reaches his Board view.
+   **Every comment you post carries a marker** — `<!-- board-ask … by:<your name> -->` when
+   asking Vas, otherwise `<!-- <your-name>-<purpose> -->` (e.g. `honey-preflight`,
+   `honey-board-triage`). The workspace has one Linear user, so an **unmarked** comment is
+   read as Vas's answer — never post one. And the reverse: your own marked comments are
+   never his answer, so don't swap to `board:responded` on them.
+   `directors/run.sh answer <ID>` tells you whether he actually replied.
 1. **Sync & triage.** Poll the channel (`buzz messages get --channel <id> --since <ts>`;
    no push notifications) and read Linear first: your team's untriaged content issues +
    anything at `dozer:needs-review` (staged drafts awaiting your craft review) /

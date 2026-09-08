@@ -8,6 +8,7 @@
 #   directors/run.sh triage              # show untriaged work needing a decision
 #   directors/run.sh ready <id> <lane>    # approve: stamp ready + lane (dev|marketing)
 #   directors/run.sh note  <id> <text>    # leave direction on a task
+#   directors/run.sh answer <id>         # board protocol: did Vas answer the newest board-ask? (read-only)
 #
 # The actual judgment (is this worth doing? which lane? what's the spec?) is what
 # directors/<role>.md tells a model/agent to do. This script is the hands.
@@ -35,5 +36,23 @@ case "${1:-triage}" in
     task_comment "$id" "$*"
     echo "[director] noted on #$id"
     ;;
-  *) echo "usage: run.sh [triage|ready <id> <lane>|note <id> <text>]" >&2; exit 1 ;;
+  answer)
+    # GSAI-41: the reconcile probe. exit 0 = Vas answered (answers printed) → swap
+    # board:to_review → board:responded; exit 3 = still waiting → leave it alone;
+    # exit 2 = no board-ask on the issue. Never swap on anything but exit 0.
+    id="${2:?usage: answer <id>}"
+    if out="$(task_board_answer "$id")"; then
+      echo "[director] #$id answered by Vas — swap board:to_review → board:responded and act this pass:"
+      sed 's/^/  /' <<<"$out"
+    else
+      rc=$?
+      case "$rc" in
+        3) echo "[director] #$id still waiting on Vas — every later comment is marked (an agent's). Leave board:to_review on." ;;
+        2) echo "[director] #$id has no board-ask marker — nothing to reconcile." ;;
+        *) echo "[director] #$id probe failed (exit $rc)" >&2 ;;
+      esac
+      exit "$rc"
+    fi
+    ;;
+  *) echo "usage: run.sh [triage|ready <id> <lane>|note <id> <text>|answer <id>]" >&2; exit 1 ;;
 esac
