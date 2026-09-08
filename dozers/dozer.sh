@@ -106,6 +106,8 @@ beat_stop() {
 # Resolve a task's working dir from the CANONICAL registry (~/ecosystem/ecosystem.yaml),
 # most-specific first:
 #   1) repo:<id> hint on the task   2) the task's Linear TEAM/org   3) config workdir_default
+# repo:<id> matches BOTH registry lists — projects: and infrastructure: (GSAI-17) — so
+# infra repos (paperclip, openclaw, gbrain-source) route like any product repo.
 # Paths live ONLY in ecosystem.yaml — never hardcoded here or in a label.
 resolve_workdir() {
   local hint="$1" team="$2" cfgf="$ROOT/org/config.yaml" path=""

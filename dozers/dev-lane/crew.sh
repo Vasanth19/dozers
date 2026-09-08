@@ -15,6 +15,10 @@
 #   DEPS_INSTALL=off skips the lockfile install that otherwise runs when a worktree
 #   has a package.json but no node_modules (GSAI-26).
 #
+# Integration branch (GSAI-15 / GSAI-19): `develop` when the repo has one (local or
+#   remote), else the repo's own default — origin/HEAD → main → the checked-out branch.
+#   Never creates develop; a detached HEAD with nothing above it fails fast.
+#
 # Merge target (GSAI-26): if the integration branch is already checked out somewhere
 #   (e.g. the main checkout sits on develop) the merge happens IN that checkout when
 #   it's clean; a dirty checkout fails fast. Otherwise a throwaway merge worktree.
@@ -48,10 +52,35 @@ rm -f "$OUT/$ID.fail" 2>/dev/null || true
 # into a worktree so `npm test` resolves them. Needed for BOTH the task worktree
 # AND the merge worktree — the green-gate runs tests in the fresh merge worktree,
 # which otherwise has no node_modules and reverts every merge (GSAI-23).
+#
+# Monorepos (GSAI-67): pnpm/npm/yarn workspaces put each package's binaries in
+# <pkg>/node_modules/.bin — `vitest` lives in apps/web/node_modules, NOT the root.
+# Linking only the root node_modules left every workspace package bare, so the
+# gate ran `vitest: command not found` and reverted clean merges. Now every nested
+# node_modules in the real checkout (packages/*, apps/*, any depth up to 5, never
+# descending INTO a node_modules or .git) is linked at the same relative path —
+# only when that package dir exists in the worktree (it's on the branch). The env
+# files beside each package are linked the same way.
+DEP_ENTRIES=( node_modules .env .env.local .env.development )
 link_deps() {  # $1 = target worktree dir
-  local d="$1" x
-  for x in node_modules .env .env.local .env.development; do
-    [[ -e "$WORKDIR/$x" && ! -e "$d/$x" ]] && ln -s "$WORKDIR/$x" "$d/$x" 2>/dev/null || true
+  local d="$1" x pkg rel src nm
+  [[ "$(cd "$WORKDIR" 2>/dev/null && pwd -P)" == "$(cd "$d" 2>/dev/null && pwd -P)" ]] && return 0
+  link_deps_dir "$WORKDIR" "$d"
+  # nested: each package dir in the real checkout that has its own node_modules.
+  # (no -mindepth: it would stop -prune applying at depth 1 and find would walk the
+  # whole root node_modules; the root entry is skipped in the loop instead.)
+  while IFS= read -r nm; do
+    [[ -n "$nm" && "$nm" != "$WORKDIR/node_modules" ]] || continue
+    pkg="$(dirname "$nm")"; rel="${pkg#"$WORKDIR"/}"
+    [[ -d "$d/$rel" ]] || continue     # package not on this branch — nothing to run there
+    link_deps_dir "$pkg" "$d/$rel" && echo "    [dev] linked deps for $rel/"
+  done < <(find "$WORKDIR" -maxdepth 5 \( -name .git -o -name node_modules \) -prune \
+             -name node_modules -print 2>/dev/null)
+}
+link_deps_dir() {  # $1 = source dir (real checkout), $2 = target dir (worktree)
+  local s="$1" t="$2" x
+  for x in "${DEP_ENTRIES[@]}"; do
+    [[ -e "$s/$x" && ! -e "$t/$x" ]] && ln -s "$s/$x" "$t/$x" 2>/dev/null || true
   done
 }
 
@@ -181,21 +210,27 @@ WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.doz
 BRANCH="$PREFIX/$ID"; SLUG="$(basename "$WORKDIR")"
 WT="$WT_ROOT/$SLUG-$ID"; MW="$WT_ROOT/$SLUG-merge"; STATE="$WT_ROOT/$SLUG-$ID.state"
 
-# Detect, don't impose. If the configured integration branch (e.g. develop) is
-# absent from THIS repo, fall back to the repo's own default branch so trunk-based
-# / main-only repos work unchanged — we never create a develop branch here. When
-# develop DOES exist (local or remote) behavior is identical to before.
+# Detect, don't impose (GSAI-15 / GSAI-19). If the configured integration branch
+# (develop) is absent from THIS repo, fall back to the repo's own default branch so
+# trunk-based / main-only repos (brain, ecosystem, dozers, the brand + client folders)
+# work unchanged — we never create a develop branch here. Ladder: origin/HEAD → main →
+# the checked-out branch. When develop DOES exist (local or remote) behavior is
+# identical to before. A detached HEAD with nothing above it on the ladder is NOT a
+# branch: `rev-parse --abbrev-ref HEAD` prints the literal "HEAD", and a merge into
+# that would land in a throwaway worktree and vanish on cleanup — so it resolves to
+# nothing and the crew fails fast below, before any model time is spent.
 _default_branch() {
   local d
   d="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"; d="${d#refs/remotes/origin/}"
   if [[ -n "$d" ]]; then echo "$d"; return; fi
   if git show-ref --verify --quiet refs/heads/main; then echo "main"; return; fi
-  git rev-parse --abbrev-ref HEAD 2>/dev/null
+  d="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [[ -n "$d" && "$d" != "HEAD" ]] && echo "$d" || true
 }
 if ! git show-ref --verify --quiet "refs/heads/$INTEG" \
    && ! git show-ref --verify --quiet "refs/remotes/origin/$INTEG"; then
   _fallback="$(_default_branch)"
-  [[ -n "$_fallback" ]] || fail "integration branch '$INTEG' absent and no default branch in $WORKDIR"
+  [[ -n "$_fallback" ]] || fail "integration branch '$INTEG' absent and no default branch in $WORKDIR (no origin/HEAD, no main, HEAD detached) — check out or configure a branch to merge into, then re-greenlight"
   echo "    [dev] integration branch '$INTEG' absent — using repo default '$_fallback'"
   INTEG="$_fallback"
 fi

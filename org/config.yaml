@@ -56,7 +56,7 @@ brand:
 workdir_default: "."
 
 # ── Dev lane pipeline knobs (per-repo build/merge behavior) ──────────────────
-integration_branch: "develop"   # branch the Dozer cuts dozer/<id> off and merges back into
+integration_branch: "develop"   # branch the Dozer cuts dozer/<id> off and merges back into — when a repo has none, the crew falls back to its default branch (main) rather than creating it (GSAI-15)
 branch_prefix: "dozer"           # task branch = <branch_prefix>/<task-id>, e.g. dozer/CFW-9
 worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
 model_cmd: "claude -p"           # LEGACY flat default — superseded by `models:` below (still honoured via MODEL_CMD)
