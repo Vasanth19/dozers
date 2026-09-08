@@ -89,7 +89,8 @@ directors/run.sh ready ENG-42 dev             # greenlight #ENG-42 into the dev 
 ```
 
 The Dozer picks up `ENG-42` within one poll, builds it in your repo's worktree, runs
-the tests, serial-merges to `develop` (green-gated), and comments a summary on the issue.
+the tests, serial-merges to `develop` (green-gated; on a main-only repo it merges to
+`main` instead — the crew detects the branch, never imposes one), and comments a summary on the issue.
 
 ### Run it as a supervised service (survives crashes, logout, reboot)
 

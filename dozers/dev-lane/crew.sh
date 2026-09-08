@@ -15,6 +15,10 @@
 #   DEPS_INSTALL=off skips the lockfile install that otherwise runs when a worktree
 #   has a package.json but no node_modules (GSAI-26).
 #
+# Integration branch (GSAI-15 / GSAI-19): `develop` when the repo has one (local or
+#   remote), else the repo's own default — origin/HEAD → main → the checked-out branch.
+#   Never creates develop; a detached HEAD with nothing above it fails fast.
+#
 # Merge target (GSAI-26): if the integration branch is already checked out somewhere
 #   (e.g. the main checkout sits on develop) the merge happens IN that checkout when
 #   it's clean; a dirty checkout fails fast. Otherwise a throwaway merge worktree.
@@ -181,21 +185,27 @@ WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.doz
 BRANCH="$PREFIX/$ID"; SLUG="$(basename "$WORKDIR")"
 WT="$WT_ROOT/$SLUG-$ID"; MW="$WT_ROOT/$SLUG-merge"; STATE="$WT_ROOT/$SLUG-$ID.state"
 
-# Detect, don't impose. If the configured integration branch (e.g. develop) is
-# absent from THIS repo, fall back to the repo's own default branch so trunk-based
-# / main-only repos work unchanged — we never create a develop branch here. When
-# develop DOES exist (local or remote) behavior is identical to before.
+# Detect, don't impose (GSAI-15 / GSAI-19). If the configured integration branch
+# (develop) is absent from THIS repo, fall back to the repo's own default branch so
+# trunk-based / main-only repos (brain, ecosystem, dozers, the brand + client folders)
+# work unchanged — we never create a develop branch here. Ladder: origin/HEAD → main →
+# the checked-out branch. When develop DOES exist (local or remote) behavior is
+# identical to before. A detached HEAD with nothing above it on the ladder is NOT a
+# branch: `rev-parse --abbrev-ref HEAD` prints the literal "HEAD", and a merge into
+# that would land in a throwaway worktree and vanish on cleanup — so it resolves to
+# nothing and the crew fails fast below, before any model time is spent.
 _default_branch() {
   local d
   d="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"; d="${d#refs/remotes/origin/}"
   if [[ -n "$d" ]]; then echo "$d"; return; fi
   if git show-ref --verify --quiet refs/heads/main; then echo "main"; return; fi
-  git rev-parse --abbrev-ref HEAD 2>/dev/null
+  d="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [[ -n "$d" && "$d" != "HEAD" ]] && echo "$d" || true
 }
 if ! git show-ref --verify --quiet "refs/heads/$INTEG" \
    && ! git show-ref --verify --quiet "refs/remotes/origin/$INTEG"; then
   _fallback="$(_default_branch)"
-  [[ -n "$_fallback" ]] || fail "integration branch '$INTEG' absent and no default branch in $WORKDIR"
+  [[ -n "$_fallback" ]] || fail "integration branch '$INTEG' absent and no default branch in $WORKDIR (no origin/HEAD, no main, HEAD detached) — check out or configure a branch to merge into, then re-greenlight"
   echo "    [dev] integration branch '$INTEG' absent — using repo default '$_fallback'"
   INTEG="$_fallback"
 fi
