@@ -38,9 +38,29 @@ HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-$POLL_SECONDS}"
 
 # Snapshot count of in-flight run-locks (tasks claimed across every Dozer on this host,
 # since LOCK_DIR is shared). Cheap directory scan, no backend call.
+#
+# CREW locks only — and that qualifier is the whole point (GSAI-76). $LOCK_DIR is shared
+# with the DIRECTORS: every awake pass takes a `director-<role>.lock` there as its own
+# single-pass mutex (~/ecosystem/scripts/director-awake.sh), and those dirs hold a bare
+# `pid` file, not an `owner`. Counting them made the beacon publish
+# `inflight = crews + live Director passes`, and the watchdog gates on that number.
+# Observed 2026-09-08 23:24Z: the beacon said `inflight=4` while exactly ONE crew was
+# running (BRD-82), and heartbeat-check alarmed on the fiction. The dangerous direction
+# is the mirror: three Director locks plus two stuck crews reach `fanout=5`, the
+# not-dispatching gate `inflight < FANOUT` goes false, and a REAL stall reports nothing.
+#
+# So two exclusions, both at the source rather than at the reader:
+#   · `director-*.lock` — not a crew, never was.
+#   · a lock whose owner pid is dead — a crashed crew is the reaper's problem, not
+#     in-flight work; counting it holds the beacon high long after the work stopped.
 inflight_count() {
-  local n=0 lock; shopt -s nullglob
-  for lock in "$LOCK_DIR"/*.lock; do n=$((n+1)); done
+  local n=0 lock pid; shopt -s nullglob
+  for lock in "$LOCK_DIR"/*.lock; do
+    case "${lock##*/}" in director-*.lock) continue ;; esac
+    # pipe through cut so a missing/owner-less lock yields "" instead of tripping set -e
+    pid="$(grep -E '^pid=' "$lock/owner" 2>/dev/null | head -1 | cut -d= -f2-)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then n=$((n+1)); fi
+  done
   shopt -u nullglob; printf '%s' "$n"
 }
 
