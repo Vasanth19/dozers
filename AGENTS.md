@@ -56,7 +56,7 @@ one `#now` ping, and a reconcile at the top of every wake that swaps in `board:r
 
 A crew's brain is configurable per **role** (today the lane name: `dev`, `marketing`),
 not baked into the crew. `org/config.yaml` → `models:` maps each role to a `provider`
-(`claude` | `ollama-cloud` | `ollama-local` | `codex`) and an optional model id;
+(`claude` | `ollama-cloud` | `ollama-local` | `codex`) and a model id;
 `dozers/model.sh` resolves that into the crew's `MODEL_CMD` plus any provider env. Check
 the current wiring with `dozers/model.sh show`, prove a provider works with
 `dozers/model.sh smoke <provider> [model]`, and override a single run with
@@ -64,6 +64,23 @@ the current wiring with `dozers/model.sh show`, prove a provider works with
 Ship default is `claude` for every role. A route that can't be satisfied **fails the
 crew** — there is no silent fallback to another model, because a run that quietly used a
 different brain is a run you can't trust.
+
+> **Always pin the model. Never leave `model: ""` on a claude route.** An empty model
+> emits a bare `claude -p`, which inherits whatever the Claude Code CLI defaults to on
+> that machine on that day — and that default moves. Between 2026-09-02 and 2026-09-08 it
+> drifted `opus-4-8` -> `fable-5-1` -> `opus-5` with no config change, putting **37% of
+> all Dozer spend ($527) through Fable 5.1 at $10/$50 per MTok — twice Opus 5's rate**,
+> selected by nobody. `tasks/model_route.py` now **refuses** an empty claude model coming
+> from config and tells you what to write; an env override (`DOZER_MODEL_<ROLE>=claude`)
+> stays loose, because a human typing it for one run has actually chosen.
+>
+> The same rule holds for anything else that shells out to a headless CLI: **the model is
+> part of the config, not part of the environment.** If you cannot name the model a run
+> used by reading the repo, the run is not reproducible.
+>
+> Spend is not metered anywhere in this repo — the crews discard everything but stdout.
+> Reconstruct it after the fact from the session transcripts with
+> `~/ecosystem/scripts/token-report.py` (`--bucket dozer --by issue|day|model`).
 
 > **Ops lane status:** the Ops-Director and the `lane:ops` label exist, but there is **no
 > `dozers/ops-lane/` crew yet** and `org/config.yaml → lanes:` lists only `dev` and

@@ -276,6 +276,20 @@ push: "false"                          # merges stay on the local integration br
 Each parallel crew works in its own worktree; a per-project merge lock keeps `develop`
 safe. A task from any team routes to that org's repo automatically.
 
+Crews are **slots, not waves**: the engine reaps each crew the moment it finishes and
+refills that slot from the ready list, so one slow task never idles the others or
+freezes the poll (GSAI-37). And every command a crew hands to a repo or a model runs
+under a time bound — a hang is killed (whole process tree) and the task fails with the
+timeout named, instead of holding a slot forever:
+
+```yaml
+timeout_model: 3600   # coding / content agent     (DOZER_TIMEOUT_MODEL=… for one run)
+timeout_test: 900     # a test run, task worktree and green-gate alike
+timeout_deps: 900     # lockfile install
+timeout_push: 300     # git push (only when push: "true")
+timeout_compose: 1800 # the video lane's COMPOSE_CMD pipeline
+```
+
 ---
 
 ## Model routing — which brain each role runs on

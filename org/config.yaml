@@ -72,6 +72,18 @@ push: "false"                    # push the integration branch to origin after m
 # ungatable repo costs no model time. TEST_GATE=bootstrap skips only that preflight —
 # for the one task whose job IS to add the test command; the merge is still gated.
 
+# ── Time bounds on crew commands (GSAI-37) ──────────────────────────────────
+# Every command a crew hands to a repo or a model runs under dozers/timebox.sh and is
+# killed (whole process group) when it exceeds its bound; the task then FAILS with the
+# timeout named in the block comment. A hang costs one issue, never a slot or the
+# engine. Whole seconds; 0 = deliberately unbounded (visible in the log, never a
+# default). Per-run override: DOZER_TIMEOUT_<NAME> (e.g. DOZER_TIMEOUT_TEST=1800).
+timeout_model: 3600     # the coding / content agent run (a resumable crew re-picks committed work)
+timeout_test: 900       # one test run — task worktree and green-gate alike
+timeout_deps: 900       # a lockfile install (npm ci / pnpm / yarn)
+timeout_push: 300       # git push of the integration branch (only when push: "true")
+timeout_compose: 1800   # the video lane's COMPOSE_CMD pipeline (its model compose uses timeout_model)
+
 # ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
 # Before merging, if the branch touches a DB schema file but ships no matching
 # migration, the merge is BLOCKED and sent back — a schema drift with no
@@ -107,8 +119,14 @@ alarm_interval: 300                                     # how often the launchd 
 # Env override wins:  DOZER_MODEL_<ROLE>="<provider>[:<model>]"  e.g. DOZER_MODEL_DEV=ollama-cloud:glm-5.2
 # Role = the lane name today (dev, marketing); `default` covers any role not listed.
 # Inspect with `dozers/model.sh show`; test a provider with `dozers/model.sh smoke <provider> [model]`.
+# PIN THE MODEL. An empty `model` on a claude route means no `--model` flag, which
+# hands the choice to whatever the Claude Code CLI defaults to that day. That default
+# drifted opus-4-8 -> fable-5-1 -> opus-5 inside one week and put 37% of all Dozer
+# spend ($527) through Fable 5.1 at $10/$50 per MTok — 2x Opus 5 — chosen by nobody.
+# model_route.py now REFUSES an empty claude model from config; this is the fix, not
+# the workaround. (GSAI-83)
 models:
-  default:   { provider: claude, model: "" }
-  dev:       { provider: claude, model: "" }
-  marketing: { provider: ollama-cloud, model: "glm-5.2" }   # flipped 2026-09-07 (Vas): first role off Claude; smoke + crew e2e PASS. Revert: provider: claude, model: ""
+  default:   { provider: claude, model: "claude-opus-5" }
+  dev:       { provider: claude, model: "claude-opus-5" }
+  marketing: { provider: ollama-cloud, model: "glm-5.2" }   # flipped 2026-09-07 (Vas): first role off Claude; smoke + crew e2e PASS. Revert: provider: claude, model: "claude-opus-5"
 ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY

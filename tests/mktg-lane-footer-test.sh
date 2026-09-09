@@ -159,6 +159,7 @@ ER="$TMP/engine"; mkdir -p "$ER/dozers"
 ln -s "$ROOT/dozers/dozer.sh" "$ER/dozers/dozer.sh"
 ln -s "$ROOT/dozers/mktg-lane" "$ER/dozers/mktg-lane"
 ln -s "$ROOT/dozers/model.sh" "$ER/dozers/model.sh"
+ln -s "$ROOT/dozers/timebox.sh" "$ER/dozers/timebox.sh"   # crews source it (GSAI-37)
 cp -R "$ROOT/tasks" "$ER/tasks"; cp -R "$ROOT/org" "$ER/org"; rm -rf "$ER/tasks/board"
 mkdir -p "$ER/tasks/board/ready"
 printf 'title: Show HN post\nlane: marketing\n\nWrite the Show HN post.\n' > "$ER/tasks/board/ready/ENG-1.md"
