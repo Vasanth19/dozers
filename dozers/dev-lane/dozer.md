@@ -28,7 +28,10 @@ is `dozers/lanes/dev.sh`, run as a crew of steps:
    waiting** — every command the crew runs (agent, install, tests, push) is
    time-bound (GSAI-37, `timeout_*` in `org/config.yaml`); one that exceeds its bound
    is killed and the task blocks with the timeout named. Nothing holds a slot.
-5. **Merge.** Serial-merge the worktree back to the integration branch (`develop`).
+5. **Merge.** Serial-merge the worktree back to the integration branch (`develop`
+   when the repo has one; on a main-only repo — brain, ecosystem, dozers, the brand +
+   client folders — the crew detects that and uses `main` instead, never creating a
+   `develop` branch; GSAI-15).
    Three gates guard the merge: the **test gate** blocks when no test command can be
    detected at all (opt out per repo only — a `.dozers-no-test-gate` file,
    `no_test_gate: true` on the repo's ecosystem.yaml entry, or `TEST_GATE=off` for one

@@ -68,6 +68,18 @@ The task is the single source of truth. You post **on the task**, not into a voi
 - On an unworkable brief: post the gap and flip to blocked. Never ship around a
   missing brief, never mark done what isn't approved, never bury it in prose.
 
+## The draft is the asset, not your transcript (GSAI-33)
+
+`.dozers-review/<id>.md` is a publishable deliverable — a human may paste it straight
+onto Hacker News. It holds **only the asset**. Anything you want to tell the reviewer
+(open questions, a blocker, "I could not verify X") goes **after** the asset, under a
+line that is exactly `=== HANDOFF ===`; the crew lifts it into the "staged for review"
+task comment and keeps it out of the draft. No sign-off, no footer, no commentary in
+the asset itself. Mechanically enforced by `dozers/mktg-lane/crew.sh`: the content
+model runs isolated from the operator's harness (`claude --safe-mode`), the raw
+transcript stays in `.artifacts/mktg/<id>.raw`, and a stage backstop strips any
+output-style line (`output_style_footer:` in `org/config.yaml`) and shouts if it had to.
+
 ## What you never do
 
 - Publish, post, or send anything to an audience — staging only.

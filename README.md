@@ -32,7 +32,7 @@ recovery, resume-after-crash, and a green-gated merge queue.
    ╚═══════════════════════════════════╤═══════════════════════════════════════════╝
                                        │   Dozer polls dozer:ready + lane, per team
    ╔═══════════════════ DO ════════════▼══════════════════════════════════════════╗
-   ║  THE DOZER  (one process, all teams, ~8 parallel crews, atomic-locked)         ║
+   ║  THE DOZER  (one process, all teams, `fanout` parallel crews, atomic-locked)   ║
    ║                                                                               ║
    ║   lane:dev        worktree → agent → test → serial-merge (green-gated)         ║
    ║   lane:marketing  load voice → produce → stage draft → human approval gate     ║
@@ -89,7 +89,8 @@ directors/run.sh ready ENG-42 dev             # greenlight #ENG-42 into the dev 
 ```
 
 The Dozer picks up `ENG-42` within one poll, builds it in your repo's worktree, runs
-the tests, serial-merges to `develop` (green-gated), and comments a summary on the issue.
+the tests, serial-merges to `develop` (green-gated; on a main-only repo it merges to
+`main` instead — the crew detects the branch, never imposes one), and comments a summary on the issue.
 
 ### Run it as a supervised service (survives crashes, logout, reboot)
 
@@ -106,9 +107,11 @@ dozers/service.sh logs        # tail the loop's log (a silent death is now visib
 dozers/service.sh uninstall   # stop + remove
 
 # ...and something that NOTICES when the engine stops beating, so you don't have to look
-dozers/heartbeat-check.sh creds     # can it actually shout? (checks creds before you trust it)
-dozers/heartbeat-check.sh install   # a launchd agent that alarms on a stalled engine
+dozers/heartbeat-check.sh creds     # can it actually shout? (a real round-trip to the tracking issue)
+dozers/heartbeat-check.sh install   # a launchd agent that alarms on a stalled/non-dispatching engine
 dozers/heartbeat-check.sh status    # the current verdict, no alarm
+# The alarm is a LABEL: `board:to_review` on the standing issue in `alarm_issue:` (org/config.yaml),
+# which is exactly what the Linear Board view filters on. Buzz is an optional second hop.
 ```
 
 If the loop dies for any reason the supervisor relaunches it (throttled 10s so a
@@ -169,8 +172,8 @@ The Dozer works *inside the target project's checkout*, resolved from your
 `ecosystem.yaml` registry — most-specific first:
 
 ```
-   repo:<id> label   →  that repo's path
-   task's team/org    →  the org's default repo
+   repo:<id> label   →  that repo's path (searched in projects: then infrastructure:)
+   task's team/org    →  the org's default repo (projects: only — infra has no org)
    workdir_default    →  fallback
 ```
 
@@ -195,7 +198,11 @@ robust, kept lean:
   │  a beacon can never outlive the process it vouches for.              │
   │  `dozers/heartbeat-check.sh` is the other half: a launchd agent that │
   │  reads the beacon and alarms when it stops — silent when a stale     │
-  │  beacon is just a long task, loud when nothing is running at all.    │
+  │  beacon is just a long task, loud when nothing is running at all,    │
+  │  and loud when the loop beats but stops claiming (poll= frozen with  │
+  │  idle slots and greenlit work queued). The alarm is the              │
+  │  `board:to_review` label on a standing Linear issue — the Board view │
+  │  is the surface; the flag comes down by itself on recovery.          │
   └─────────────────────────────────────────────────────────────────────┘
 
   ┌── Seance (resume) ─────────────────────────────────────────────────┐
@@ -260,9 +267,10 @@ One Dozer process serves **all** your orgs and runs crews in parallel:
 
 ```yaml
 # org/config.yaml
-linear_teams: "CFW,LL,BRD,GSAI,DEL"   # every team, one process
-fanout: 8                              # up to 8 crews at once
-push: "false"                          # merges stay local until you say otherwise
+linear_teams: "CFW,LL,BRD,GSAI,DLY"   # every team, one process
+fanout: 5                              # 5 crews at once
+push: "false"                          # merges stay on the local integration branch —
+                                       # nothing is pushed to origin until you say otherwise
 ```
 
 Each parallel crew works in its own worktree; a per-project merge lock keeps `develop`
@@ -343,10 +351,11 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 |------|-----------|
 | `dozers/dozer.sh` | The engine — poll → claim → route → run → report (`once` / `loop` / `doctor` / `recover` / `heartbeat`). |
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
-| `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms when it stops beating (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
+| `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms (Linear `board:to_review` on `alarm_issue`, Buzz optional) when it stops beating or stops dispatching (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
 | `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
-| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md`, shared `LINEAR.md`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
+| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
+| `directors/LINEAR.md` | The board contract every Director inherits — the exact label move per operation, plus the **board protocol**: `@Vas` + `board:to_review` → one `#now` ping → reconcile-first next wake → `board:responded`. |
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
 | `dozers/model.sh` · `tasks/model_route.py` | Per-role model routing — `show` / `env <role>` / `smoke <provider>`. |
 | `org/config.yaml` | Teams, lanes, fan-out, integration branch, per-role model routing. |

@@ -14,6 +14,9 @@
 # Config (org/config.yaml or env): linear_teams ("CFW,LL"), fanout (1..8),
 #   workdir_default, workdirs (team/repo -> path). One process can serve all teams.
 set -euo pipefail
+# 2026-09-05 crash loop: launchd's com.dozers.loop resolved a stale Homebrew
+# `claude` (2.1.201) ahead of ~/.npm-global/bin/claude (2.1.261), crashing crews.
+export PATH="$HOME/.npm-global/bin:$PATH"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/tasks/adapter.sh"
 
@@ -105,6 +108,8 @@ beat_stop() {
 # Resolve a task's working dir from the CANONICAL registry (~/ecosystem/ecosystem.yaml),
 # most-specific first:
 #   1) repo:<id> hint on the task   2) the task's Linear TEAM/org   3) config workdir_default
+# repo:<id> matches BOTH registry lists — projects: and infrastructure: (GSAI-17) — so
+# infra repos (paperclip, openclaw, gbrain-source) route like any product repo.
 # Paths live ONLY in ecosystem.yaml — never hardcoded here or in a label.
 resolve_workdir() {
   local hint="$1" team="$2" cfgf="$ROOT/org/config.yaml" path=""
@@ -134,6 +139,11 @@ run_one() { # <id> <lane> <title>
   local lane_dir
   case "$lane" in dev) lane_dir="dev-lane";; marketing) lane_dir="mktg-lane";; *) lane_dir="$lane-lane";; esac
   local crew="$ROOT/dozers/$lane_dir/crew.sh" persona="$ROOT/dozers/$lane_dir/dozer.md"
+  # Where this lane's crew leaves its artifacts (.artifacts/<dir>/<id>.*). The marketing
+  # crew writes to `mktg`, not `marketing` — the engine used to read the latter, so a
+  # marketing summary/fail reason never reached the task comment (found in GSAI-33).
+  local art_dir; case "$lane" in marketing) art_dir="mktg";; *) art_dir="$lane";; esac
+  local art="$ROOT/.artifacts/$art_dir"
   [[ -x "$crew" ]] || { echo "  x no crew for lane '$lane' ($lane_dir) - skipping #$id" >&2; return 0; }
 
   if ! task_claim "$id"; then echo "  ~ #$id already claimed, skipping" >&2; return 0; fi
@@ -146,17 +156,19 @@ run_one() { # <id> <lane> <title>
   workdir="$(resolve_workdir "$hint" "$team")"
   echo "    cwd -> $workdir  ${team:+[team:$team]}${hint:+ (repo:$hint)}"
 
-  # The crew leaves TWO artifacts: <id>.summary on success, <id>.fail (the reason) on
-  # failure — the latter goes into the block comment so a Director never has to read
-  # loop.err.log to learn why (GSAI-26 #3).
-  local summary_file="$ROOT/.artifacts/$lane/$id.summary" fail_file="$ROOT/.artifacts/$lane/$id.fail"
-  rm -f "$summary_file" "$fail_file" 2>/dev/null || true
+  # The crew leaves up to THREE artifacts: <id>.summary on success, <id>.fail (the
+  # reason) on failure — the latter goes into the block comment so a Director never has
+  # to read loop.err.log to learn why (GSAI-26 #3) — and optionally <id>.handoff, the
+  # crew's note for the reviewer (GSAI-33: it belongs in the task comment, never in the
+  # staged deliverable).
+  local summary_file="$art/$id.summary" fail_file="$art/$id.fail" handoff_file="$art/$id.handoff"
+  rm -f "$summary_file" "$fail_file" "$handoff_file" 2>/dev/null || true
 
   # The brief (GSAI-7): the task's description, handed to the crew as a FILE so a lane
   # can route on what the Director wrote — the marketing lane treats a `production:`
   # line as a video brief. Best-effort: a backend without task_description, or a
   # fetch that fails, leaves an empty brief and the crew runs on the title alone.
-  local brief_file="$ROOT/.artifacts/$lane/$id.brief"
+  local brief_file="$art/$id.brief"
   mkdir -p "$(dirname "$brief_file")" 2>/dev/null || true
   if declare -F task_description >/dev/null 2>&1; then
     task_description "$id" > "$brief_file" 2>/dev/null || : > "$brief_file"
@@ -169,6 +181,8 @@ run_one() { # <id> <lane> <title>
     if [[ "$lane" == "marketing" ]]; then task_review "$id"; verb="staged for review"; else task_merged "$id"; verb="merged to develop"; fi
     local body
     if [[ -s "$summary_file" ]]; then body="$(head -n 10 "$summary_file")"; else body="- completed via lane:$lane"; fi
+    # the handoff note rides the same comment (capped so a runaway note can't flood it)
+    if [[ -s "$handoff_file" ]]; then body="$(printf '%s\n\nHandoff note from the crew:\n%s' "$body" "$(head -c 4000 "$handoff_file")")"; fi
     task_comment "$id" "$(printf 'Dozer %s - lane:%s\n%s' "$verb" "$lane" "$body")"
     echo "  ok #$id $verb"
   else

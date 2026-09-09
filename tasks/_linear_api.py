@@ -17,8 +17,11 @@ Label lifecycle (dozer:* = execution; lane:/repo: = routing):
   mktg done  -> dozer:needs-review                  (human approval gate)
   failed     -> dozer:blocked
 Each mutation resolves the *issue's own* team, so multi-team ops are correct.
+
+Board protocol (GSAI-41): `board-answer <ID>` is the read-only reconcile probe —
+exit 0 = Vas answered (prints the answers), 3 = still waiting, 2 = no board-ask.
 """
-import json, os, sys, urllib.request
+import json, os, re, sys, urllib.request
 
 API = "https://api.linear.app/graphql"
 KEY = os.environ.get("LINEAR_API_KEY")
@@ -191,7 +194,10 @@ def review(identifier):      # mktg lane: staged for human approval
 
 
 def block(identifier):       # failure off-ramp
-    _relabel(issue(identifier), add=[BLOCKED], remove=[INPROG])
+    # 2026-09-05: also reset state to Todo (unstarted) — poll only sees dozer:ready
+    # issues in backlog/unstarted/triage, so a re-greenlit issue stuck in "started"
+    # (In Progress) is invisible until someone moves it back manually.
+    _relabel(issue(identifier), add=[BLOCKED], remove=[INPROG], state_type="unstarted")
 
 
 def done(identifier):        # fully done (e.g. a Director after develop->main promotion)
@@ -262,6 +268,152 @@ def comment(identifier, text):
         {"id": iss["id"], "b": text})
 
 
+# --- board protocol: who wrote a comment? (GSAI-41) ------------------------------
+# The workspace has ONE Linear user, so every agent comment is posted as Vasanth.
+# Authorship is told apart by MARKER, never by author. The contract, in one sentence:
+#
+#   An agent comment MUST carry a marker; an unmarked comment is Vas.
+#
+# A marker is any HTML comment in the body — `<!-- board-ask id:… by:Honey -->`,
+# `<!-- board-mirror src:… -->`, `<!-- honey-preflight -->`, `<!-- fizz-sweep -->` …
+# The old rule ("no `board-*` marker ⇒ Vas") read a Director's own `<!-- honey-preflight -->`
+# as his answer and silently flipped a live question to board:responded (GSAI-29).
+# So the match is deliberately BROAD: any `<!-- … -->` at all means "an agent wrote this".
+# Over-matching leaves a real answer un-swapped for one awake (visible, on the Board);
+# under-matching loses the question for good (invisible). Fail toward visible.
+MARKER_RE = re.compile(r"<!--.*?-->", re.S)
+ASK_RE = re.compile(r"<!--\s*board-ask\b[^>]*-->")
+
+
+def is_agent_comment(body):
+    """True when the body carries ANY `<!-- … -->` marker — i.e. an agent wrote it."""
+    return bool(MARKER_RE.search(body or ""))
+
+
+def _latest_ask(comments):
+    """The newest `board-ask` marker comment (comments sorted by createdAt), or None."""
+    asks = [c for c in comments if ASK_RE.search(c.get("body") or "")]
+    return asks[-1] if asks else None
+
+
+def board_answers(comments):
+    """Vas's answers to the newest ask: every comment AFTER the latest `board-ask` that
+    carries NO marker. Pure — takes the sorted comment list, no I/O.
+    Returns (ask, answers): ask is None when there is no board-ask at all."""
+    comments = sorted(comments, key=lambda c: c["createdAt"])
+    ask = _latest_ask(comments)
+    if ask is None:
+        return None, []
+    later = [c for c in comments if c["createdAt"] > ask["createdAt"]]
+    return ask, [c for c in later if not is_agent_comment(c.get("body"))]
+
+
+def board_answer(identifier):
+    """CLI: did Vas answer the newest board-ask on <issue>?  Read-only.
+    stdout: one line per answer `<createdAt>\t<first line>` ; exit 0 = answered,
+    3 = still waiting (nothing unmarked after the ask), 2 = no board-ask on the issue.
+    A Director swaps board:to_review -> board:responded ONLY on exit 0."""
+    ask, answers = board_answers(_issue_comments(identifier))
+    if ask is None:
+        print(f"{identifier}: no board-ask marker on this issue", file=sys.stderr)
+        sys.exit(2)
+    if not answers:
+        print(f"{identifier}: waiting — no unmarked comment after the ask at {ask['createdAt']}",
+              file=sys.stderr)
+        sys.exit(3)
+    for c in answers:
+        first = (c.get("body") or "").strip().splitlines()[0] if (c.get("body") or "").strip() else ""
+        print(f"{c['createdAt']}\t{first}")
+
+
+# --- engine alarm surface (dozers/heartbeat-check.sh, GSAI-31) -------------------
+# The watchdog's alarm is a LABEL, not a comment. The Board view filters on exactly
+# {"labels":{"name":{"eq":"board:to_review"}}}, and LINEAR_API_KEY authenticates as the
+# workspace's only human, so a comment alone notifies nobody (Linear never notifies you
+# about your own comment). Apply the label first; the comment is the detail.
+# Authorship is told apart by marker comments, never by author — every write here
+# carries `by:heartbeat-check`, and a later comment WITHOUT it is a human's answer.
+BOARD_REVIEW = "board:to_review"
+BOARD_RESPONDED = "board:responded"
+HB_BY = "by:heartbeat-check"
+
+
+def _now_iso():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _issue_comments(identifier):
+    d = gql('query($i:String!){ issue(id:$i){ comments(first:100){ nodes{ body createdAt url } } } }',
+            {"i": identifier})
+    iss = d["issue"]
+    if not iss:
+        die(f"no issue '{identifier}'")
+    return sorted(iss["comments"]["nodes"], key=lambda c: c["createdAt"])
+
+
+def _comment_url(identifier, body):
+    iss = issue(identifier)
+    d = gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ success comment{ url } } }',
+            {"id": iss["id"], "b": body})
+    return (d["commentCreate"].get("comment") or {}).get("url") or ""
+
+
+def alarm_probe(identifier):
+    """Can the alarm reach its surface? Resolves the tracking issue and reports it —
+    a real round-trip with the real key, so `creds` proves delivery, not just presence."""
+    iss = issue(identifier)
+    flagged = _has(iss["labels"]["nodes"], BOARD_REVIEW)
+    print(f'{iss["identifier"]}\t{iss["state"]["type"]}\t{"flagged" if flagged else "clear"}\t{iss["title"]}')
+
+
+def alarm_raise(identifier, body):
+    """Flag the tracking issue: board:to_review on, reopened if closed, then the detail."""
+    iss = issue(identifier)
+    reopen = iss["state"]["type"] in ("completed", "canceled")
+    _relabel(iss, add=[BOARD_REVIEW], remove=[BOARD_RESPONDED],
+             state_type="unstarted" if reopen else None)
+    marked = f"{body}\n\n<!-- board-ask id:{_now_iso()} {HB_BY} -->"
+    url = _comment_url(identifier, marked)
+    print(f'{identifier} -> {BOARD_REVIEW}{" (reopened)" if reopen else ""} {url}')
+
+
+def alarm_clear(identifier, body):
+    """The outage ended. If a human commented since the alarm, hand the ball back to the
+    Director (board:responded); otherwise just take the flag down. Never leave a stale
+    flag on the Board."""
+    iss = issue(identifier)
+    comments = _issue_comments(identifier)
+    last_ask = None
+    for c in comments:
+        if "board-ask" in c["body"] and HB_BY in c["body"]:
+            last_ask = c["createdAt"]
+    # GSAI-41: "human" = no marker AT ALL, not merely "not ours" — a Director's own
+    # marked comment (`<!-- honey-preflight -->`, another board-ask) is never Vas.
+    human = any(c["createdAt"] > last_ask and not is_agent_comment(c["body"])
+                for c in comments) if last_ask else False
+    if human:
+        _relabel(iss, add=[BOARD_RESPONDED], remove=[BOARD_REVIEW])
+    else:
+        _relabel(iss, remove=[BOARD_REVIEW])
+    marked = f"{body}\n\n<!-- board-clear id:{_now_iso()} {HB_BY} human_answered:{'yes' if human else 'no'} -->"
+    url = _comment_url(identifier, marked)
+    print(f'{identifier} -> {BOARD_RESPONDED if human else "flag removed"} {url}')
+
+
+def count_ready():
+    """How many greenlit (dozer:ready + lane:) issues are queued across the configured
+    teams — the third alarm row (alive but not dispatching) needs the number, not the list."""
+    n = 0
+    for i in _all_issues():
+        if i["state"]["type"] not in ("backlog", "unstarted", "triage"):
+            continue
+        labels = i["labels"]["nodes"]
+        if _has(labels, READY) and _lane_of(labels):
+            n += 1
+    print(n)
+
+
 OPS = {
     "list-untriaged": lambda a: list_untriaged(),
     "list-ready": lambda a: list_ready(),
@@ -277,6 +429,11 @@ OPS = {
     "description": lambda a: description(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
+    "alarm-probe": lambda a: alarm_probe(a[0]),
+    "alarm-raise": lambda a: alarm_raise(a[0], a[1]),
+    "alarm-clear": lambda a: alarm_clear(a[0], a[1]),
+    "count-ready": lambda a: count_ready(),
+    "board-answer": lambda a: board_answer(a[0]),
 }
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ backend: linear
 linear_team: "CFW"
 # Multi-team mode: ONE Dozer that polls SEVERAL teams (comma-separated keys).
 # If set, it overrides linear_team — the simplest way to run every org at once.
-linear_teams: "CFW,LL,BRD,GSAI,DEL"           # serve both orgs from one Dozer
+linear_teams: "CFW,LL,BRD,GSAI,DLY"           # serve both orgs from one Dozer
 # Parallel crews one Dozer runs at once (fan-out). 1 = sequential; up to ~8.
 fanout: 5                                     # 5 parallel crews (Vas, 2026-09-04). History: 8 saturated shared Claude Code usage (throttled to 3 on 2026-09-03); per-role model routing (models:) now lets roles move off Claude to relieve that.
 
@@ -33,6 +33,16 @@ lanes:
 brand:
   voice: "clear, warm, no hype"
 
+# ── Marketing-lane stage backstop (GSAI-33) ─────────────────────────────────
+# The crew's content model runs ISOLATED from the operator's harness (claude --safe-mode:
+# no output styles, hooks, CLAUDE.md, MCP) so nothing personal can land in a publishable
+# draft. This regex (grep -E, one line) is the belt behind that buckle: any draft line
+# matching it is stripped on stage, moved into the reviewer handoff note, and logged as
+# a leak. Default = the "👨 Daddy says" footer that hit 24/24 drafts on 2026-09-06.
+# Leave unset for the default; it is a backstop, not the fix — if it ever fires, the
+# isolation broke and that is the bug to chase.
+# output_style_footer: "^[[:space:]]*(👨[[:space:]]*)?Daddy says"
+
 # ── Where the Dozer works ────────────────────────────────────────────────────
 # CANONICAL: paths are resolved from ~/ecosystem/ecosystem.yaml via
 # tasks/ecosystem_workdir.py — NEVER hardcoded here or in a label. Order:
@@ -46,7 +56,7 @@ brand:
 workdir_default: "."
 
 # ── Dev lane pipeline knobs (per-repo build/merge behavior) ──────────────────
-integration_branch: "develop"   # branch the Dozer cuts dozer/<id> off and merges back into
+integration_branch: "develop"   # branch the Dozer cuts dozer/<id> off and merges back into — when a repo has none, the crew falls back to its default branch (main) rather than creating it (GSAI-15)
 branch_prefix: "dozer"           # task branch = <branch_prefix>/<task-id>, e.g. dozer/CFW-9
 worktree_root: "~/.dozers/worktrees"   # where task + merge worktrees live
 model_cmd: "claude -p"           # LEGACY flat default — superseded by `models:` below (still honoured via MODEL_CMD)
@@ -84,19 +94,24 @@ schema_globs: "*.prisma"                        # space-separated; what counts a
 migration_globs: "*/migrations/* */migrate/*"   # space-separated; what counts as a migration
 
 # ── Liveness alarm (dozers/heartbeat-check.sh, GSAI-31) ─────────────────────
-# Where the watchdog shouts when the engine stops beating. Channel ids and pubkeys
-# are addresses, not secrets — the KEY it signs with is read from the vault below.
-# Leave alarm_channel empty to disable posting (the check still logs its verdict).
-alarm_channel: "79c94c7b-4969-4320-a379-c4edc67df34b"   # Buzz channel: cfw.social
+# Where the watchdog shouts when the engine stops beating (or beats but stops
+# dispatching). PRIMARY: Linear — the alarm IS the `board:to_review` label on the
+# standing tracking issue below; the Board view filters on exactly that label, so it is
+# the only write that reaches a human. OPTIONAL second hop: Buzz — sent when
+# BUZZ_PRIVATE_KEY is present, skipped quietly when it is not; a missing optional
+# channel never suppresses the primary one. Ids/channels/pubkeys are addresses, not
+# secrets — the keys are read from the vault files below (vault-first).
+alarm_issue: "GSAI-38"                                  # standing tracking issue the alarm flags (GSAI: Housekeeping)
+alarm_linear_env: "~/ecosystem/vault/linear.env"        # vault file holding LINEAR_API_KEY
+alarm_channel: "79c94c7b-4969-4320-a379-c4edc67df34b"   # Buzz channel: cfw.social (optional hop)
 alarm_mention: "557d141c51da17bab381925acbd26fc4bb2805cfd4d461c337b355d27f2477f6"  # @Fizz (chief)
 alarm_env: "~/ecosystem/vault/buzz.env"                 # vault file holding BUZZ_PRIVATE_KEY + BUZZ_RELAY_URL
-# NOTE (2026-09-05): buzz.env's BUZZ_PRIVATE_KEY was deliberately CLEARED on 2026-09-03 —
+# NOTE (2026-09-07): buzz.env's BUZZ_PRIVATE_KEY was deliberately CLEARED on 2026-09-03 —
 # the Guzz identity moved into the macOS Keychain as a Buzz Desktop managed agent, and the
-# CLI has no Keychain path (`buzz --help`: BUZZ_PRIVATE_KEY required, hex or nsec). So no
-# CLI-driven job can post to Buzz right now, this watchdog included. Point alarm_env at a
-# dedicated bot identity once one is minted; until then `heartbeat-check.sh install`
-# refuses to load an agent that cannot shout. Do NOT repoint this at buzz-owner.env —
-# that is Vasanth's own key, and an alarm signed as him is a lie about who is speaking.
+# CLI has no Keychain path. Until a dedicated bot identity is minted the Buzz hop is
+# skipped and Linear carries the alarm alone (`heartbeat-check.sh creds` shows which
+# channels can deliver). Do NOT repoint alarm_env at buzz-owner.env — that is Vasanth's
+# own key, and an alarm signed as him is a lie about who is speaking.
 alarm_interval: 300                                     # how often the launchd agent runs the check (s)
 
 # ── Model routing — which brain each ROLE runs on. Swap a role's provider any time. ──
@@ -107,5 +122,5 @@ alarm_interval: 300                                     # how often the launchd 
 models:
   default:   { provider: claude, model: "" }
   dev:       { provider: claude, model: "" }
-  marketing: { provider: claude, model: "" }
+  marketing: { provider: ollama-cloud, model: "glm-5.2" }   # flipped 2026-09-07 (Vas): first role off Claude; smoke + crew e2e PASS. Revert: provider: claude, model: ""
 ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY
