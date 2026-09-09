@@ -20,6 +20,8 @@ Prints to stdout a block of `export`/`unset` lines meant to be eval'd by the cre
 
 Providers:
     claude        Anthropic Claude Code, the user's normal auth.  MODEL_CMD="claude -p"
+                  Requires an explicit model in config — a bare `claude -p` inherits the
+                  CLI's default, which drifts under you (GSAI-83).
     ollama-cloud  Claude Code pointed at https://ollama.com via the Anthropic-compatible
                   API, authenticated with OLLAMA_API_KEY as a Bearer token
                   (ANTHROPIC_AUTH_TOKEN — NOT ANTHROPIC_API_KEY, which 401-hangs).
@@ -172,6 +174,20 @@ def build(role, cfg, env):
         out.append("export %s=%s" % (name, shlex.quote(str(value))))
 
     if provider == "claude":
+        # An empty model means a bare `claude -p` — the CLI picks whatever its default
+        # is that day. That is not a route, it is a coin flip, and it silently moved the
+        # dev lane onto Fable 5.1 at 2x Opus 5's price for a week (GSAI-83). Config must
+        # name the model. An env override stays loose on purpose: a human typing
+        # DOZER_MODEL_DEV=claude for one run has chosen, and `model.sh smoke claude`
+        # needs to probe the provider default.
+        if not model and source.startswith("config:"):
+            die(
+                "role %r routes to claude with no model (from %s) — a bare `claude -p` "
+                "inherits the CLI's shifting default. Name it explicitly, e.g.\n"
+                "    models:\n      %s: { provider: claude, model: \"claude-opus-5\" }\n"
+                "For a deliberate one-off, use %s=claude instead."
+                % (role, source, role, role_key(role))
+            )
         cmd = "claude -p"
         if model:
             cmd += " --model " + shlex.quote(model)
