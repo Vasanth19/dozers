@@ -4,7 +4,9 @@
 # Polls the backend for work carrying the greenlight (ready) AND a lane, claims it,
 # resolves the task's PROJECT working dir (from the task's team/org or repo hint),
 # cd's the crew into it, runs the crew, posts incremental updates ON the task.
-# Multi-team aware, parallel-safe (atomic mkdir lock), fan-out capable.
+# Multi-team aware, parallel-safe (atomic mkdir lock), fan-out capable. Crews are
+# SLOTS that outlive a poll (GSAI-37): a finished crew's slot is refilled at once, a
+# slow crew holds only its own slot, and the poll keeps advancing throughout.
 #
 #   dozers/dozer.sh once     # drain now, then exit
 #   dozers/dozer.sh loop      # keep draining every POLL_SECONDS (default 30)
@@ -193,16 +195,63 @@ run_one() { # <id> <lane> <title>
   fi
 }
 
-drain() {
-  local any=0; local -a pids=()
+# ── Slots, not waves (GSAI-37) ─────────────────────────────────────────────────
+# `drain` used to launch up to FANOUT crews and then `wait` on ALL of them before it
+# could touch the next task — and `loop` could not poll again until drain returned. So
+# the slowest crew set the pace of the whole wave, and one that never finished stalled
+# the engine outright. Observed live 2026-09-07: `inflight=1` against `fanout=5`, four
+# slots idle, `poll` frozen for 45+ minutes while ~30 greenlit issues waited behind a
+# single asleep test command.
+#
+# Now crews are SLOTS that outlive a poll. CREWS holds the pid of every running crew;
+# `drain` reaps the ones that finished, fills the free slots from the ready list, and
+# RETURNS — it never waits for a crew. `loop` then naps until the poll interval passes
+# OR a crew finishes (`wait -n`), whichever is first, so a freed slot is refilled at
+# once rather than a poll later. The invariant: idle capacity and queued greenlit work
+# never coexist. A slow crew now costs exactly one slot. (The time bound that stops a
+# crew hanging in the first place lives in dozers/timebox.sh.)
+CREWS=()
+
+reap_crews() {  # drop finished crews from CREWS (collect their status); keep the live ones
+  local -a live=(); local pid
+  for pid in "${CREWS[@]}"; do
+    # bash reaps an exited background child on SIGCHLD, so `kill -0` fails the moment a
+    # crew is gone; `wait` then just hands back the status bash already saved.
+    if kill -0 "$pid" 2>/dev/null; then live+=("$pid"); else wait "$pid" 2>/dev/null || true; fi
+  done
+  CREWS=("${live[@]}")
+}
+
+drain() {  # fill the free slots from the ready list; returns immediately, never waits on a crew
+  reap_crews
+  local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 id lane title
   while IFS=$'\t' read -r id lane title; do
-    [[ -z "$id" ]] && continue; any=1
+    [[ -z "$id" ]] && continue; seen=$((seen+1))
+    # Already in flight on this host (its crew holds a slot): the backend just hasn't
+    # caught up. Don't burn a slot on a crew that would only say "locked, skipping".
+    [[ -d "$LOCK_DIR/${id//\//_}.lock" ]] && continue
+    if (( launched >= free )); then queued=$((queued+1)); continue; fi
     run_one "$id" "$lane" "$title" &
-    pids+=("$!")
-    if (( ${#pids[@]} >= FANOUT )); then wait "${pids[@]}" 2>/dev/null || true; pids=(); fi
+    CREWS+=("$!"); launched=$((launched+1))
   done < <(task_list_ready)
-  (( ${#pids[@]} )) && { wait "${pids[@]}" 2>/dev/null || true; }
-  (( any )) || echo "  (nothing ready)"
+  if (( seen == 0 )); then echo "  (nothing ready)"
+  elif (( queued )); then echo "  ~ $queued ready but waiting: all $FANOUT slots busy (started $launched this poll)"
+  fi
+}
+
+# Sleep for up to $1 seconds, but wake early the moment any crew finishes, so its slot
+# is refilled by the next drain instead of sitting idle until the poll interval elapses.
+nap() {
+  local sleeper; sleep "$1" & sleeper=$!
+  if (( ${#CREWS[@]} )); then wait -n "$sleeper" "${CREWS[@]}" 2>/dev/null || true
+  else wait "$sleeper" 2>/dev/null || true; fi
+  kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true
+}
+
+# One-shot: keep filling slots as crews finish, return once every crew is done.
+drain_all() {
+  drain
+  while (( ${#CREWS[@]} )); do wait -n "${CREWS[@]}" 2>/dev/null || true; drain; done
 }
 
 # Crash recovery: reclaim work stranded by a Dozer that died mid-task (stale locks +
@@ -250,7 +299,7 @@ doctor() {
 }
 
 case "${1:-once}" in
-  once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; recover; drain ;;
+  once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; recover; drain_all ;;
   recover) recover "${2:-}" ;;                              # run the reaper standalone (pass --dry-run)
   heartbeat) heartbeat "${2:-}"; cat "$HEARTBEAT_FILE" ;;   # emit one beat now, print it (scriptable/testable)
   doctor)  doctor ;;                                        # health view: in-flight, alive?, orphans
@@ -262,10 +311,10 @@ case "${1:-once}" in
         trap 'beat_stop; exit 0' INT TERM
         beat_start                                          # ...then keep beating THROUGH each drain
         while true; do
-          echo "[dozer] $(date '+%H:%M:%S') poll"; drain
+          echo "[dozer] $(date '+%H:%M:%S') poll (running=${#CREWS[@]}/$FANOUT)"; drain
           ticks=$((ticks+1)); heartbeat "$ticks"            # stamp the new tick (the ticker keeps ts fresh between these)
           (( REAPER_EVERY > 0 && ticks % REAPER_EVERY == 0 )) && recover
-          sleep "$POLL_SECONDS"
+          nap "$POLL_SECONDS"                               # ...or sooner, the moment a crew frees its slot
         done ;;
   *) echo "usage: dozer.sh [once|loop|recover [--dry-run]|heartbeat [tick]|doctor]" >&2; exit 1 ;;
 esac
