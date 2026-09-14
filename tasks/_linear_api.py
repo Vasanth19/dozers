@@ -11,7 +11,10 @@ Env it reads:
                    (LINEAR_TEAMS wins if both are set)
 
 Label lifecycle (dozer:* = execution; lane:/repo: = routing):
-  greenlight -> dozer:ready + lane:<name>          (a Director sets both)
+  greenlight -> dozer:ready + lane:<name>          (a Director sets both) — and a RESET:
+                the greenlight clears every other dozer:* label and returns a closed or
+                started issue to a pollable state, so re-greenlighting always requeues
+                (GSAI-75). The poll's gate is the labels, not the state.
   claimed    -> dozer:in-progress, state started    (drops dozer:ready)
   dev done   -> dozer:merged-develop                (Director then promotes -> director:merged-main)
   mktg done  -> dozer:needs-review                  (human approval gate)
@@ -61,7 +64,33 @@ def teams():
     nodes = d["teams"]["nodes"]
     if not nodes:
         die(f"no teams matching {TEAM_KEYS}")
+    # GSAI-75: a key that resolves to nothing used to be dropped in silence — the filter
+    # simply returned fewer nodes and every verb (list-ready, list-untriaged, poll) went
+    # on believing it covered the whole factory. Live for weeks: the service env said
+    # `LINEAR_TEAMS=CFW,LL,BRD,GSAI,DEL` and `DEL` is not a team, so all of DLY was
+    # invisible to the Dozer with nothing anywhere saying so. A typo in a team key must
+    # fail loudly (doctrine: no silent fallbacks), not quietly shrink the factory.
+    found = {n["key"] for n in nodes}
+    missing = [k for k in TEAM_KEYS if k not in found]
+    if missing:
+        # Point at the fix, not just the fault: TEAM_KEYS is env-wins, so the offending
+        # value is almost always the service env file, while org/config.yaml still holds
+        # the correct list. Naming both turns a hard stop into a one-line correction.
+        hint = f"  Real team keys in this workspace: {sorted(k['key'] for k in _all_team_keys())}."
+        die(f"unknown team key(s) {missing} — resolved only {sorted(found)}. "
+            f"LINEAR_TEAMS/LINEAR_TEAM is env-wins, so check the service env "
+            f"(~/.dozers/dozer.env) before org/config.yaml's linear_teams.\n{hint}\n"
+            f"  Refusing to poll a partial factory: every issue in the missing team(s) "
+            f"would be invisible to the Dozer with nothing to say why.")
     return nodes
+
+
+def _all_team_keys():
+    """Every team key the API key can see — only ever called to build an error message."""
+    try:
+        return gql('query{ teams(first:100){ nodes{ key } } }')["teams"]["nodes"]
+    except SystemExit:
+        return []
 
 
 def _team_labels(tid):
@@ -97,10 +126,27 @@ def issue(identifier):
     return iss
 
 
+# Linear caps a page at 250; anything past it needs the cursor. GSAI-75: this used to be
+# a single unpaginated `first:200` and nothing checked hasNextPage — so once a team passed
+# 200 issues the tail silently vanished from EVERY verb that walks the board (list-ready,
+# list-untriaged, list-inflight, count-ready). Measured on 2026-09-14: CFW held 240 issues,
+# so 40 were unreachable — a greenlit issue landing in that tail could never be polled and
+# would sit at dozer:ready forever with no error to explain it. Always drain the cursor.
+_PAGE = 250
+
+
 def _fetch_team_issues(tid):
-    d = gql('query($t:ID!){ issues(first:200, filter:{team:{id:{eq:$t}}}){ nodes{ '
-            'identifier title team{ key } state{ type } labels{ nodes{ name } } } } }', {"t": tid})
-    return d["issues"]["nodes"]
+    out, cursor = [], None
+    while True:
+        d = gql('query($t:ID!,$n:Int!,$c:String){ issues(first:$n, after:$c, '
+                'filter:{team:{id:{eq:$t}}}){ pageInfo{ hasNextPage endCursor } nodes{ '
+                'identifier title team{ key } state{ type } labels{ nodes{ name } } } } }',
+                {"t": tid, "n": _PAGE, "c": cursor})
+        page = d["issues"]
+        out.extend(page["nodes"])
+        if not page["pageInfo"]["hasNextPage"]:
+            return out
+        cursor = page["pageInfo"]["endCursor"]
 
 
 def _all_issues():
@@ -161,21 +207,61 @@ def list_untriaged():
             print(f'{i["identifier"]}\t{i["title"]}')
 
 
+# A state the poll can see. Linear's five state types are backlog / unstarted / started /
+# completed / canceled; the first three are where queued work legitimately sits.
+POLLABLE_STATES = ("backlog", "unstarted", "triage")
+
+
+def _is_ready(i):
+    """Greenlit and free to dispatch — the poll's whole definition, label-first.
+
+    GSAI-75: this used to be `state in POLLABLE_STATES and dozer:ready and a lane`, and
+    the state half of that was quietly the stricter half. The greenlight IS the label
+    pair (dozer:ready + lane:) — doctrine, `Nothing runs without the greenlight` — but an
+    issue sitting in a `started` state was skipped no matter what its labels said. Every
+    ordinary path leaves an issue `started`: claim() sets it, and merged()/review() leave
+    it there. So a Director re-greenlighting anything that had already run once produced
+    an issue labelled perfectly and dispatched never, with no error and nothing on the
+    Board to show for it — it just fell into the `Leak - stalled` view.
+
+    State is now consulted for one thing only: a closed issue never runs. dozer:in-progress
+    still excludes, so a torn claim (label written, nothing else) is not dispatched twice.
+    """
+    if i["state"]["type"] in ("completed", "canceled"):
+        return False
+    labels = i["labels"]["nodes"]
+    if not _has(labels, READY) or _has(labels, INPROG):
+        return False
+    return bool(_lane_of(labels))
+
+
 def list_ready():
     for i in _all_issues():
-        if i["state"]["type"] not in ("backlog", "unstarted", "triage"):
-            continue
-        labels = i["labels"]["nodes"]
-        lane = _lane_of(labels)
-        if _has(labels, READY) and lane:
-            print(f'{i["identifier"]}\t{lane}\t{i["title"]}')
+        if _is_ready(i):
+            print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}')
 
 
 def mark_ready(identifier, lane):
+    """The greenlight. Resets the issue to queued — labels AND state.
+
+    GSAI-75: this only ever ADDED dozer:ready + lane:, so re-greenlighting left whatever
+    the last run wrote still on the issue — a `started` state the poll skipped, and a
+    stale dozer:in-progress / blocked / merged-develop / needs-review label claiming the
+    task was somewhere it wasn't. block() and requeue() already reset state for exactly
+    this reason (see the 2026-09-05 note on block()); the greenlight itself did not, which
+    is why the leak survived every off-ramp fix. A greenlight now means one thing —
+    queued, nothing else in flight.
+
+    A pollable state is left alone: an issue triaged in Backlog stays in Backlog rather
+    than being yanked into Todo by a Director's approval.
+    """
     iss = issue(identifier)
     ensure_label(iss["team"]["id"], f"lane:{lane}", "#d98419")
-    _relabel(iss, add=[READY, f"lane:{lane}"])
-    print(f"{identifier} -> {READY} + lane:{lane}")
+    reset = iss["state"]["type"] not in POLLABLE_STATES
+    _relabel(iss, add=[READY, f"lane:{lane}"],
+             remove=[INPROG, BLOCKED, MERGEDDEV, NEEDSREVIEW],
+             state_type="unstarted" if reset else None)
+    print(f"{identifier} -> {READY} + lane:{lane}{' (state reset to unstarted)' if reset else ''}")
 
 
 def claim(identifier):
@@ -404,14 +490,9 @@ def alarm_clear(identifier, body):
 def count_ready():
     """How many greenlit (dozer:ready + lane:) issues are queued across the configured
     teams — the third alarm row (alive but not dispatching) needs the number, not the list."""
-    n = 0
-    for i in _all_issues():
-        if i["state"]["type"] not in ("backlog", "unstarted", "triage"):
-            continue
-        labels = i["labels"]["nodes"]
-        if _has(labels, READY) and _lane_of(labels):
-            n += 1
-    print(n)
+    # Same predicate as list_ready — the watchdog must count exactly what the poll would
+    # dispatch, or "alive but not dispatching" fires on a queue the Dozer cannot see.
+    print(sum(1 for i in _all_issues() if _is_ready(i)))
 
 
 OPS = {
