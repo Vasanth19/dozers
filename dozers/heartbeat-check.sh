@@ -138,11 +138,14 @@ engine_alive() {
 # How many crews are genuinely running right now: run-locks whose owner pid is alive.
 # A stale lock left by a crashed crew must not buy the engine silence — that is the
 # reaper's problem, and counting it here would mask a real stall.
+# LOCK_DIR is shared: a lock with no `owner` file belongs to another holder (the
+# Directors' `director-<role>.lock`) and is not a crew at all (GSAI-96).
 live_crews() {
   if [ -n "${HB_ASSUME_CREWS:-}" ]; then printf '%s' "$HB_ASSUME_CREWS"; return 0; fi
   local n=0 lock pid
   for lock in "$LOCK_DIR"/*.lock; do
     [ -d "$lock" ] || continue
+    [ -f "$lock/owner" ] || continue
     pid="$(field "$lock/owner" pid)"
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && n=$((n+1))
   done
