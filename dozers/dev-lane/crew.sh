@@ -263,16 +263,48 @@ resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK + _P
   _PASS_DESC="$(eval "$_PASS_BLOCK" >/dev/null; printf '%s/%s' "${DOZER_MODEL_PROVIDER:-?}" "${DOZER_MODEL_NAME:-default}")"
 }
 
-# run_model_pass <pass> <prompt> — one agent run under its own route, its own timebox.
-run_model_pass() {  # $1 = architect|build|review, $2 = prompt
+# run_model_pass <pass> <prompt> [proof] — one agent run under its own route, its own
+# timebox. <proof> (GSAI-147) names the pass's deliverable and is consulted ONLY when
+# the session exits non-zero AND it was not a timeout: the exit code is a side-channel,
+# not the deliverable — a model CLI can finish its work (write DOZER-DESIGN.md, commit
+# the build, write the verdict in DOZER-REVIEW.md) and still die on teardown (a
+# final-turn API error, a crash at exit). Before this, one such flake discarded a
+# PASSING review and re-ran the whole task from resume — three model runs of spend
+# for an exit code. Forms:
+#   file:<name>    → the $WT file exists and is non-empty  (architect, review)
+#   commits:<sha>  → the branch advanced past <sha>        (build)
+# A timeout ALWAYS fails (GSAI-37): a killed process may have left a truncated file,
+# and "hung = failed" is not negotiable — TIMEBOX_HIT wins over any artifact. No
+# deliverable → fails exactly as before: the rescue is earned by a deliverable, not
+# by exit-code generosity. Every rescue logs a loud ⚠ naming the pass, the exit code,
+# and the artifact — reported, never masked (fail-fast doctrine).
+run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artifact (optional)
   resolve_pass "$1"
   echo "    [dev] $1 model: $_PASS_DESC"
   PASS_ROWS+=("$1: $_PASS_DESC")
-  if ! _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" timebox "$T_MODEL" "$1 agent" "$WT" \
-       'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"$_PASS_PROMPT\""'; then
-    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "$1 agent" "$T_MODEL" model); worktree kept for resume"
-    fail "$1 agent failed (worktree kept for resume)"
+  local rc=0
+  _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" timebox "$T_MODEL" "$1 agent" "$WT" \
+    'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"$_PASS_PROMPT\""' || rc=$?
+  # if/then, not `&& return`/`&& fail`: a false `(( … ))` short-circuits the list to
+  # status 1, and run_model_pass runs as a plain command under set -e — that would
+  # kill the crew silently before either branch below could speak.
+  if (( rc == 0 )); then return 0; fi
+  if (( TIMEBOX_HIT )); then
+    fail "$(timed_out_msg "$1 agent" "$T_MODEL" model); worktree kept for resume"
   fi
+  case "${3:-}" in
+    file:*)
+      if [[ -s "$WT/${3#file:}" ]]; then
+        echo "    [dev] ⚠ $1 agent exited $rc but ${3#file:} is on disk — continuing from the artifact"
+        return 0
+      fi ;;
+    commits:*)
+      if ! git -C "$WT" diff --quiet "${3#commits:}" -- 2>/dev/null; then
+        echo "    [dev] ⚠ $1 agent exited $rc but $BRANCH advanced past ${3#commits:} — continuing from its commits"
+        return 0
+      fi ;;
+  esac
+  fail "$1 agent failed (worktree kept for resume)"
 }
 PUSH="${PUSH:-$(cfg push)}"
 PREFIX="${BRANCH_PREFIX:-$(cfg branch_prefix)}"; PREFIX="${PREFIX:-dozer}"
@@ -440,7 +472,7 @@ if [[ "${DRY_RUN:-}" == "1" ]]; then
   git -C "$WT" add -A && git -C "$WT" commit -q -m "dozer #$ID: $TITLE (dry-run stub, attempt $attempt)" || true
 else
   # -- 2a. ARCHITECT: spec -> DOZER-DESIGN.md -------------------------------------
-  run_model_pass architect "$ARCH_PROMPT"
+  run_model_pass architect "$ARCH_PROMPT" file:DOZER-DESIGN.md
   if [[ -z "${MODEL_CMD:-}" ]]; then
     # The pass was told to write AND commit the design; backstop the commit so the
     # build diff/merge never lose it (still fail-fast on NO design at all).
@@ -460,7 +492,7 @@ $1"
     # The no-commit gate anchors at HEAD *now*: the architect pass commits the design,
     # so diffing against $base would pass vacuously even if the build wrote nothing.
     anchor="$(git -C "$WT" rev-parse HEAD)"
-    run_model_pass build "$prompt"
+    run_model_pass build "$prompt" "commits:$anchor"
     # no-op if the agent (or link_deps) already provided node_modules
     install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
     resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
@@ -495,7 +527,7 @@ TASK #$ID: $TITLE
 DIFF ($base..HEAD):
 $(git -C "$WT" diff "$base" 2>/dev/null)
 EOF
-    run_model_pass review "$_rev_prompt"
+    run_model_pass review "$_rev_prompt" file:DOZER-REVIEW.md
     unset _rev_prompt
     if [[ -z "${MODEL_CMD:-}" ]]; then
       git -C "$WT" add DOZER-REVIEW.md 2>/dev/null \
