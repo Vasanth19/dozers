@@ -28,6 +28,11 @@ task_list_untriaged() {
 }
 
 task_list_ready() {
+  # GSAI-105: the adapter contract (tasks/adapter.sh) wants the ready list in claim
+  # order — urgency first, then oldest — with a 4th priority column. GitHub Issues
+  # has no priority field, so there is nothing to sort by and nothing to print:
+  # gh's default (newest first) is what you get. Prioritised claiming is a Linear
+  # backend feature; this backend stays the zero-infra one.
   _gh issue list --state open --label ready --json number,title,labels \
     --jq '.[] | . as $i | (.labels|map(.name)|map(select(startswith("lane:")))[0] // "lane:none") as $lane | "\($i.number)\t\($lane|ltrimstr("lane:"))\t\($i.title)"'
 }

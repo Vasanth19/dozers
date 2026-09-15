@@ -25,10 +25,22 @@ task_list_untriaged() {
 }
 
 task_list_ready() {
+  # GSAI-105: mirror the Linear backend's claim order — a task file may carry
+  # `priority: <1-4>` frontmatter (1=urgent … 4=low, Linear-style; absent or
+  # unparseable sorts last). Tiebreak is the filename: a file task has no createdAt,
+  # so "oldest first" degenerates to name order, which is at least deterministic.
+  # Row format is the adapter contract: <id>\t<lane>\t<title>\t<priority-or-empty>.
+  local f id prio
   for f in "$BOARD"/ready/*.md; do
     [[ -e "$f" ]] || continue
-    printf '%s\t%s\t%s\n' "$(basename "$f" .md)" "$(_fm "$f" lane)" "$(_fm "$f" title)"
-  done
+    id="$(basename "$f" .md)"
+    # `|| true`: adapter.sh sources us under `set -euo pipefail`, and a task file
+    # without a `priority:` line makes _fm's grep exit 1 — a bare assignment would
+    # abort the whole drain. (Existing _fm reads hide inside printf args for the
+    # same reason.)
+    prio="$(_fm "$f" priority || true)"; [[ "$prio" =~ ^[1-4]$ ]] || prio=""
+    printf '%s\t%s\t%s\t%s\t%s\n' "${prio:-5}" "$id" "$(_fm "$f" lane)" "$(_fm "$f" title)" "$prio"
+  done | sort -t$'\t' -k1,1n -k2,2 | cut -f2-
 }
 
 task_mark_ready() { # <id> <lane>
