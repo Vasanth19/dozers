@@ -10,7 +10,13 @@
 #
 # Every backend must implement these five functions:
 #   task_list_untriaged   -> print one "<id>\t<title>" per line (no lane yet)
-#   task_list_ready       -> print one "<id>\t<lane>\t<title>" per line (ready+lane)
+#   task_list_ready       -> print one "<id>\t<lane>\t<title>[\t<priority>]" per line
+#                            (ready+lane), in CLAIM order: backend-defined urgency
+#                            first, then oldest first, ties broken deterministically.
+#                            drain() claims top-down, so the list order IS the fleet's
+#                            pick order (GSAI-105). The 4th field is the backend's
+#                            priority token ("" when the issue/backend has none) —
+#                            dozer.sh logs it; no consumer requires it.
 #   task_mark_ready <id> <lane>   -> the GREENLIGHT: stamp an issue ready + give it a lane.
 #                            It is a RESET, not an add (GSAI-75). After it returns, the
 #                            task MUST appear in task_list_ready — whatever state a
