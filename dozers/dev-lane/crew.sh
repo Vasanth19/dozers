@@ -61,7 +61,7 @@ cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 
 # fail: print the reason AND record it in $OUT/<id>.fail so the engine can put it
 # in the block comment (GSAI-26 #3) — Directors shouldn't have to read loop.err.log.
 fail() { echo "    [dev] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
-rm -f "$OUT/$ID.fail" 2>/dev/null || true
+rm -f "$OUT/$ID.fail" "$OUT/$ID.merge" 2>/dev/null || true   # .merge receipt: see GSAI-119 block below
 
 # ── Time bounds (GSAI-37) — resolved up front so a bad value fails before any spend ──
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
@@ -486,6 +486,18 @@ if [[ "$PUSH" == "true" ]]; then
   elif (( TIMEBOX_HIT )); then echo "    [dev] ⚠ push timed out after ${T_PUSH}s (DOZER_TIMEOUT_PUSH / timeout_push) — $INTEG merged locally, not pushed"
   else echo "    [dev] ⚠ push failed"; fi
 fi
+
+# ── Merge receipt (GSAI-119): the engine labels the issue dozer:merged-develop on the
+# crew's exit code alone, so the label must be backed by a checkable fact, not a claim.
+# Before labeling, dozer.sh runs dozers/verify-merge.sh on THIS receipt: the merge SHA
+# below must exist in the repo and be an ancestor of the branch below. The receipt is
+# written only here — after the merge landed AND the green-gate passed — so an exit 0
+# from any earlier point (or a receipt missing/stale) blocks the issue instead of
+# labeling it merged, which is how phantom merges reached the Ship gate (CFW-215/252).
+MERGE_SHA="$(git -C "$MW" rev-parse HEAD)"
+printf 'branch=%s\nmerge_sha=%s\n' "$INTEG" "$MERGE_SHA" > "$OUT/$ID.merge" 2>/dev/null \
+  || fail "merge landed but the receipt could not be written ($OUT/$ID.merge) — NOT labeling merged; investigate .artifacts/dev writability and re-greenlight"
+echo "    [dev] merge receipt: $(git -C "$MW" rev-parse --short HEAD) on $INTEG"
 
 # ── 4. cleanup (success): drop worktrees + branch + state; merge lock released on EXIT ──
 (( MW_OWNED )) && { git worktree remove --force "$MW" >/dev/null 2>&1 || true; }

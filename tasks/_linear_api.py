@@ -348,6 +348,38 @@ def list_inflight():
             print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}')
 
 
+def list_merged_dev():
+    """Every issue carrying dozer:merged-develop, ANY state (the audit's input).
+
+    GSAI-119: this label used to mean only "the dev crew exited 0". The audit
+    (dozers/audit-merged.sh) git-verifies each of these rows against the issue's
+    repo. Row format: identifier \t team \t repo:<id> hint (or -) \t state type \t lane.
+    Includes closed issues on purpose: Done + merged-develop pollutes the Ship gate
+    view (CFW-251, 2026-09-14)."""
+    for i in _all_issues():
+        labels = i["labels"]["nodes"]
+        if not _has(labels, MERGEDDEV):
+            continue
+        hint = next((n["name"][len("repo:"):] for n in labels if n["name"].startswith("repo:")), "-")
+        print(f'{i["identifier"]}\t{i["team"]["key"]}\t{hint}\t{i["state"]["type"]}\t{_lane_of(labels) or "-"}')
+
+
+def audit_requeue(identifier):
+    """A phantom merge on an OPEN issue: strip the label, hand the task back to the
+    queue (dozer:ready + unstarted, lane preserved) so the Dozer actually does the
+    work this time. GSAI-119 — see dozers/audit-merged.sh."""
+    _relabel(issue(identifier), add=[READY], remove=[MERGEDDEV, INPROG], state_type="unstarted")
+    print(f"{identifier} -> {READY} (phantom {MERGEDDEV} stripped, requeued)")
+
+
+def audit_strip(identifier):
+    """Label hygiene ONLY (GSAI-119): a completed/canceled issue must not retain
+    dozer:merged-develop — it pollutes the Ship gate view with an already-closed
+    PROMOTE row. Drops the label, never touches state."""
+    _relabel(issue(identifier), remove=[MERGEDDEV])
+    print(f"{identifier} -> {MERGEDDEV} stripped (closed-issue hygiene)")
+
+
 def requeue(identifier):
     # Undo a claim: re-add dozer:ready, drop in-progress, back to unstarted so
     # list_ready() picks it up again. The lane label is preserved.
@@ -532,6 +564,9 @@ OPS = {
     "description": lambda a: description(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
+    "list-merged-dev": lambda a: list_merged_dev(),
+    "audit-requeue": lambda a: audit_requeue(a[0]),
+    "audit-strip": lambda a: audit_strip(a[0]),
     "alarm-probe": lambda a: alarm_probe(a[0]),
     "alarm-raise": lambda a: alarm_raise(a[0], a[1]),
     "alarm-clear": lambda a: alarm_clear(a[0], a[1]),
