@@ -262,6 +262,9 @@ Directors and the Dozer coordinate entirely through labels on the issue:
      ▼
  dozer:in-progress
      ├── dev  ──► dozer:merged-develop ──► (Director) director:merged-main ──► Done
+     │           ▲ git-verified first (GSAI-119): the merge receipt's SHA must be an
+     │           │ ancestor of the integration branch, else blocked — never labelled
+     │           │ (`dozers/verify-merge.sh`; repair pass: `dozers/audit-merged.sh`)
      ├── mktg ──► dozer:needs-review ─────► (human approves) ──────────────► Done
      └── fail ──► dozer:blocked   (Director fixes, re-greenlights)
 
@@ -363,6 +366,8 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
 | `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms (Linear `board:to_review` on `alarm_issue`, Buzz optional) when it stops beating or stops dispatching (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
 | `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
+| `dozers/verify-merge.sh` | The proof step behind `dozer:merged-develop` (GSAI-119): the dev crew's merge receipt SHA must be an ancestor of the integration branch in the task's own repo, or the issue blocks instead of labelling. |
+| `dozers/audit-merged.sh` | One-shot phantom-merge repair: walks every `dozer:merged-develop` issue, git-verifies the claimed merge, strips + requeues phantoms, strips the label off closed issues (`--dry-run` to preview). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
 | `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`, `promote.sh`. |
 | `directors/promote.sh` | The **only** way develop→main moves: fetch → refuse a dirty checkout → `git merge --no-ff` → verify a 2-parent merge that adds nothing absent from develop → push. A hand-rolled *squash* promote once split cfw-social's branches (GSAI-104); an invariant that lives in prose is not an invariant. |
