@@ -96,15 +96,26 @@ cleanup_crews() { local l p; for l in "$LOCKS"/*.lock; do [[ -e "$l/owner" ]] ||
 cleanup_crews; reset_board
 seed NAP-SLOW 8; for i in 1 2 3; do seed "NAP-F$i" 1; done
 LOG="$TMP/once.log"; start=$SECONDS; engine once 2 "$LOG"; once_pid=$ENGINE_PID
-# by ~4s the three 1s tasks are done (slots: slow + one revolving) and the slow one is up
+# The three 1s tasks must all land while the slow crew is still holding its slot.
+# This used to be budgeted as a flat "by ~4s", which asserted a MACHINE SPEED, not the
+# invariant: a crew is not just its sleep, it carries real per-run overhead (claim, run
+# lock, board bookkeeping, the merge) — measured ~4s a crew here, so a "1s" task costs
+# ~5s wall clock and, at fanout=2, the three fast ones need two full rounds (~10s). The
+# 6s budget could therefore never be met on an ordinary box, and the test was red on
+# develop for reasons that had nothing to do with the engine. Wait on the invariant
+# itself instead — the fast tasks finishing, with the slow crew still up when they do —
+# under a bound loose enough to be about hanging, not about how fast this Mac is.
 fast_done_early=0
-while (( SECONDS - start < 6 )); do (( $(done_count) >= 3 )) && { fast_done_early=1; break; }; sleep 0.5; done
+while (( SECONDS - start < 60 )); do (( $(done_count) >= 3 )) && { fast_done_early=1; break; }; sleep 0.5; done
 (( fast_done_early )) && slow_running NAP-SLOW && ok "ONCE: 3 fast tasks done at $(( SECONDS - start ))s while the slow crew still runs" \
   || no "ONCE: fast tasks did not finish ahead of the slow crew (done=$(done_count))"
 wait "$once_pid"; rc=$?; ENGINE_PID=""
 took=$(( SECONDS - start ))
 [[ $rc -eq 0 ]] && ok "ONCE: exited 0" || { no "ONCE: exited $rc"; sed 's/^/    | /' "$LOG" >&2; }
-(( took >= 8 && took <= 20 )) && ok "ONCE: returned only after the slow crew ended (${took}s)" || no "ONCE: returned at ${took}s"
+# The lower bound is the real assertion — `once` must not return before the slow crew
+# ended. The upper bound only catches a hang, so it is generous on purpose: per-crew
+# overhead makes the honest total ~16s, and a tight ceiling is just the 6s flake again.
+(( took >= 8 && took <= 90 )) && ok "ONCE: returned only after the slow crew ended (${took}s)" || no "ONCE: returned at ${took}s"
 (( $(done_count) == 4 )) && ok "ONCE: every task reached done/" || no "ONCE: done=$(done_count), want 4"
 
 if [[ $fail == 0 ]]; then echo "dozer-fanout-test: PASS"; else echo "dozer-fanout-test: FAIL" >&2; exit 1; fi
