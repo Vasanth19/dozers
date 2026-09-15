@@ -174,10 +174,19 @@ The Dozer works *inside the target project's checkout*, resolved from your
 ```
    repo:<id> label   →  that repo's path (searched in projects: then infrastructure:)
    task's team/org    →  the org's default repo (projects: only — infra has no org)
-   workdir_default    →  fallback
+   workdir_default    →  explicit catch-all, only when the task named no repo
 ```
 
 Paths live in one registry, never hardcoded in a label or in config.
+
+**Routing fails loud** (GSAI-131). It is a preflight: a task that cannot be routed is
+`dozer:blocked` with the resolver's real error *before* any crew, worktree or branch
+exists. A task that carries an identity — a `repo:` label or a team — is routed by the
+registry or not at all: a `repo:<id>` that doesn't resolve is never demoted to the
+team's default repo, and never falls back into the Dozer's own repo. Guessing a repo is
+how a brand's code ends up being built inside the engine. `workdir_default` applies only
+to a task that names neither, which is what makes the self-hosted/files-backend mode
+(the Dozer working on the repo it ships in) still work.
 
 ---
 
