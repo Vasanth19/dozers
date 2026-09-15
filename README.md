@@ -86,6 +86,7 @@ dozers/dozer.sh loop
 # 2) a Director greenlights work (or run one as a Buzz/Codex/Claude agent — see below):
 directors/run.sh triage                       # see untriaged issues
 directors/run.sh ready ENG-42 dev             # greenlight #ENG-42 into the dev lane
+directors/promote.sh myrepo --summary ENG-42  # promote develop → main (always a --no-ff merge)
 ```
 
 The Dozer picks up `ENG-42` within one poll, builds it in your repo's worktree, runs
@@ -142,7 +143,7 @@ an OKR → no greenlight → no run.
         →  coding agent implements + tests + commits
         →  test gate (red = stop; NO tests = stop too)
         →  serial-merge to develop (green-gated)
-        →  Director promotes develop → main
+        →  Director promotes develop → main   (directors/promote.sh — always --no-ff)
 
   lane:marketing  ────────────────────────────────────────────────────────
      load brand voice  →  content agent produces the asset
@@ -363,7 +364,8 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 | `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms (Linear `board:to_review` on `alarm_issue`, Buzz optional) when it stops beating or stops dispatching (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
 | `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
-| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
+| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`, `promote.sh`. |
+| `directors/promote.sh` | The **only** way develop→main moves: fetch → refuse a dirty checkout → `git merge --no-ff` → verify a 2-parent merge that adds nothing absent from develop → push. A hand-rolled *squash* promote once split cfw-social's branches (GSAI-104); an invariant that lives in prose is not an invariant. |
 | `directors/LINEAR.md` | The board contract every Director inherits — the exact label move per operation, plus the **board protocol**: `@Vas` + `board:to_review` → one `#now` ping → reconcile-first next wake → `board:responded`. |
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
 | `dozers/model.sh` · `tasks/model_route.py` | Per-role model routing — `show` / `env <role>` / `smoke <provider>`. |
