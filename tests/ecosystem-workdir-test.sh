@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/ecosystem-workdir-test.sh — regression test for GSAI-17.
 #
-# tasks/ecosystem_workdir.py used to search only `projects:`. Infra repos (paperclip,
+# tasks/ecosystem_workdir.py used to search only `projects:`. Infra repos (harbour,
 # openclaw, gbrain-source) live under `infrastructure:` in ecosystem.yaml, so a
 # `repo:<infra-id>` label never resolved and no fix in those repos could be greenlit
 # (GSAI-43 was stuck on exactly this). This pins the resolver's contract:
@@ -11,7 +11,7 @@
 #   NOTDIR    — an infra entry whose `local` is a file (ollama binary) does NOT resolve
 #   FLAG      — --flag reads per-repo settings off an infrastructure: entry too
 #   TEAM      — --team still walks projects: only (infra entries carry no org)
-#   LIVE      — against the REAL registry, repo:paperclip / repo:openclaw resolve
+#   LIVE      — against the REAL registry, every on-disk `infrastructure:` entry resolves
 #
 # Hermetic: builds a fixture registry in a tempdir and points ECOSYSTEM_REGISTRY at it.
 # Run:  bash tests/ecosystem-workdir-test.sh   (exits non-zero on any failure)
@@ -22,7 +22,7 @@ RESOLVER="$ROOT/tasks/ecosystem_workdir.py"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 fail=0; ok() { echo "  ✓ $1"; }; no() { echo "  ✗ $1" >&2; fail=1; }
 
-mkdir -p "$TMP/proj/app" "$TMP/proj/shadow-project" "$TMP/infra/paperclip" \
+mkdir -p "$TMP/proj/app" "$TMP/proj/shadow-project" "$TMP/infra/harbour" \
          "$TMP/infra/openclaw" "$TMP/infra/gbrain" "$TMP/infra/shadow-infra"
 touch "$TMP/infra/ollama-bin"
 
@@ -39,9 +39,9 @@ projects:
     org: acme
     local: $TMP/proj/shadow-project/
 infrastructure:
-  - id: paperclip
-    local: $TMP/infra/paperclip/
-    repo: https://github.com/paperclipai/paperclip
+  - id: harbour
+    local: $TMP/infra/harbour/
+    repo: https://github.com/hyphenlabs/harbour
     role: control-plane
   - id: openclaw
     local: $TMP/infra/openclaw/
@@ -70,7 +70,7 @@ expect_miss() { # expect_miss <label> -- <resolver args>
 }
 
 # ── INFRA: id, folder basename, repo-URL basename all hit the infrastructure: entry ──
-expect "INFRA repo:paperclip (id)"        "$TMP/infra/paperclip" -- --repo paperclip
+expect "INFRA repo:harbour (id)  "        "$TMP/infra/harbour" -- --repo harbour
 expect "INFRA repo:openclaw (id)"         "$TMP/infra/openclaw"  -- --repo openclaw
 expect "INFRA repo:gbrain (folder name)"  "$TMP/infra/gbrain"    -- --repo gbrain
 expect "INFRA repo:gbrain-source (id)"    "$TMP/infra/gbrain"    -- --repo gbrain-source
@@ -90,7 +90,7 @@ expect_miss "NOTDIR repo:nope (unknown)"                 -- --repo nope
 got="$(resolve --flag no_test_gate --path "$TMP/infra/gbrain")"; rc=$?
 [[ $rc -eq 0 && "$got" == "true" ]] && ok "FLAG no_test_gate read off infrastructure: entry -> $got" \
                                     || no "FLAG expected 'true' got '$got' (rc=$rc)"
-resolve --flag no_test_gate --path "$TMP/infra/paperclip" >/dev/null && no "FLAG unset key should exit non-zero" \
+resolve --flag no_test_gate --path "$TMP/infra/harbour" >/dev/null && no "FLAG unset key should exit non-zero" \
                                                                      || ok "FLAG unset key on infra entry exits non-zero"
 
 # ── TEAM: team resolution ignores infrastructure: (no org there) ──────────────
@@ -98,29 +98,42 @@ expect "TEAM --team ACME -> first live project of the org" "$TMP/proj/app" -- --
 expect "TEAM repo miss + team fallback" "$TMP/proj/app" -- --repo nope --team ACME
 
 # ── LIVE: the real registry, the spec's own "done when" ───────────────────────
-# Skipped (not failed) only when the registry or the checkout is absent on this box —
-# that is an environment gap, not a resolver regression.
+# Registry-driven on purpose: it asserts that EVERY on-disk `infrastructure:` entry in
+# the real ecosystem.yaml resolves by id — it never names a specific repo. The old
+# version hardcoded `paperclip`, which is retired (Linear replaced it, 2026-08-31), so
+# the test went red the day the registry dropped the entry — a registry edit breaking a
+# resolver test is exactly the coupling this avoids (GSAI-91).
+# Skipped (not failed) only when the registry is absent or nothing is checked out on
+# this box — that is an environment gap, not a resolver regression.
 REAL="${HOME}/ecosystem/ecosystem.yaml"
 if [[ -f "$REAL" ]]; then
-  for id in paperclip openclaw; do
-    local_path="$(python3 - "$REAL" "$id" <<'PY'
-import sys, os, yaml
-reg = yaml.safe_load(open(sys.argv[1]))
-for p in reg.get("infrastructure") or []:
-    if p.get("id") == sys.argv[2]:
-        print(os.path.expanduser(str(p.get("local") or "")).rstrip("/")); break
+  live_rows="$(python3 - "$REAL" <<'PY'
+import os, sys, yaml
+reg = yaml.safe_load(open(sys.argv[1])) or {}
+infra = reg.get("infrastructure") or []
+print("HAS_INFRA" if infra else "NO_INFRA")
+for entry in infra:
+    pid = entry.get("id")
+    local = os.path.expanduser(str(entry.get("local") or "")).rstrip("/")
+    if pid and local and os.path.isdir(local):
+        print(f"{pid}\t{local}")
 PY
-)"
-    if [[ -z "$local_path" ]]; then
-      no "LIVE $id is not listed under infrastructure: in the real registry"
-    elif [[ ! -d "$local_path" ]]; then
-      echo "  - LIVE repo:$id skipped — $local_path is not on disk"
-    else
+)"; rc=$?
+  if (( rc != 0 )); then
+    no "LIVE could not read $REAL (rc=$rc)"
+  elif [[ "$(head -1 <<<"$live_rows")" == "NO_INFRA" ]]; then
+    no "LIVE the real registry has no infrastructure: entries — nothing pins the resolver"
+  else
+    checked=0
+    while IFS=$'\t' read -r id local_path; do
+      [[ -z "$id" ]] && continue
+      checked=$(( checked + 1 ))
       got="$(python3 "$RESOLVER" --repo "$id" 2>/dev/null)"; rc=$?
       [[ $rc -eq 0 && "$got" == "$local_path" ]] && ok "LIVE repo:$id -> $got" \
                                                  || no "LIVE repo:$id expected '$local_path' got '$got' (rc=$rc)"
-    fi
-  done
+    done < <(tail -n +2 <<<"$live_rows")
+    (( checked == 0 )) && echo "  - LIVE skipped — no infrastructure: entry is checked out on this box"
+  fi
 else
   echo "  - LIVE skipped — no $REAL on this box"
 fi
