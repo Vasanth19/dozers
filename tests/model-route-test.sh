@@ -3,7 +3,8 @@
 #
 # Proves the knob that decides WHICH BRAIN a role runs on behaves, and above all that
 # it FAILS FAST instead of quietly falling back to claude:
-#   DEFAULT   — shipped config routes every role to claude -p (nothing changed on merge)
+#   DEFAULT   — shipped config routes the dev role to claude -p with an EXPLICIT model
+#   UNPINNED  — a claude route with model:"" in config -> exit 2 (GSAI-83); env stays loose
 #   OVERRIDE  — DOZER_MODEL_<ROLE>=ollama-cloud:<model> emits the proven ANTHROPIC_* env
 #   VAULT     — the key is read from the configured env file, never printed by `show`
 #   NOKEY     — ollama-cloud with no key anywhere -> exit 2 with a clear message
@@ -66,8 +67,8 @@ echo "== model routing =="
 
 # ── DEFAULT: shipped config = claude for every role ────────────────────────────
 out="$(route env dev)"
-if has "$out" "export MODEL_CMD='claude -p'" && has "$out" "export DOZER_MODEL_PROVIDER=claude"; then
-  ok "DEFAULT dev -> claude -p"; else no "DEFAULT dev should route to claude -p; got: $out"; fi
+if has "$out" "export MODEL_CMD='claude -p --model claude-opus-5'" && has "$out" "export DOZER_MODEL_PROVIDER=claude"; then
+  ok "DEFAULT dev -> claude -p with the model PINNED"; else no "DEFAULT dev should route to a pinned claude model; got: $out"; fi
 out="$(route env marketing)"
 has "$out" "export MODEL_CMD='claude -p'" && ok "DEFAULT marketing -> claude -p" \
   || no "DEFAULT marketing should route to claude -p; got: $out"
@@ -99,12 +100,43 @@ out="$(route DOZER_MODEL_DEV=ollama-cloud env dev)"
 has "$out" "export ANTHROPIC_MODEL=glm-5.2" && ok "OVERRIDE bare ollama-cloud uses the provider default model" \
   || no "bare ollama-cloud should pick a provider default; got: $out"
 
+# ── UNPINNED: a claude route with no model in config -> exit 2 (GSAI-83) ───────
+# A bare `claude -p` inherits the CLI's default, which drifted opus-4-8 -> fable-5-1 ->
+# opus-5 in one week and spent 37% of the Dozer's budget on a 2x-price model nobody
+# chose. Config must name the model; an env override stays loose on purpose.
+UNPIN="$TMP/unpinned.yaml"
+python3 - "$CFG" "$UNPIN" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+s, n = re.subn(r'(?m)^(\s*dev:\s*)\{[^}]*\}', r'\1{ provider: claude, model: "" }', s)
+assert n == 1, "fixture did not blank models.dev (found %d matches)" % n
+open(sys.argv[2], 'w').write(s)
+PY
+set +e
+out="$(env "${SCRUB_ENV[@]}" DOZER_CONFIG="$UNPIN" bash "$ROOT/dozers/model.sh" env dev 2>&1)"; rc=$?
+set -e
+if (( rc == 2 )) && has "$out" "no model"; then
+  ok "UNPINNED claude route fails fast (exit 2)"
+else no "UNPINNED should exit 2 naming the missing model; rc=$rc out=$out"; fi
+has "$out" "MODEL_CMD" && no "UNPINNED must not emit MODEL_CMD"   || ok "UNPINNED emits no MODEL_CMD (no bare claude -p)"
+# ...but a human's one-off env override is still allowed to be loose.
+set +e
+out="$(env "${SCRUB_ENV[@]}" DOZER_CONFIG="$UNPIN" DOZER_MODEL_DEV=claude        bash "$ROOT/dozers/model.sh" env dev 2>&1)"; rc=$?
+set -e
+if (( rc == 0 )) && has "$out" "export MODEL_CMD='claude -p'"; then
+  ok "UNPINNED env override stays loose (deliberate one-off)"
+else no "env override should still resolve; rc=$rc out=$out"; fi
+
 # ── VAULT: `show` must never leak the token ────────────────────────────────────
 python3 - "$CFG" <<'PY'
 import re, sys
+# Line-anchored, not a byte-for-byte literal: this fixture broke silently once when
+# org/config.yaml pinned the model (GSAI-83), and a fixture that no-ops on drift makes
+# the two assertions below test the shipped config instead of the route under test.
 p = sys.argv[1]; s = open(p).read()
-s = s.replace('dev:       { provider: claude, model: "" }',
-              'dev:       { provider: ollama-cloud, model: "glm-5.2" }')
+s, n = re.subn(r'(?m)^(\s*dev:\s*)\{[^}]*\}',
+               r'\1{ provider: ollama-cloud, model: "glm-5.2" }', s)
+assert n == 1, "fixture did not rewrite models.dev (found %d matches)" % n
 open(p, 'w').write(s)
 PY
 out="$(route show)"
