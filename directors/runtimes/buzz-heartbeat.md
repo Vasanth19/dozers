@@ -6,14 +6,14 @@ system prompt (build-prompt.sh dev-director buzz); this just triggers one sweep.
 
 It's your scheduled Dev-Director tick. Do ONE sweep, then stop.
 
-**First, recall the brain:** run `brain recall "dev-director promote develop main"` and follow the runbook. Golden rule: measure git gaps against `origin` (fetch first), never against a stale local branch.
+**Promote is a script:** `directors/promote.sh <repo-id|path> --summary "<issue ids>"` — never hand-roll the git (a hand-rolled squash split cfw-social's branches; see GSAI-104). It fetches, refuses a dirty checkout, merges `--no-ff`, and verifies a 2-parent result. Background on a repo's quirks: `brain recall "dev-director promote develop main"`. Golden rule it already applies: measure git gaps against `origin` (fetch first), never against a stale local branch.
 
 1. Read `~/ecosystem/ecosystem.yaml` → find your own entry under `buzz.agents` → get your
    `teams` and each team's channel id from `buzz.channels`. Those are your teams.
 2. For EACH team, spawn a worker in parallel (Sonnet sub-agent or `claude -p`) to run one
    Dev-Director pass on that team's Linear board:
    - triage new issues; greenlight ready ones (`dozer:ready` + `lane:dev`);
-   - review `dozer:merged-develop` (promote develop→main, or send back);
+   - review `dozer:merged-develop` (promote with `directors/promote.sh`, or send back);
    - UNSTICK anything blocked — re-run failed jobs, restart a hung Dozer/deploy, fix a bad
      label or merge conflict, break simple deadlocks. Never write feature code.
 3. Collect the workers' results into ONE short per-team summary: moved / fixed / still-stuck.
