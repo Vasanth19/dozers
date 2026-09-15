@@ -115,7 +115,8 @@ run_crew "$PB" "TEST-TO-B" "$LOG" AGENT_HANG=1 || rc=$?
 took=$(( SECONDS - start ))
 [[ $rc -ne 0 ]] && ok "MODEL: crew blocked (exit $rc) in ${took}s" || { no "MODEL: crew exited 0 with a hung agent"; dump "$LOG"; }
 r="$(reason TEST-TO-B)"
-[[ "$r" == *"coding agent timed out after ${BOUND}s"* && "$r" == *"DOZER_TIMEOUT_MODEL"* ]] && ok "MODEL: reason names the model timeout" \
+# per-role routing: the stub hangs on its FIRST invocation, which is the architect pass
+[[ "$r" == *"architect agent timed out after ${BOUND}s"* && "$r" == *"DOZER_TIMEOUT_MODEL"* ]] && ok "MODEL: reason names the model timeout" \
   || { no "MODEL: reason does not name the model timeout: '$r'"; dump "$LOG"; }
 [[ "$r" == *"kept for resume"* ]] && ok "MODEL: worktree kept for resume" || no "MODEL: reason does not mention resume: '$r'"
 [[ -d "$TMP/wt-TEST-TO-B/hang-model-TEST-TO-B" ]] && ok "MODEL: worktree actually kept" || no "MODEL: worktree removed"

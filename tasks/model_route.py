@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Resolve which MODEL (brain) a Dozer ROLE runs on, and print an eval-able shell block.
 
-One knob, one place. `org/config.yaml` maps a ROLE (today: the lane name — dev,
-marketing — plus `default` for anything unlisted) to a PROVIDER and a MODEL id.
-An env override always wins:
+One knob, one place. `org/config.yaml` maps a ROLE to a PROVIDER and a MODEL id. A role
+is a lane name (`dev`, `marketing`) or a DOTTED per-pass role (`dev.architect`,
+`dev.build`, `dev.review`): a nested lane entry maps each role to its own route, while a
+flat entry (one carrying a `provider`/`model` key) is shared by every role in the lane.
+`default` covers anything unlisted. An env override always wins:
 
     DOZER_MODEL_<ROLE>="<provider>[:<model>]"     e.g. DOZER_MODEL_DEV=ollama-cloud:glm-5.2
+                                                  e.g. DOZER_MODEL_DEV_BUILD=ollama-cloud:kimi-k3:cloud
+
+(the role key folds dots to `_`, so the dotted role needs no separate override name).
+
+`small` (a plain string on a nested lane entry) or `small_model:` (on a flat entry) pins
+ANTHROPIC_SMALL_FAST_MODEL for ollama-cloud / ollama-local routes instead of duplicating
+the main model. Unset: small = main (the original behaviour).
 
 Usage:
     tasks/model_route.py <role> [--config PATH]
@@ -86,30 +95,94 @@ def role_key(role):
     return "DOZER_MODEL_" + "".join(c if c.isalnum() else "_" for c in role).upper()
 
 
+# Keys on a nested lane entry that are NOT roles: `small` pins the small/fast model,
+# `small_model` is the accepted flat-entry spelling (also tolerated nested).
+LANE_META_KEYS = ("small", "small_model")
+
+
+def lane_roles(entry):
+    """Role names of a nested lane entry (a mapping without a `provider` key)."""
+    if not isinstance(entry, dict) or "provider" in entry:
+        return []
+    return [r for r in entry if r not in LANE_META_KEYS]
+
+
 def resolve_route(role, cfg, env):
-    """(provider, model, source) for a role. Env override beats config beats default."""
+    """(provider, model, small, source) for a role. Env override beats config.
+
+    Config resolution order for a dotted role like `dev.build`:
+        models.dev.build   (nested lane entry: role -> {provider, model})
+        models.dev         (flat lane entry, shared by every role of the lane)
+        models.default
+        legacy             (no models: block at all -> bare claude)
+
+    `small` is the ANTHROPIC_SMALL_FAST_MODEL pin: taken from the role's own entry,
+    else the lane-level `small` (string on a nested lane) / `small_model:` (on a flat
+    entry). "" means "unset" — the caller prints small = main, today's behaviour.
+    """
     override = env.get(role_key(role))
     if override:
         override = override.strip()
         provider, _, model = override.partition(":")
-        return provider.strip(), model.strip(), "env:" + role_key(role)
+        return provider.strip(), model.strip(), "", "env:" + role_key(role)
 
     models = cfg.get("models") or {}
     if not isinstance(models, dict):
         die("`models:` in config is not a mapping")
-    entry = models.get(role)
-    source = "config:models.%s" % role
+
+    lane, _, sub = role.partition(".")
+    entry = None
+    source = small = ""
+    if sub:
+        lane_entry = models.get(lane)
+        if lane_entry is not None and not isinstance(lane_entry, dict):
+            die("`models.%s` must be a mapping" % lane)
+        if isinstance(lane_entry, dict) and "provider" not in lane_entry:
+            entry = lane_entry.get(sub)
+            if entry is not None:
+                source = "config:models.%s" % role
+                if not isinstance(entry, dict):
+                    die("`models.%s` must be a mapping with provider/model" % role)
+                small = str(entry.get("small_model") or "").strip()
+            if not small:
+                for k in LANE_META_KEYS:
+                    v = lane_entry.get(k)
+                    if v is None:
+                        continue
+                    if not isinstance(v, str):
+                        die("`models.%s.%s` must be a model-id string" % (lane, k))
+                    small = v.strip()
+                    if small:
+                        break
+    if entry is None:
+        entry = models.get(lane)
+        source = "config:models.%s" % lane
+        if isinstance(entry, dict) and "provider" not in entry:
+            if sub:
+                # Nested lane without this role, and no lane-level fallback — fail fast.
+                die(
+                    "`models.%s` is a nested lane with roles %s but has no `%s` entry — "
+                    "add `%s: { provider: ..., model: ... }` or rely on a flat `models.%s`"
+                    % (lane, ", ".join(sorted(lane_roles(entry))) or "(none)",
+                       role, sub, lane)
+                )
+            entry = None  # a bare lane name never routes through a nested entry
     if entry is None:
         entry = models.get("default")
         source = "config:models.default"
+        if isinstance(entry, dict) and "provider" not in entry:
+            die("`models.default` must be a flat mapping with provider/model")
     if entry is None:
         # No models: block at all — legacy behavior, honour flat model_cmd via claude.
-        return "claude", "", "config:legacy-default"
-    if not isinstance(entry, dict):
-        die("`models.%s` must be a mapping with provider/model" % role)
+        return "claude", "", "", "config:legacy-default"
+    if not isinstance(entry, dict) or "provider" not in entry:
+        die("`models.%s` must be a mapping with provider/model" % (role if sub else lane))
+    if not small:
+        small = str(entry.get("small_model") or "").strip()
     return (
         str(entry.get("provider") or "claude").strip(),
         str(entry.get("model") or "").strip(),
+        small,
         source,
     )
 
@@ -161,7 +234,7 @@ def emit(lines):
 
 
 def build(role, cfg, env):
-    provider, model, source = resolve_route(role, cfg, env)
+    provider, model, small, source = resolve_route(role, cfg, env)
     if provider not in PROVIDERS:
         die(
             "unknown provider %r for role %r (from %s) — pick one of: %s"
@@ -214,7 +287,10 @@ def build(role, cfg, env):
         export("ANTHROPIC_BASE_URL", base)
         export("ANTHROPIC_AUTH_TOKEN", token)
         export("ANTHROPIC_MODEL", model)
-        export("ANTHROPIC_SMALL_FAST_MODEL", model)
+        # `small` (nested lane) / `small_model:` (flat entry) pins the small/fast model
+        # (auto-compact, title gen) instead of burning the main model on it. Unset:
+        # small = main, the original behaviour.
+        export("ANTHROPIC_SMALL_FAST_MODEL", small or model)
         # count_tokens 404s on these endpoints; disabling non-essential traffic avoids it.
         export("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         cmd = "claude -p"
@@ -233,7 +309,7 @@ def build(role, cfg, env):
 
 def main():
     ap = argparse.ArgumentParser(description="Resolve a Dozer role's model route.")
-    ap.add_argument("role", help="role name (lane): dev, marketing, ... ; 'default' fallback")
+    ap.add_argument("role", help="role: a lane (dev, marketing) or dotted dev.architect/dev.build/dev.review; 'default' fallback")
     ap.add_argument("--config", default=DEFAULT_CONFIG, help="path to org/config.yaml")
     ap.add_argument(
         "--show", action="store_true",
@@ -249,21 +325,36 @@ def main():
 
 
 def show(cfg, env):
-    """Role -> provider/model table. Deliberately prints no secret values."""
+    """Role -> provider/model table. Deliberately prints no secret values.
+
+    A nested lane entry (models.<lane> without a `provider` key) is shown as one row
+    per role — `dev.architect`, `dev.build`, `dev.review` — never as a bare lane row.
+    """
     models = cfg.get("models") or {}
     roles = list(dict.fromkeys(["default"] + [r for r in models if r != "default"]))
     for lane in (cfg.get("lanes") or []):
         if lane not in roles:
             roles.append(str(lane))
-    print("%-12s %-14s %-24s %s" % ("ROLE", "PROVIDER", "MODEL", "SOURCE"))
+    rows = []
     for role in roles:
+        entry = models.get(role)
+        nested = lane_roles(entry)
+        if nested and role != "default":
+            rows.extend("%s.%s" % (role, sub) for sub in nested)
+        else:
+            rows.append(role)
+    print("%-12s %-14s %-24s %s" % ("ROLE", "PROVIDER", "MODEL", "SOURCE"))
+    for role in rows:
         try:
-            provider, model, source = resolve_route(role, cfg, env)
+            provider, model, small, source = resolve_route(role, cfg, env)
         except SystemExit:
-            provider, model, source = "?", "?", "unresolved"
+            provider, model, small, source = "?", "?", "", "unresolved"
         if provider == "ollama-cloud" and not model:
             model = OLLAMA_CLOUD_DEFAULT_MODEL + " (provider default)"
-        print("%-12s %-14s %-24s %s" % (role, provider, model or "(provider default)", source))
+        model = model or "(provider default)"
+        if small:
+            model += " (small: %s)" % small
+        print("%-12s %-14s %-24s %s" % (role, provider, model, source))
 
     path = expand(cfg.get("ollama_env") or DEFAULT_OLLAMA_ENV)
     if env.get("OLLAMA_API_KEY"):

@@ -38,11 +38,12 @@
 #   knowable from the checkout, so don't pay for a run that can never merge), again on
 #   the task worktree after the agent, and once more at the green-gate.
 #
-# Model routing: the brain this lane runs on comes from org/config.yaml `models.dev`
-#   (provider + model), resolved by dozers/model.sh. Override per-run with
-#   DOZER_MODEL_DEV="<provider>[:<model>]" (e.g. ollama-cloud:glm-5.2), or bypass
-#   routing entirely by exporting MODEL_CMD. A route that can't be satisfied FAILS the
-#   crew — no silent fallback.
+# Model routing: THREE passes, each on its OWN brain — ARCHITECT (spec → DOZER-DESIGN.md),
+#   BUILD (implement the design), REVIEW (verdict → DOZER-REVIEW.md). Each resolves its
+#   dotted role via dozers/model.sh: models.dev.<pass> → flat models.dev → models.default.
+#   Override per-run with DOZER_MODEL_DEV[_<PASS>]="<provider>[:<model>]", or bypass
+#   routing entirely by exporting MODEL_CMD (all three passes then share it). A route
+#   that can't be satisfied FAILS the crew — no silent fallback.
 #
 # Time bounds (GSAI-37): every command this crew hands to a repo or a model runs under
 #   dozers/timebox.sh — the coding agent, the lockfile install, the test run in the task
@@ -237,18 +238,42 @@ cd "$WORKDIR" 2>/dev/null || fail "workdir missing: $WORKDIR"
 git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git repo: $WORKDIR"
 
 INTEG="${INTEGRATION_BRANCH:-$(cfg integration_branch)}"; INTEG="${INTEG:-develop}"
-# ── Model routing: which brain runs this lane (see dozers/model.sh + config `models:`).
-# MODEL_CMD already in the env wins (legacy/manual override). Otherwise resolve the
-# ROLE's route — fail fast: a bad provider or a missing key stops the crew, it never
-# silently falls back to claude.
+# ── Model routing: the lane runs THREE model passes (architect → build → review), each
+# on its OWN route, resolved just before the pass runs (see dozers/model.sh + config
+# `models:`). A pass's route block is expanded only INSIDE that pass's timebox subshell,
+# so its exports (ANTHROPIC_*, the provider token, MODEL_CMD) live exactly as long as
+# the pass and never leak back into the crew env the merge/test sections see.
+# MODEL_CMD already in the env wins for every pass (legacy/manual override). Otherwise
+# the pass's DOTTED role resolves nested → flat lane → models.default. Fail fast: a bad
+# provider or a missing key stops the crew — it never silently falls back to claude.
 DOZER_ROLE="${DOZER_ROLE:-dev}"
-if [[ -n "${MODEL_CMD:-}" ]]; then
-  DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
-else
-  _route="$("$REPO_ROOT/dozers/model.sh" env "$DOZER_ROLE")" || fail "model routing failed for role '$DOZER_ROLE'"
-  eval "$_route"; unset _route
-fi
-MODEL_DESC="${DOZER_MODEL_PROVIDER:-claude}/${DOZER_MODEL_NAME:-default}"
+PASS_ROWS=()   # "pass: provider/model" per run, in order — the summary reports all three
+
+_PASS_BLOCK=""; _PASS_DESC=""
+resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK + _PASS_DESC
+  local role="$DOZER_ROLE.$1"
+  if [[ -n "${MODEL_CMD:-}" ]]; then
+    DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
+    _PASS_BLOCK=":"; _PASS_DESC="${DOZER_MODEL_PROVIDER}/${DOZER_MODEL_NAME}"
+    return 0
+  fi
+  _PASS_BLOCK="$("$REPO_ROOT/dozers/model.sh" env "$role")" \
+    || fail "model routing failed for role '$role'"
+  # Desc from a throwaway subshell — the route's exports must not enter the crew env.
+  _PASS_DESC="$(eval "$_PASS_BLOCK" >/dev/null; printf '%s/%s' "${DOZER_MODEL_PROVIDER:-?}" "${DOZER_MODEL_NAME:-default}")"
+}
+
+# run_model_pass <pass> <prompt> — one agent run under its own route, its own timebox.
+run_model_pass() {  # $1 = architect|build|review, $2 = prompt
+  resolve_pass "$1"
+  echo "    [dev] $1 model: $_PASS_DESC"
+  PASS_ROWS+=("$1: $_PASS_DESC")
+  if ! _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" timebox "$T_MODEL" "$1 agent" "$WT" \
+       'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"$_PASS_PROMPT\""'; then
+    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "$1 agent" "$T_MODEL" model); worktree kept for resume"
+    fail "$1 agent failed (worktree kept for resume)"
+  fi
+}
 PUSH="${PUSH:-$(cfg push)}"
 PREFIX="${BRANCH_PREFIX:-$(cfg branch_prefix)}"; PREFIX="${PREFIX:-dozer}"
 WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.dozers/worktrees}"; WT_ROOT="${WT_ROOT/#\~/$HOME}"; mkdir -p "$WT_ROOT"
@@ -281,7 +306,6 @@ if ! git show-ref --verify --quiet "refs/heads/$INTEG" \
 fi
 
 echo "    [dev] cwd=$(pwd)  integration=$INTEG  branch=$BRANCH"
-echo "    [dev] model: $MODEL_DESC"
 [[ -n "$DOZER_PERSONA" ]] && echo "    [dev] persona: $DOZER_PERSONA" || true
 [[ -f AGENTS.md ]] && echo "    [dev] + project AGENTS.md" || true
 
@@ -361,39 +385,152 @@ fi
 link_deps "$WT"
 [[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
 
-# ── 2. coding agent (implements + tests + commits INSIDE the worktree) ─────────
-read -r -d '' PROMPT <<EOF || true
-You are a Dozer working inside a dedicated git worktree on branch $BRANCH.
-Rules (from $DOZER_PERSONA): do ALL work here; implement the task; run the project's
+# ── 2. three model passes: ARCHITECT → BUILD → REVIEW (each on its own route) ────
+# ARCHITECT turns the spec into DOZER-DESIGN.md; BUILD implements that design (and must
+# still clear every existing gate: deps, tests, no-commit); REVIEW judges spec-vs-diff
+# and writes DOZER-REVIEW.md whose first line is the verdict. A FAIL verdict buys ONE
+# rebuild with the review notes; a second FAIL blocks the task.
+
+# -- prompts ----------------------------------------------------------------------
+read -r -d '' ARCH_PROMPT <<EOF || true
+You are the ARCHITECT pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
+Rules (from $DOZER_PERSONA): read the task spec, then DESIGN the implementation — write
+DOZER-DESIGN.md at the worktree root (approach, files to touch, edge cases, how it gets
+tested) and commit it. Write and commit ONLY DOZER-DESIGN.md: no code, no other edits.
+Do NOT merge, push, switch branches, or remove this worktree.
+
+TASK #$ID: $TITLE
+EOF
+
+read -r -d '' BUILD_PROMPT <<EOF || true
+You are the BUILD pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
+Implement the design in DOZER-DESIGN.md (the architect pass's plan — follow it).
+Rules (from $DOZER_PERSONA): do ALL work here; run the project's
 tests until green; commit. Do NOT merge, push, switch branches, or remove this worktree.
 
 TASK #$ID: $TITLE
 EOF
-if (( RESUMING )); then
-  PROMPT="RESUMING (attempt $attempt). Prior work is ALREADY committed on $BRANCH:
-$(git -C "$WT" log --oneline "$base..$BRANCH")
-Continue from there — do NOT redo committed work; finish the task and commit.
 
-$PROMPT"
+if (( RESUMING )); then
+  _resume_note="RESUMING (attempt $attempt). Prior work is ALREADY committed on $BRANCH:
+$(git -C "$WT" log --oneline "$base..$BRANCH")
+Continue from there — do NOT redo committed work; finish the pass and commit."
+  ARCH_PROMPT="$_resume_note
+If DOZER-DESIGN.md is already committed on this branch, review it and amend ONLY if the
+design must change (then commit it again); otherwise commit nothing new.
+
+$ARCH_PROMPT"
+  BUILD_PROMPT="$_resume_note
+
+$BUILD_PROMPT"
+  unset _resume_note
 fi
 
 if [[ "${DRY_RUN:-}" == "1" ]]; then
-  echo "    [dev] DRY_RUN — skipping model$([[ $RESUMING == 1 ]] && echo ' (resume)')"
+  for _p in architect build review; do
+    resolve_pass "$_p"
+    echo "    [dev] $_p model: $_PASS_DESC"
+    PASS_ROWS+=("$_p: $_PASS_DESC")
+  done
+  unset _p
+  echo "    [dev] DRY_RUN — skipping models$([[ $RESUMING == 1 ]] && echo ' (resume)')"
+  printf '# DOZER-DESIGN (dry-run stub)\n' > "$WT/DOZER-DESIGN.md"
   printf 'dozer #%s attempt %s: %s\n' "$ID" "$attempt" "$TITLE" >> "$WT/.dozer-log"
+  printf 'VERDICT: PASS\n(dry-run stub review)\n' > "$WT/DOZER-REVIEW.md"
   git -C "$WT" add -A && git -C "$WT" commit -q -m "dozer #$ID: $TITLE (dry-run stub, attempt $attempt)" || true
 else
-  if ! timebox "$T_MODEL" "coding agent" "$WT" "$MODEL_CMD \"\$PROMPT\""; then
-    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "coding agent" "$T_MODEL" model); worktree kept for resume"
-    fail "coding agent failed (worktree kept for resume)"
+  # -- 2a. ARCHITECT: spec -> DOZER-DESIGN.md -------------------------------------
+  run_model_pass architect "$ARCH_PROMPT"
+  if [[ -z "${MODEL_CMD:-}" ]]; then
+    # The pass was told to write AND commit the design; backstop the commit so the
+    # build diff/merge never lose it (still fail-fast on NO design at all).
+    [[ -s "$WT/DOZER-DESIGN.md" ]] \
+      || fail "architect produced no DOZER-DESIGN.md (worktree kept for resume)"
+    git -C "$WT" add DOZER-DESIGN.md 2>/dev/null \
+      && git -C "$WT" commit -q -m "dozer #$ID: design (architect pass)" 2>/dev/null || true
   fi
-  # no-op if the agent (or link_deps) already provided node_modules
-  install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
-  resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
-  if [[ -n "$TEST_CMD" ]] && ! run_tests "$WT" "task worktree"; then
-    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
-    fail "tests failed — not merging (worktree kept for resume)"
+
+  # -- 2b. BUILD: implement the design + the full downstream gates ----------------
+  # Build is a function because a FAILed review triggers exactly ONE rebuild.
+  build_once() {  # $1 = extra prompt block (review notes on the rebuild)
+    local prompt="$BUILD_PROMPT" anchor
+    [[ -n "${1:-}" ]] && prompt="$prompt
+
+$1"
+    # The no-commit gate anchors at HEAD *now*: the architect pass commits the design,
+    # so diffing against $base would pass vacuously even if the build wrote nothing.
+    anchor="$(git -C "$WT" rev-parse HEAD)"
+    run_model_pass build "$prompt"
+    # no-op if the agent (or link_deps) already provided node_modules
+    install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
+    resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
+    if [[ -n "$TEST_CMD" ]] && ! run_tests "$WT" "task worktree"; then
+      (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
+      fail "tests failed — not merging (worktree kept for resume)"
+    fi
+    # `if !` not `&&`: build_once is CALLED as a plain command under set -e, so the
+    # function's exit status is its last command's — a bare `diff --quiet && fail`
+    # would return 1 (diff found the commits) and kill the crew right after a
+    # PASSING build. Inside `if`, the diff's status is exempt from set -e.
+    if git -C "$WT" diff --quiet "$anchor" -- 2>/dev/null; then
+      fail "build agent produced no commits on $BRANCH"
+    fi
+  }
+
+  # -- 2c. REVIEW: spec + diff -> DOZER-REVIEW.md, first line VERDICT: PASS|FAIL --
+  REVIEW_VERDICT=""
+  review_once() {
+    local vline
+    read -r -d '' _rev_prompt <<EOF || true
+You are the REVIEW pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
+Judge, don't build: change NOTHING except the review file. Given the spec and the diff
+of this branch below, decide whether the implementation satisfies the spec and is sound
+(DOZER-DESIGN.md is the architect pass's plan — check the build followed it). Then write
+DOZER-REVIEW.md at the worktree root whose FIRST LINE is exactly "VERDICT: PASS" or
+"VERDICT: FAIL", followed by your reasons, and commit ONLY that file.
+Do NOT merge, push, switch branches, or remove this worktree.
+
+TASK #$ID: $TITLE
+
+DIFF ($base..HEAD):
+$(git -C "$WT" diff "$base" 2>/dev/null)
+EOF
+    run_model_pass review "$_rev_prompt"
+    unset _rev_prompt
+    if [[ -z "${MODEL_CMD:-}" ]]; then
+      git -C "$WT" add DOZER-REVIEW.md 2>/dev/null \
+        && git -C "$WT" commit -q -m "dozer #$ID: review (review pass)" 2>/dev/null || true
+      vline="$(head -n1 "$WT/DOZER-REVIEW.md" 2>/dev/null | tr -d '\r' || true)"
+      # A missing or garbled verdict IS a fail — no free pass to merge.
+      case "$vline" in
+        "VERDICT: PASS") REVIEW_VERDICT="PASS" ;;
+        "VERDICT: FAIL") REVIEW_VERDICT="FAIL" ;;
+        *)               REVIEW_VERDICT="FAIL" ;;
+      esac
+      echo "    [dev] review verdict: $REVIEW_VERDICT"
+    else
+      REVIEW_VERDICT="PASS"   # MODEL_CMD bypass (legacy/tests): no verdict contract
+    fi
+  }
+
+  build_once ""
+  review_once
+  if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
+    _notes="$(cat "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+    echo "    [dev] review failed — one rebuild with the review notes"
+    build_once "The REVIEW pass FAILED the previous build. Its notes (DOZER-REVIEW.md):
+
+$_notes
+
+Fix what it names, then run the tests and commit."
+    review_once
+    if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
+      _notes="$(cat "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+      fail "review failed TWICE — not merging (worktree kept, sent back). Review notes:
+$(printf '%s\n' "$_notes" | head -n 40 | sed 's/^/      /')"
+    fi
+    unset _notes
   fi
-  git -C "$WT" diff --quiet "$base" -- 2>/dev/null && fail "agent produced no commits on $BRANCH"
 fi
 
 # ── 2b. Migration gate (LL-31): block a schema change with no matching migration ──
@@ -502,9 +639,10 @@ EOF
 if [[ "${DRY_RUN:-}" == "1" ]]; then agent_line="stub commit (dry-run)"; tests_line="skipped (dry-run)"; gate_line="skipped (dry-run)"
 elif (( GATE_WAIVED )); then agent_line="implemented + committed"; tests_line="no test command — gate waived for this repo"; gate_line="not verified (test gate opted out)"
 else agent_line="implemented + committed"; tests_line="gate passed"; gate_line="$INTEG green after merge"; fi
+_models=""; for _p in "${PASS_ROWS[@]:-}"; do [[ -n "$_p" ]] && _models+="${_models:+ · }$_p"; done; unset _p
 cat > "$OUT/$ID.summary" <<EOF
 - Picked up: $TITLE$([[ $RESUMING == 1 ]] && echo " (RESUMED, attempt $attempt)")
-- model: $MODEL_DESC
+- models (architect → build → review): ${_models:-unresolved}
 - Worktree $BRANCH off $INTEG (isolated)
 - Coding agent: $agent_line
 - Tests: $tests_line

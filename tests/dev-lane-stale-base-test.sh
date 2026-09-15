@@ -83,7 +83,8 @@ write_stub "$TMP/stubA.sh" "$TMP/nA" "printf 'task work 1\n' > task.txt"
 STUB="$TMP/stubA.sh"
 
 rc=0; run_crew "$PROJA" TEST-SBA1 "stale-base clean rebase" "$TMP/crewA1.log" || rc=$?
-[[ $rc -ne 0 ]] && grep -q "coding agent failed (worktree kept for resume)" "$TMP/crewA1.log" \
+# per-role routing: the stub dies on its FIRST invocation, which is the architect pass
+[[ $rc -ne 0 ]] && grep -q "architect agent failed (worktree kept for resume)" "$TMP/crewA1.log" \
   && [[ -d "$WT_ROOT/projA-TEST-SBA1" ]] \
   && ok "attempt 1 died with the worktree kept (Seance precondition)" \
   || { no "attempt 1 did not leave a resumable worktree"; sed 's/^/    | /' "$TMP/crewA1.log" >&2; }
@@ -102,7 +103,9 @@ grep -q "base moved — rebased" "$TMP/crewA2.log" \
 grep -q "has not moved — resuming as-is" "$TMP/crewA2.log" \
   && no "crew claimed the base had NOT moved (wrong path)" \
   || ok "crew did NOT take the unchanged-base path"
-[[ "$(cat "$TMP/nA")" == "2" ]] && ok "agent ran again after the rebase (resume continued)" \
+# per-role routing: the resume runs the stub once PER PASS — architect n=2, build n=3,
+# review n=4 — so a continued resume lands the counter on 4, not 2.
+[[ "$(cat "$TMP/nA")" == "4" ]] && ok "agent ran again after the rebase (resume continued: architect+build+review)" \
   || no "agent did NOT run again after the rebase (counter=$(cat "$TMP/nA" 2>/dev/null))"
 
 DEV_MSGS="$(git -C "$PROJA" log --format=%s develop 2>/dev/null)"
