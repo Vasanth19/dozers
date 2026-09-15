@@ -13,7 +13,9 @@
 # Env: WORKDIR, DOZER_PERSONA, REPO_ROOT. Config: integration_branch, push,
 #   branch_prefix, worktree_root. DRY_RUN=1 stubs the model + tests (+ deps install).
 #   DEPS_INSTALL=off skips the lockfile install that otherwise runs when a worktree
-#   has a package.json but no node_modules (GSAI-26).
+#   has a package.json but no node_modules (GSAI-26). On the merge worktree that
+#   install happens AFTER the merge (GSAI-124), so a first package.json arriving with
+#   the change still gets node_modules before the green-gate runs.
 #
 # Integration branch (GSAI-15 / GSAI-19): `develop` when the repo has one (local or
 #   remote), else the repo's own default — origin/HEAD → main → the checked-out branch.
@@ -116,10 +118,17 @@ link_deps_dir() {  # $1 = source dir (real checkout), $2 = target dir (worktree)
 # reverted (CFW-31 failed 18 attempts that way). Install from the lockfile first, so
 # a failure here is reported as the INSTALL's — never disguised as "merge broke
 # develop". No lockfile → no install (a deps-free package.json is legitimate) and the
-# test run speaks for itself. DEPS_INSTALL=off disables. Output → $OUT/<id>.deps.log
-# (never inside the worktree — it may be a live checkout).
-install_deps() {  # $1 = worktree dir, $2 = label for the failure message
-  local d="$1" what="$2" cmd
+# test run speaks for itself. DEPS_INSTALL=off disables. Output → $OUT/<id>.deps-<stage>.log
+# (never inside the worktree — it may be a live checkout; one log per stage so the
+# green-gate's install can't overwrite the task worktree's).
+#
+# Returns 1 with $DEPS_FAIL_MSG set rather than failing outright (GSAI-124) — the
+# green-gate calls this AFTER it has merged, so it must revert before it fails.
+# Callers with nothing to undo just `|| fail "$DEPS_FAIL_MSG"`.
+DEPS_FAIL_MSG=""
+install_deps() {  # $1 = worktree dir, $2 = stage label (also names the log)
+  local d="$1" what="$2" cmd log
+  DEPS_FAIL_MSG=""; log="$OUT/$ID.deps-${what// /-}.log"
   [[ -f "$d/package.json" ]] || return 0
   [[ -e "$d/node_modules" ]] && return 0
   [[ "${DEPS_INSTALL:-on}" == "off" ]] && { echo "    [dev] $what: deps install off"; return 0; }
@@ -128,10 +137,14 @@ install_deps() {  # $1 = worktree dir, $2 = label for the failure message
   elif [[ -f "$d/yarn.lock" ]];         then cmd="yarn install --frozen-lockfile"
   else echo "    [dev] ⚠ $what: package.json but no lockfile and no node_modules — not installing"; return 0; fi
   echo "    [dev] $what: node_modules missing — $cmd"
-  timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$OUT/$ID.deps.log" 2>&1 && return 0
-  (( TIMEBOX_HIT )) && fail "$(timed_out_msg "$what deps install (\`$cmd\` in $d)" "$T_DEPS" deps) — see $OUT/$ID.deps.log"
-  fail "$what deps install failed ($cmd in $d) — see $OUT/$ID.deps.log; last lines:
-$(tail -n 5 "$OUT/$ID.deps.log" 2>/dev/null | sed 's/^/      /')"
+  timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$log" 2>&1 && return 0
+  if (( TIMEBOX_HIT )); then
+    DEPS_FAIL_MSG="$(timed_out_msg "$what deps install (\`$cmd\` in $d)" "$T_DEPS" deps) — see $log"
+  else
+    DEPS_FAIL_MSG="$what deps install failed ($cmd in $d) — see $log; last lines:
+$(tail -n 5 "$log" 2>/dev/null | sed 's/^/      /')"
+  fi
+  return 1
 }
 
 # ── Test gate (GSAI-27) ──────────────────────────────────────────────────────
@@ -313,7 +326,7 @@ if [[ "${DRY_RUN:-}" != "1" ]]; then
 fi
 
 link_deps "$WT"
-[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree"
+[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
 
 # ── 2. coding agent (implements + tests + commits INSIDE the worktree) ─────────
 read -r -d '' PROMPT <<EOF || true
@@ -340,7 +353,8 @@ else
     (( TIMEBOX_HIT )) && fail "$(timed_out_msg "coding agent" "$T_MODEL" model); worktree kept for resume"
     fail "coding agent failed (worktree kept for resume)"
   fi
-  install_deps "$WT" "task worktree"   # no-op if the agent (or link_deps) already provided node_modules
+  # no-op if the agent (or link_deps) already provided node_modules
+  install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
   resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
   if [[ -n "$TEST_CMD" ]] && ! run_tests "$WT" "task worktree"; then
     (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
@@ -379,8 +393,6 @@ else
     || git worktree add -B "$INTEG" "$MW" "$base" >/dev/null 2>&1 \
     || fail "could not create merge worktree $MW on $INTEG"
 fi
-link_deps "$MW"   # so the green-gate's `npm test` has node_modules — else every merge reverts
-[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$MW" "green-gate"
 PREMERGE="$(git -C "$MW" rev-parse HEAD)"
 if git -C "$MW" merge --no-ff "$BRANCH" -m "merge $BRANCH into $INTEG — #$ID $TITLE" >/dev/null 2>&1; then
   echo "    [dev] merged $BRANCH → $INTEG"
@@ -394,13 +406,31 @@ else
     fail "merge conflict on $BRANCH → $INTEG — worktree kept, sent back"
   fi
 fi
+# Deps for the green-gate are provisioned on the POST-merge tree (GSAI-124) — the
+# exact tree the gate is about to test. They used to be provisioned BEFORE the merge,
+# while $MW still sat on the untouched integration branch, which silently skipped the
+# one case that needs them most: the task that adds a repo's FIRST package.json. The
+# pre-merge tree had no package.json to install from, so install_deps returned early;
+# the merge then brought package.json in and the gate ran `npm test` bare → "command
+# not found" → the merge was reverted and the issue blocked with the flatly wrong
+# reason "merge broke develop". Same for link_deps: a branch that adds a new workspace
+# package only gets that package's deps linked once its dir is actually on the tree.
+link_deps "$MW"   # so the green-gate's `npm test` has node_modules — else every merge reverts
+
 # green-gate: the integration branch must STILL pass after the merge, else revert it.
 # The same hole is closed here (GSAI-27): a merge with nothing to run is NOT green,
 # it is unverified — revert it and send the task back, exactly as a red one.
+#
+# The merge has already happened at this point, so every rung below reports through
+# $gate_why and lets the single revert-and-fail at the bottom undo it — including the
+# deps install, whose failure must be named AS the install and never mistaken for a
+# broken integration branch.
 GATE_WAIVED=0
 if [[ "${DRY_RUN:-}" != "1" ]]; then
   gate=1; gate_why=""
-  if ! resolve_test_cmd "$MW" "green-gate"; then
+  if ! install_deps "$MW" "green-gate"; then
+    gate=0; gate_why="$DEPS_FAIL_MSG"
+  elif ! resolve_test_cmd "$MW" "green-gate"; then
     gate=0; gate_why="$NO_TEST_MSG"
   elif [[ -z "$TEST_CMD" ]]; then
     GATE_WAIVED=1
