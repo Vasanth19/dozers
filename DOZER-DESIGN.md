@@ -117,8 +117,8 @@ pure form doesn't already say.
 ## How it gets tested
 
 `tests/promote-test.sh` gains local-only cases next to the existing no-origin refusal
-(test 11). The fixture helper is reused; the local-only variant builds local develop
-work in the clone first, then `git remote remove origin`:
+(test 11). The new cases use the pure `fixture_localonly()` described above — built
+directly, never a clone with the remote removed:
 
 - **11b — no origin + `--no-push --check`**: exit 0, "promotable", origin untouched
   (n/a), and — the "Done when" #1 shape — the run reports the commit gap rather than
