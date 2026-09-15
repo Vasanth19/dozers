@@ -7,7 +7,8 @@
 #
 # Routing lives in org/config.yaml under `models:` (role -> provider + model); an env
 # override always wins:  DOZER_MODEL_<ROLE>="<provider>[:<model>]".
-# Crews use it as:   eval "$(dozers/model.sh env dev)"   -> sets MODEL_CMD + provider env.
+# A role is a lane (`dev`) or a dotted pass role (`dev.build`); the resolver falls back
+# nested role -> flat lane -> default. Crews: eval "$(dozers/model.sh env dev.build)".
 #
 # FAIL FAST: a role routed to a provider with no usable credentials/model exits non-zero.
 # There is no silent fallback to claude. Secrets are emitted only inside `env` output
