@@ -45,6 +45,23 @@ on_develop() {   # on_develop <fixture-dir> <text>
   git -C "$d/src" add -A && git -C "$d/src" commit -qm "$t"
   git -C "$d/src" push -q origin develop
 }
+# fixture_localonly: a repo WITH local main + develop work and NO origin at all —
+# mirrors ~/ecosystem (GSAI-142) and ~/initiatives/brands/mr-growth-guide (BRD-4),
+# where no remote ever existed. Built directly (no bare origin, no clone, no
+# `remote remove`) so the "no origin" precondition is the purest possible form and
+# the fixture costs a fraction of a clone on a slow disk.
+fixture_localonly() {
+  local d="$TMP/$1"; rm -rf "$d"; mkdir -p "$d"
+  git init -q "$d/clone"
+  git -C "$d/clone" symbolic-ref HEAD refs/heads/main
+  echo base > "$d/clone/app.txt"
+  git -C "$d/clone" add -A && git -C "$d/clone" commit -qm "base"
+  git -C "$d/clone" checkout -q -b develop
+  echo "local work" >> "$d/clone/app.txt"
+  git -C "$d/clone" add -A && git -C "$d/clone" commit -qm "local develop work"
+  git -C "$d/clone" checkout -q main
+  echo "$d"
+}
 omain()   { git -C "$1/origin.git" rev-parse main; }               # published main tip
 parents() { echo $(( $(git -C "$1/origin.git" rev-list --parents -n1 "${2:-main}" | wc -w) - 1 )); }
 gap()     { git -C "$1/origin.git" rev-list --count main..develop; }   # must be 0 after a promote
@@ -217,7 +234,42 @@ out="$(run "$d")"; rc=$?
 d="$(fixture noremote)"
 git -C "$d/clone" remote remove origin
 out="$(run "$d")"; rc=$?
-(( rc == 1 )) && grep -q "no 'origin' remote" <<<"$out" && ok "no origin remote: refused" || bad "no origin: exit $rc — $out"
+(( rc == 1 )) && grep -q "no 'origin' remote" <<<"$out" && grep -q -- "--no-push" <<<"$out" \
+  && ok "no origin remote: refused, points at --no-push" || bad "no origin: exit $rc — $out"
+
+# ── 11b. no origin + --no-push --check: report the gap, refuse nothing ──────
+d="$(fixture_localonly localonly_check)"
+before="$(git -C "$d/clone" rev-parse main)"
+out="$(run "$d" --no-push --check)"; rc=$?
+(( rc == 0 )) && grep -q "commit(s) to promote" <<<"$out" && grep -q "promotable" <<<"$out" \
+  && [[ "$(git -C "$d/clone" rev-parse main)" == "$before" ]] \
+  && ok "local-only --check: reports the gap, changes nothing" || bad "local-only --check: exit $rc — $out"
+
+# ── 11c. no origin + --no-push: the promote GSAI-142 and BRD-4 are blocked on ─
+d="$(fixture_localonly localonly)"
+out="$(run "$d" --no-push --summary "GSAI-142")"; rc=$?
+(( rc == 0 )) && ok "local-only: promote exits 0" || bad "local-only: exit $rc — $out"
+[[ $(( $(git -C "$d/clone" rev-list --parents -n1 main | wc -w) - 1 )) == 2 ]] \
+  && ok "local-only: 2-parent merge on local main" || bad "local-only: local main is not a 2-parent merge"
+[[ "$(git -C "$d/clone" rev-list --count main..develop)" == "0" ]] \
+  && ok "local-only: local main..develop empty" || bad "local-only: gap $(git -C "$d/clone" rev-list --count main..develop)"
+grep -q "never published" <<<"$out" && ok "local-only: says nothing is published" || bad "local-only: no not-published line — $out"
+
+# ── 11d. no origin + --no-push + dirty main: the dirty guard is intact ──────
+d="$(fixture_localonly localonly_dirty)"
+before="$(git -C "$d/clone" rev-parse main)"
+echo "uncommitted" >> "$d/clone/app.txt"
+out="$(run "$d" --no-push)"; rc=$?
+(( rc == 1 )) && grep -qi "dirty" <<<"$out" && [[ "$(git -C "$d/clone" rev-parse main)" == "$before" ]] \
+  && ok "local-only dirty main: refused, main untouched" || bad "local-only dirty main: exit $rc — $out"
+
+# ── 11e. a second local-only run is a clean no-op (idempotency, no origin) ──
+d="$(fixture_localonly localonly_twice)"
+"$PROMOTE" "$d/clone" --no-push >/dev/null 2>&1
+before="$(git -C "$d/clone" rev-parse main)"
+out="$(run "$d" --no-push)"; rc=$?
+(( rc == 0 )) && grep -q "nothing to promote" <<<"$out" && [[ "$(git -C "$d/clone" rev-parse main)" == "$before" ]] \
+  && ok "local-only: second run is a clean no-op" || bad "local-only second run: exit $rc — $out"
 
 out="$("$PROMOTE" "$TMP/nope-not-a-repo-or-id" 2>&1)"; rc=$?
 (( rc == 1 )) && ok "unknown repo id: refused (never guesses a repo)" || bad "unknown repo id: exit $rc — $out"
