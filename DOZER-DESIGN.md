@@ -102,11 +102,17 @@ touches a remote ref:
 | Origin present, any flags | Byte-identical to today (mode never engages) |
 | Origin present but missing `origin/main` or `origin/develop`, `--no-push` | Unchanged: still fatal after fetch — fixing that is not in this spec |
 
-One real-world nuance the fixture must honor: `git remote remove origin` also drops
-remote-tracking refs, and a plain clone of a bare origin only has a local `main` — so
-the local-only test must create its local `develop` (commit on it) before removing
-the remote, mirroring `~/ecosystem` where the crew's merge left a real local
-`develop` behind.
+One real-world nuance the fixture must honor: a plain clone of a bare origin only
+has a local `main` — so whatever fixture shape is used, it must end up with a local
+`develop` carrying real commits, mirroring `~/ecosystem` where the crew's merge left
+a real local `develop` behind. The cleanest shape is a `fixture_localonly()` that
+builds the repo **directly** — `git init`, commit base on `main`, branch `develop`,
+commit local work, back to `main` — with **no bare origin, no clone, and no remote
+ever existing**. That is the purest form of the "no origin" precondition (it matches
+`~/ecosystem` and `mr-growth-guide`, where no remote ever existed rather than one
+having been removed) and skips the cost of a clone on a slow disk. Do NOT build it
+as a clone + `git remote remove origin` — that re-adds clone cost to say nothing the
+pure form doesn't already say.
 
 ## How it gets tested
 
