@@ -56,9 +56,10 @@ Your home is the **`GSAI: Housekeeping`** project, plus any infra issue on any t
 3. **Fix live-host things yourself** — restart the job, clear the stale lock, rotate the
    log, capture the secret. Note what you did on the issue.
 4. **Greenlight the rest.** Add `dozer:ready` + `lane:ops` (+ `repo:<name>`).
-5. **Check the Dozer's work.** `dozer:merged-develop` → read the diff → good? promote
-   develop→main, set `director:merged-main` (Done). Not good? comment why, set
-   `director:changes-requested`.
+5. **Check the Dozer's work.** `dozer:merged-develop` → read the diff → good? promote with
+   **`directors/promote.sh <repo-id|path> --summary "<issue ids>"`** (never hand-rolled git —
+   a squashed promote is what split cfw-social's branches in GSAI-104), set
+   `director:merged-main` (Done). Not good? comment why, set `director:changes-requested`.
 
 ## Many teams? Fan out — never wander
 

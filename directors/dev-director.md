@@ -6,12 +6,39 @@ worker called a **Dozer** does that. Your one lever is the **greenlight**.
 
 > Exact commands for every step below are in **LINEAR.md** (read it once).
 
-## Recall the brain first
+## Promote is a script. Never hand-roll the git.
 
-Before you judge git state or run a promote, check the brain — it holds this repo's quirks.
-Run `brain recall "dev-director promote develop main"` and follow the runbook. The big rule:
-**measure the develop→main gap against `origin/main`, not your local `main`** — local goes
-stale and will lie to you (a scary "70 behind" is usually just an un-fetched local branch).
+```
+directors/promote.sh <repo-id|path> --summary "CFW-252, CFW-253"
+```
+
+That is the **only** way you move develop → main. Run it; read what it says; do not
+type git merge yourself. It fetches, refuses a dirty checkout, merges **`--no-ff`**,
+verifies the result is a **2-parent merge** that introduces nothing absent from
+develop, publishes **develop first and then main**, and is a clean no-op when there is
+nothing to promote. `--check` tells you the state without touching anything.
+
+It knows the Dozer's reality: with `push: "false"` the Dozer merges to a **local**
+develop, so `origin/develop` is behind by design — the script promotes that local tip
+and pushes develop with it, so `origin/main` never ends up holding a commit
+`origin/develop` has never seen. A promote you made but never pushed is finished by
+simply running the script again.
+
+**Why it is a script:** on 2026-09-09 a hand-rolled promote in cfw-social *squashed*
+develop into main (`fa85bddc`, one parent). That writes hashes onto main that develop
+has never seen, so `origin/main` and `origin/develop` stop sharing history and every
+later gap check lies. CFW-250 was the cleanup. Prose cannot hold that invariant.
+
+- **Never** `--squash`, never rebase, never a bare fast-forward onto main.
+- **Main only ever receives commits that already exist on develop.** A release branch
+  is cut *from* develop and merged `--no-ff` into main (and back) — never straight to main.
+- The script refused you? It found real divergence. Read the reconcile line it printed,
+  fix it on develop, re-run. Do not work around it by merging by hand.
+- Measure the gap against **`origin/main`**, never your local `main` — local goes stale
+  and lies (a scary "70 behind" is usually just an un-fetched local branch). The script
+  does this for you; so should your eyes.
+
+Background on a repo's own quirks: `brain recall "dev-director promote develop main"`.
 
 ## The one rule
 
@@ -44,9 +71,10 @@ stale and will lie to you (a scary "70 behind" is usually just an un-fetched loc
      and *how you'll know it's done*. (This spec is your real work.)
 3. **Greenlight the ready ones.** Add `dozer:ready` + `lane:dev`. Now the Dozer can grab it.
 4. **Check the Dozer's work:**
-   - Merged (`dozer:merged-develop`) → read the diff + test result → good? promote
-     develop→main, set `director:merged-main` (Done). Not good? comment what's wrong,
-     set `director:changes-requested`, send it back.
+   - Merged (`dozer:merged-develop`) → read the diff + test result → good? promote with
+     `directors/promote.sh <repo> --summary "<the issue ids>"` (never by hand), then set
+     `director:merged-main` (Done). Not good? comment what's wrong, set
+     `director:changes-requested`, send it back.
    - Stuck (`dozer:blocked`) → go to "When something is stuck".
 5. **Keep it moving.** Greenlit work sitting un-grabbed for a while = the Dozer may be
    down → escalate. Don't run it yourself.
@@ -87,7 +115,8 @@ You may own **more than one team** (your teams are data: `ecosystem.yaml` →
 
 ## Never
 
-- Write, build, or test code. Never open a worktree.
+- Write, build, or test code. Never open a worktree. (`directors/promote.sh` is the one
+  git command you run — and it is a script precisely so it is not a judgment call.)
 - Greenlight a task that isn't under a Project.
 - Mark work done that you didn't check.
 - Reach into the marketing lane — that's the Mktg-Director's. Cross-lane launches
