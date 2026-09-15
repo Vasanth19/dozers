@@ -3,7 +3,9 @@
 #
 # Proves the knob that decides WHICH BRAIN a role runs on behaves, and above all that
 # it FAILS FAST instead of quietly falling back to claude:
-#   DEFAULT   — shipped config routes the dev role to claude -p with an EXPLICIT model
+#   DEFAULT   — shipped config routes dev + default to ollama-cloud/kimi-k3 (pinned
+#               via ANTHROPIC_MODEL through the claude CLI; flipped off Claude
+#               2026-09-15, see org/config.yaml — this case tracks whatever ships)
 #   UNPINNED  — a claude route with model:"" in config -> exit 2 (GSAI-83); env stays loose
 #   OVERRIDE  — DOZER_MODEL_<ROLE>=ollama-cloud:<model> emits the proven ANTHROPIC_* env
 #   VAULT     — the key is read from the configured env file, never printed by `show`
@@ -65,13 +67,20 @@ route() {
 
 echo "== model routing =="
 
-# ── DEFAULT: shipped config = claude for every role ────────────────────────────
+# ── DEFAULT: shipped config (2026-09-15): dev + default → ollama-cloud/kimi-k3,
+# marketing → ollama-cloud/glm-5.2 — all pinned via ANTHROPIC_MODEL, run through the
+# claude CLI against ollama.com. This case tracks WHATEVER ships in org/config.yaml;
+# when the shipped route changes, change these expectations with it ───────────────
 out="$(route env dev)"
-if has "$out" "export MODEL_CMD='claude -p --model claude-opus-5'" && has "$out" "export DOZER_MODEL_PROVIDER=claude"; then
-  ok "DEFAULT dev -> claude -p with the model PINNED"; else no "DEFAULT dev should route to a pinned claude model; got: $out"; fi
+if has "$out" "export DOZER_MODEL_PROVIDER=ollama-cloud" \
+   && has "$out" "export ANTHROPIC_MODEL=kimi-k3" \
+   && has "$out" "export MODEL_CMD='claude -p'"; then
+  ok "DEFAULT dev -> ollama-cloud/kimi-k3 (pinned) via claude -p"
+else no "DEFAULT dev should route to ollama-cloud/kimi-k3; got: $out"; fi
 out="$(route env marketing)"
-has "$out" "export MODEL_CMD='claude -p'" && ok "DEFAULT marketing -> claude -p" \
-  || no "DEFAULT marketing should route to claude -p; got: $out"
+has "$out" "export ANTHROPIC_MODEL=glm-5.2" && has "$out" "export MODEL_CMD='claude -p'" \
+  && ok "DEFAULT marketing -> ollama-cloud/glm-5.2 via claude -p" \
+  || no "DEFAULT marketing should route to ollama-cloud/glm-5.2; got: $out"
 # an unlisted role falls back to models.default
 out="$(route env sales)"
 has "$out" "config:models.default" && ok "DEFAULT unlisted role falls back to models.default" \

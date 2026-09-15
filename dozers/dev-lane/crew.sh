@@ -6,6 +6,11 @@
 #   • Seance (resume): if a prior attempt left COMMITTED work in this task's worktree
 #     (e.g. a crash), REUSE the worktree and tell the agent to continue — not restart.
 #     The reaper leaves worktrees intact on failure precisely so this can happen.
+#   • Stale base (GSAI-70): a resume first checks the integration branch is still an
+#     ancestor of the task branch — if it advanced since the worktree was built, the
+#     branch is rebased onto the new base BEFORE resuming (a conflicting rebase aborts
+#     and FAILS, naming the conflicting files). Otherwise every resume quietly builds
+#     on the old base and the lane merge-conflicts forever (LL-19, LL-26, CFW-202).
 #   • Refinery (merge queue): merges to the integration branch are serialized by a
 #     per-project lock, and each merge is GREEN-GATED — verified on the integration
 #     branch after merging; a merge that breaks it is reverted and the task sent back.
@@ -287,7 +292,35 @@ RESUMING=0; attempt=1
 if [[ -d "$WT" ]] && git -C "$WT" rev-parse --verify -q "refs/heads/$BRANCH" >/dev/null 2>&1 \
    && [[ -n "$(git -C "$WT" log --oneline "$base..$BRANCH" 2>/dev/null)" ]]; then
   RESUMING=1; attempt=$(( $(cat "$STATE" 2>/dev/null || echo 1) + 1 )); echo "$attempt" > "$STATE"
-  echo "    [dev] RESUMING #$ID (attempt $attempt) — reusing worktree; prior commits:"
+  echo "    [dev] RESUMING #$ID (attempt $attempt) — reusing worktree"
+  # GSAI-70: the integration branch may have ADVANCED after this worktree was built
+  # (`git log "$base..$BRANCH"` alone can't tell — it is non-empty either way, which is
+  # why a stale worktree used to resume as-is and then merge-conflict forever). If
+  # $base is no longer an ancestor of $BRANCH, rebase the task branch onto the new
+  # base BEFORE anything else runs. A rebase that conflicts is ABORTED and reported
+  # as "stale base" with the conflicting files named — the Director sees why, and the
+  # prior commits are never silently discarded. The path taken is logged either way.
+  if git merge-base --is-ancestor "$base" "$BRANCH" 2>/dev/null; then
+    echo "    [dev] resume check: base $base has not moved — resuming as-is"
+  else
+    _old_base="$(git merge-base "$base" "$BRANCH" 2>/dev/null || true)"
+    _new_base="$(git rev-parse --verify --short "$base" 2>/dev/null || echo "$base")"
+    if _rb_out="$(git -C "$WT" rebase "$base" 2>&1)"; then
+      echo "    [dev] base moved — rebased ${_old_base:0:7}..${_new_base}"
+    else
+      _rb_conflicts="$(git -C "$WT" status --porcelain --untracked-files=no 2>/dev/null \
+        | awk '$1 ~ /^(UU|AA|AU|UA|DU|UD|DD)$/ {print $2}' | sort -u | sed 's/^/      /')"
+      git -C "$WT" rebase --abort >/dev/null 2>&1 || true
+      if [[ -n "$_rb_conflicts" ]]; then
+        fail "stale base: $INTEG advanced (${_old_base:0:7} → ${_new_base}) after this worktree was built, and rebasing $BRANCH onto it CONFLICTS — worktree kept, sent back (rebase aborted; nothing discarded). Conflicting files:
+$_rb_conflicts"
+      else
+        fail "stale base: $INTEG advanced (${_old_base:0:7} → ${_new_base}) after this worktree was built, and rebasing $BRANCH onto it failed — worktree kept, sent back (rebase aborted; nothing discarded). git said:
+$(printf '%s\n' "$_rb_out" | tail -n 5 | sed 's/^/      /')"
+      fi
+    fi
+  fi
+  echo "    [dev]   prior commits on $BRANCH off $base:"
   git -C "$WT" log --oneline "$base..$BRANCH" 2>/dev/null | sed 's/^/          /'
 else
   git worktree prune >/dev/null 2>&1 || true
