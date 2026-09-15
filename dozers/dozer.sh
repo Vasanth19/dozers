@@ -271,7 +271,10 @@ run_one() { # <id> <lane> <title> [priority]
   # crew's note for the reviewer (GSAI-33: it belongs in the task comment, never in the
   # staged deliverable).
   local summary_file="$art/$id.summary" fail_file="$art/$id.fail" handoff_file="$art/$id.handoff"
-  rm -f "$summary_file" "$fail_file" "$handoff_file" 2>/dev/null || true
+  # The merge receipt (GSAI-119) rides with the other artifacts: a STALE receipt from a
+  # previous run must never vouch for this one, so it is deleted up front like the rest.
+  local merge_file="$art/$id.merge"
+  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" 2>/dev/null || true
 
   # The brief (GSAI-7): the task's description, handed to the crew as a FILE so a lane
   # can route on what the Director wrote — the marketing lane treats a `production:`
@@ -286,10 +289,38 @@ run_one() { # <id> <lane> <title> [priority]
   fi
 
   if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" DOZER_BRIEF="$brief_file" "$crew" "$id" "$title"; then
-    local verb
-    if [[ "$lane" == "marketing" ]]; then task_review "$id"; verb="staged for review"; else task_merged "$id"; verb="merged to develop"; fi
+    local verb VERIFY_PROOF=""
+    if [[ "$lane" == "marketing" ]]; then
+      task_review "$id"; verb="staged for review"
+    elif [[ "$lane" == "dev" ]]; then
+      # GSAI-119: label on PROOF, not the exit code. Crew success and merge success are
+      # two different facts — an exit-0 with no merge behind it used to earn
+      # dozer:merged-develop and a fake PROMOTE row on the Ship gate with nothing to
+      # promote (CFW-215/CFW-252, git-verified 2026-09-14; CFW-141 twice on 2026-09-08).
+      # Only the receipt the crew wrote after its green-gate — a merge SHA that IS an
+      # ancestor of the integration branch in the task's own repo — earns the label.
+      # Unverifiable -> block with the git evidence, NEVER label merged.
+      local vout vrc=0
+      # REPO_ROOT is passed EXPLICITLY: a leaked env REPO_ROOT would point the proof
+      # step at the wrong artifacts dir — the exact silent-fallback class this fix kills.
+      vout="$(REPO_ROOT="$ROOT" "$ROOT/dozers/verify-merge.sh" "$id" "$workdir" 2>&1)" || vrc=$?
+      if (( vrc != 0 )); then
+        task_block "$id"
+        task_comment "$id" "$(printf 'Dozer blocked AFTER the crew reported success — the claimed merge could NOT be verified against %s, so the issue is NOT labeled dozer:merged-develop (GSAI-119).\n\nReason: %s' "$workdir" "$vout")"
+        echo "  x #$id crew succeeded but the merge did not verify — blocked: ${vout%%$'\n'*}" >&2
+        return 0
+      fi
+      echo "    verify-merge: $vout"
+      task_merged "$id"; verb="merged to develop"
+      # The proof rides the merged comment — "merged to develop" without it is the
+      # exact claim that could not be trusted before.
+      VERIFY_PROOF="$vout"
+    else
+      task_merged "$id"; verb="merged to develop"
+    fi
     local body
     if [[ -s "$summary_file" ]]; then body="$(head -n 10 "$summary_file")"; else body="- completed via lane:$lane"; fi
+    if [[ -n "${VERIFY_PROOF:-}" ]]; then body="$(printf 'Merge verified (GSAI-119): %s\n\n%s' "$VERIFY_PROOF" "$body")"; fi
     # the handoff note rides the same comment (capped so a runaway note can't flood it)
     if [[ -s "$handoff_file" ]]; then body="$(printf '%s\n\nHandoff note from the crew:\n%s' "$body" "$(head -c 4000 "$handoff_file")")"; fi
     task_comment "$id" "$(printf 'Dozer %s - lane:%s\n%s' "$verb" "$lane" "$body")"
