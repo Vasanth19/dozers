@@ -49,7 +49,15 @@ brand:
 #   1) the task's repo:<id> hint  -> ecosystem.yaml project.id == id   (multi-repo orgs)
 #   2) the task's Linear team key -> the org whose linear_team == KEY, its default repo
 #      → a LearnLoop (LL) task lands in the learnloop repo automatically, no label
-#   3) workdir_default            (last-resort fallback only if the registry misses)
+#   3) workdir_default            (last resort, and ONLY when the task named no repo)
+#
+# Routing FAILS LOUD (GSAI-131). A task that carries an identity — a repo: label or a
+# team — is routed by the registry or it is not routed at all: an unresolvable
+# repo:<id> BLOCKS with the resolver's real error, is never demoted into the team's
+# default repo, and never lands in ~/Code/dozers. Step 3 below therefore applies to
+# exactly one kind of task: one that names NEITHER a repo nor a team. For those, "."
+# means "the repo the Dozer ships in" — the zero-config/files-backend mode where the
+# Dozer works on itself. Set an absolute path here for a different catch-all.
 #
 # The old hardcoded `workdirs:` map was REMOVED 2026-08-31 — ecosystem.yaml is the
 # single source of truth. Register new repos there (id, org, local), not here.

@@ -105,21 +105,116 @@ beat_stop() {
   BEAT_PID=""
 }
 
+# Names by which THIS checkout may legitimately be labelled: its directory name and
+# its origin-URL basename. Derived, never hardcoded — the engine repo can be renamed or
+# forked and this still answers correctly. Only used to let a `repo:dozers` task work on
+# the engine on purpose, while any other id that resolves here is refused.
+is_engine_alias() {
+  local want; want="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  local origin; origin="$(git -C "$ROOT" config --get remote.origin.url 2>/dev/null || true)"
+  local a
+  for a in "$(basename "$ROOT")" "$(basename "${origin%.git}")"; do
+    a="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')"
+    [[ -n "$a" && "$a" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+# True when two paths are the same directory on disk (symlinks and ".." resolved), so
+# a symlinked or aliased path cannot slip past the engine-repo guard below.
+same_dir() {
+  local a b
+  a="$(cd "$1" 2>/dev/null && pwd -P || true)"
+  b="$(cd "$2" 2>/dev/null && pwd -P || true)"
+  [[ -n "$a" && "$a" == "$b" ]]
+}
+
 # Resolve a task's working dir from the CANONICAL registry (~/ecosystem/ecosystem.yaml),
 # most-specific first:
 #   1) repo:<id> hint on the task   2) the task's Linear TEAM/org   3) config workdir_default
 # repo:<id> matches BOTH registry lists — projects: and infrastructure: (GSAI-17) — so
 # infra repos (paperclip, openclaw, gbrain-source) route like any product repo.
 # Paths live ONLY in ecosystem.yaml — never hardcoded here or in a label.
+#
+# ── Fail fast; never guess a repo (GSAI-131) ──────────────────────────────────
+# This used to swallow the resolver's stderr (`2>/dev/null || true`) and then fall
+# through THREE silent fallbacks onto $ROOT — the repo that holds the engine itself.
+# Caught live on BRD-85 (2026-09-15): two runs, identical labels (`repo:mr-growth-guide`),
+# two different working dirs — the second landed in ~/Code/dozers, where a crew spent
+# ~2 min writing a brand repo's test suite into the engine and cut dozer/BRD-85 off the
+# ENGINE's develop. Resolving by hand worked, so the miss was transient: ecosystem.yaml
+# is read on every resolve and is edited live by other crews and Directors, so a
+# momentary parse failure is expected and will recur. The defect is the fallback, not
+# the flake. Three rules now hold:
+#   1. An explicit repo:<id> is resolved ALONE. The resolver's own repo->team fallback
+#      is the same class of bug — a task that names its repo must never be quietly
+#      demoted into the team's default repo.
+#   2. The resolver's stderr is captured and reported, never discarded, so the block
+#      comment says WHY routing failed instead of leaving a cwd= line nobody reads.
+#   3. A task that carries an identity — a repo: label OR a team — is never routed by
+#      a fallback at all: it resolves through the registry or it blocks. So the engine's
+#      own checkout is unreachable by a foreign task. The configured workdir_default
+#      (and its "." = here) survives for exactly one case: a task that names neither a
+#      repo nor a team, i.e. the zero-config files-backend mode where the Dozer works
+#      on the repo it ships in. Nothing about such a task points anywhere else, so that
+#      is a configured answer, not a guess.
+# Prints the path on stdout and returns 0. On failure prints the reason on stderr and
+# returns 1; run_one blocks the task before any crew — and so any worktree — exists.
 resolve_workdir() {
-  local hint="$1" team="$2" cfgf="$ROOT/org/config.yaml" path=""
-  # Canonical source: ecosystem.yaml (repo id -> local, or Linear team -> org default repo)
-  path="$(python3 "$ROOT/tasks/ecosystem_workdir.py" ${hint:+--repo "$hint"} ${team:+--team "$team"} 2>/dev/null || true)"
-  # Fallback: config workdir_default, then the dozers repo root.
-  [[ -z "$path" ]] && path="${WORKDIR_DEFAULT:-$(grep -E '^workdir_default:' "$cfgf" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true)}"
-  [[ -z "$path" || "$path" == "." ]] && path="$ROOT"
+  local hint="$1" team="$2" cfgf="$ROOT/org/config.yaml"
+  local path="" src="" err="" rc=0 errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/dozer-workdir.XXXXXX" 2>/dev/null)" || errf="/tmp/dozer-workdir.$$"
+
+  if [[ -n "$hint" ]]; then
+    # Canonical source: ecosystem.yaml (repo id -> local). NO --team here, on purpose:
+    # the resolver falls back repo->team internally, and a named repo silently becoming
+    # the team's default repo is the same defect wearing a smaller hat.
+    src="repo:$hint"
+    path="$(python3 "$ROOT/tasks/ecosystem_workdir.py" --repo "$hint" 2>"$errf")" || rc=$?
+    err="$(head -c 1000 "$errf" 2>/dev/null || true)"; rm -f "$errf" 2>/dev/null || true
+    if (( rc != 0 )) || [[ -z "$path" ]]; then
+      printf 'repo:%s does not resolve to a checkout in ~/ecosystem/ecosystem.yaml (resolver rc=%s).%s Refusing to substitute a different repo — register the id there (or fix the registry), then re-greenlight.\n' \
+        "$hint" "$rc" "${err:+ Resolver said: ${err//$'\n'/ }}" >&2
+      return 1
+    fi
+  elif [[ -n "$team" ]]; then
+    # No repo: label, but the task belongs to a team — so the registry DOES claim an
+    # org repo for it. Failing to find it is drift, not an invitation to improvise.
+    src="team:$team"
+    path="$(python3 "$ROOT/tasks/ecosystem_workdir.py" --team "$team" 2>"$errf")" || rc=$?
+    err="$(head -c 1000 "$errf" 2>/dev/null || true)"; rm -f "$errf" 2>/dev/null || true
+    if (( rc != 0 )) || [[ -z "$path" ]]; then
+      printf 'team %s has no live default repo in ~/ecosystem/ecosystem.yaml (resolver rc=%s).%s Label the task repo:<id> or give the org a live project entry, then re-greenlight.\n' \
+        "$team" "$rc" "${err:+ Resolver said: ${err//$'\n'/ }}" >&2
+      return 1
+    fi
+  else
+    # The task names NOTHING that points at another repo — no repo: label, no team.
+    # Only here is the configured default in play, and only here can "." (the engine's
+    # own checkout) be the answer: that is the zero-config/files-backend mode, where
+    # the Dozer works on the repo it ships in. A task carrying an identity can never
+    # reach this branch, so the engine repo stays unreachable by a foreign task.
+    rm -f "$errf" 2>/dev/null || true
+    src="workdir_default"
+    path="${WORKDIR_DEFAULT:-$(grep -E '^workdir_default:' "$cfgf" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true)}"
+    [[ -z "$path" || "$path" == "." ]] && path="$ROOT"
+  fi
   path="${path/#\~/$HOME}"
-  [[ -d "$path" ]] || path="$ROOT"
+
+  # Every branch above either returned or produced a non-empty path, so from here the
+  # only question left is whether that path is really a checkout on this box.
+  if [[ ! -d "$path" ]]; then
+    printf '%s resolved to "%s", which is not a directory on this box — the registry entry points at a checkout that is not here.\n' "$src" "$path" >&2
+    return 1
+  fi
+  # Backstop for rule 4: a task that named ANOTHER repo may never land in the engine's
+  # own checkout, even if the registry says so — a mistyped `local:` on someone else's
+  # entry would otherwise reproduce BRD-85 through the "correct" path.
+  if [[ -n "$hint" ]] && same_dir "$path" "$ROOT" && ! is_engine_alias "$hint"; then
+    printf 'repo:%s resolves to the Dozer engine repo itself (%s), which is not what that label names — the registry entry is almost certainly mistyped. Refusing to build a foreign repo inside the engine (GSAI-131).\n' \
+      "$hint" "$ROOT" >&2
+    return 1
+  fi
   printf '%s' "$path"
 }
 
@@ -150,10 +245,22 @@ run_one() { # <id> <lane> <title>
   task_comment "$id" "Dozer claimed - lane:$lane. Starting now; will post a summary on finish."
   echo "  -> #$id [$lane] $title"
 
-  local hint team workdir
+  # Routing is a PREFLIGHT (GSAI-131): a task that cannot be routed to a repo is
+  # blocked here, with the resolver's real error, before a crew — and therefore before
+  # a worktree, a branch or a commit — exists anywhere. The engine never guesses.
+  local hint team workdir wd_err wd_errf
   hint="$(task_repo "$id" 2>/dev/null || true)"
   team="$(task_team "$id" 2>/dev/null || true)"
-  workdir="$(resolve_workdir "$hint" "$team")"
+  wd_errf="$(mktemp "${TMPDIR:-/tmp}/dozer-route.XXXXXX" 2>/dev/null)" || wd_errf="/tmp/dozer-route.$BASHPID"
+  if ! workdir="$(resolve_workdir "$hint" "$team" 2>"$wd_errf")"; then
+    wd_err="$(head -c 2000 "$wd_errf" 2>/dev/null || true)"; rm -f "$wd_errf" 2>/dev/null || true
+    [[ -n "$wd_err" ]] || wd_err="workdir resolution failed without a reason"
+    task_block "$id"
+    task_comment "$id" "$(printf 'Dozer blocked BEFORE any work - could not resolve a working directory, so no crew ran, no worktree was created and no branch was cut.\n  repo hint: %s\n  team: %s\nReason: %s' "${hint:-<none>}" "${team:-<none>}" "$wd_err")"
+    echo "  x #$id unroutable: $wd_err" >&2
+    return 0
+  fi
+  rm -f "$wd_errf" 2>/dev/null || true
   echo "    cwd -> $workdir  ${team:+[team:$team]}${hint:+ (repo:$hint)}"
 
   # The crew leaves up to THREE artifacts: <id>.summary on success, <id>.fail (the
