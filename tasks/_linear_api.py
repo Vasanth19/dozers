@@ -140,7 +140,8 @@ def _fetch_team_issues(tid):
     while True:
         d = gql('query($t:ID!,$n:Int!,$c:String){ issues(first:$n, after:$c, '
                 'filter:{team:{id:{eq:$t}}}){ pageInfo{ hasNextPage endCursor } nodes{ '
-                'identifier title team{ key } state{ type } labels{ nodes{ name } } } } }',
+                'identifier title team{ key } state{ type } priority createdAt '
+                'labels{ nodes{ name } } } } }',
                 {"t": tid, "n": _PAGE, "c": cursor})
         page = d["issues"]
         out.extend(page["nodes"])
@@ -235,10 +236,31 @@ def _is_ready(i):
     return bool(_lane_of(labels))
 
 
+def _priority_of(i):
+    """Linear's raw priority: 1 urgent, 2 high, 3 normal, 4 low, 0 = no priority."""
+    p = i.get("priority") or 0
+    return p if isinstance(p, int) else 0
+
+
+def _priority_key(i):
+    """Sort key: urgent first, no-priority LAST (Linear's own ordering does the same),
+    tiebreak oldest createdAt first. GSAI-105: the greenlit queue used to come out in
+    whatever order Linear happened to return it, and drain() claims top-down — so the
+    Dozer's pick order was a lottery and a Director's only "build this first" lever was
+    hoarding greenlights. The list order IS the fleet's pick order; sort it here and
+    priority becomes that lever."""
+    p = _priority_of(i)
+    return (p if 1 <= p <= 4 else 5, i.get("createdAt") or "", i["identifier"])
+
+
 def list_ready():
-    for i in _all_issues():
-        if _is_ready(i):
-            print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}')
+    ready = sorted((i for i in _all_issues() if _is_ready(i)), key=_priority_key)
+    for i in ready:
+        # 4th column carries the priority so dozer.sh can log WHY a task was picked
+        # ("" when the issue has none). See the contract in tasks/adapter.sh.
+        p = _priority_of(i)
+        prio = str(p) if 1 <= p <= 4 else ""
+        print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}\t{prio}')
 
 
 def mark_ready(identifier, lane):

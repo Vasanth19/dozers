@@ -219,8 +219,8 @@ resolve_workdir() {
 }
 
 # Always invoked backgrounded (own subshell), so the EXIT trap + lock are scoped.
-run_one() { # <id> <lane> <title>
-  local id="$1" lane="$2" title="$3"
+run_one() { # <id> <lane> <title> [priority]
+  local id="$1" lane="$2" title="$3" prio="${4:-}"
   # atomic local mutex so parallel Dozers never double-grab the same task
   local lock="$LOCK_DIR/${id//\//_}.lock"
   if ! mkdir "$lock" 2>/dev/null; then echo "  ~ #$id locked locally, skipping"; return 0; fi
@@ -243,7 +243,9 @@ run_one() { # <id> <lane> <title>
 
   if ! task_claim "$id"; then echo "  ~ #$id already claimed, skipping" >&2; return 0; fi
   task_comment "$id" "Dozer claimed - lane:$lane. Starting now; will post a summary on finish."
-  echo "  -> #$id [$lane] $title"
+  # GSAI-105: log the priority the pick was ordered by, so a drain log reads as a plan,
+  # not a lottery. Empty when the backend/issue carries no priority.
+  echo "  -> #$id [$lane]${prio:+ p$prio} $title"
 
   # Routing is a PREFLIGHT (GSAI-131): a task that cannot be routed to a repo is
   # blocked here, with the resolver's real error, before a crew — and therefore before
@@ -331,14 +333,16 @@ reap_crews() {  # drop finished crews from CREWS (collect their status); keep th
 
 drain() {  # fill the free slots from the ready list; returns immediately, never waits on a crew
   reap_crews
-  local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 id lane title
-  while IFS=$'\t' read -r id lane title; do
+  # The ready list arrives in claim order (GSAI-105: backend priority, then oldest
+  # first — see tasks/adapter.sh); claiming top-down is what orders the fleet.
+  local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 id lane title prio
+  while IFS=$'\t' read -r id lane title prio; do
     [[ -z "$id" ]] && continue; seen=$((seen+1))
     # Already in flight on this host (its crew holds a slot): the backend just hasn't
     # caught up. Don't burn a slot on a crew that would only say "locked, skipping".
     [[ -d "$LOCK_DIR/${id//\//_}.lock" ]] && continue
     if (( launched >= free )); then queued=$((queued+1)); continue; fi
-    run_one "$id" "$lane" "$title" &
+    run_one "$id" "$lane" "$title" "$prio" &
     CREWS+=("$!"); launched=$((launched+1))
   done < <(task_list_ready)
   if (( seen == 0 )); then echo "  (nothing ready)"

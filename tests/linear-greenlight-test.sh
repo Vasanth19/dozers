@@ -24,7 +24,8 @@ lin = importlib.util.module_from_spec(spec); spec.loader.exec_module(lin)
 
 def iss(ident, state, *labels):
     return {"identifier": ident, "title": "t", "team": {"key": "T"},
-            "state": {"type": state}, "labels": {"nodes": [{"name": l} for l in labels]}}
+            "state": {"type": state}, "priority": 0, "createdAt": "2026-09-01T00:00:00Z",
+            "labels": {"nodes": [{"name": l} for l in labels]}}
 
 # --- 1 + 2: what the poll sees -------------------------------------------------
 lin._all_issues = lambda: [
