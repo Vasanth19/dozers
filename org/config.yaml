@@ -134,7 +134,7 @@ alarm_interval: 300                                     # how often the launchd 
 # model_route.py now REFUSES an empty claude model from config; this is the fix, not
 # the workaround. (GSAI-83)
 models:
-  default:   { provider: claude, model: "claude-opus-5" }
-  dev:       { provider: claude, model: "claude-opus-5" }
+  default:   { provider: ollama-cloud, model: "kimi-k3" }   # flipped 2026-09-15 (Vas): the whole Dozer is off Claude. Revert: provider: claude, model: "claude-opus-5"
+  dev:       { provider: ollama-cloud, model: "kimi-k3" }   # flipped 2026-09-15 (Vas): smoke PASS + real tool-call e2e (Write landed on disk) on 2026-09-15. Revert: provider: claude, model: "claude-opus-5"
   marketing: { provider: ollama-cloud, model: "glm-5.2" }   # flipped 2026-09-07 (Vas): first role off Claude; smoke + crew e2e PASS. Revert: provider: claude, model: "claude-opus-5"
 ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY
