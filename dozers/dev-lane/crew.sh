@@ -6,6 +6,11 @@
 #   • Seance (resume): if a prior attempt left COMMITTED work in this task's worktree
 #     (e.g. a crash), REUSE the worktree and tell the agent to continue — not restart.
 #     The reaper leaves worktrees intact on failure precisely so this can happen.
+#   • Stale base (GSAI-70): a resume first checks the integration branch is still an
+#     ancestor of the task branch — if it advanced since the worktree was built, the
+#     branch is rebased onto the new base BEFORE resuming (a conflicting rebase aborts
+#     and FAILS, naming the conflicting files). Otherwise every resume quietly builds
+#     on the old base and the lane merge-conflicts forever (LL-19, LL-26, CFW-202).
 #   • Refinery (merge queue): merges to the integration branch are serialized by a
 #     per-project lock, and each merge is GREEN-GATED — verified on the integration
 #     branch after merging; a merge that breaks it is reverted and the task sent back.
@@ -13,7 +18,9 @@
 # Env: WORKDIR, DOZER_PERSONA, REPO_ROOT. Config: integration_branch, push,
 #   branch_prefix, worktree_root. DRY_RUN=1 stubs the model + tests (+ deps install).
 #   DEPS_INSTALL=off skips the lockfile install that otherwise runs when a worktree
-#   has a package.json but no node_modules (GSAI-26).
+#   has a package.json but no node_modules (GSAI-26). On the merge worktree that
+#   install happens AFTER the merge (GSAI-124), so a first package.json arriving with
+#   the change still gets node_modules before the green-gate runs.
 #
 # Integration branch (GSAI-15 / GSAI-19): `develop` when the repo has one (local or
 #   remote), else the repo's own default — origin/HEAD → main → the checked-out branch.
@@ -31,11 +38,12 @@
 #   knowable from the checkout, so don't pay for a run that can never merge), again on
 #   the task worktree after the agent, and once more at the green-gate.
 #
-# Model routing: the brain this lane runs on comes from org/config.yaml `models.dev`
-#   (provider + model), resolved by dozers/model.sh. Override per-run with
-#   DOZER_MODEL_DEV="<provider>[:<model>]" (e.g. ollama-cloud:glm-5.2), or bypass
-#   routing entirely by exporting MODEL_CMD. A route that can't be satisfied FAILS the
-#   crew — no silent fallback.
+# Model routing: THREE passes, each on its OWN brain — ARCHITECT (spec → DOZER-DESIGN.md),
+#   BUILD (implement the design), REVIEW (verdict → DOZER-REVIEW.md). Each resolves its
+#   dotted role via dozers/model.sh: models.dev.<pass> → flat models.dev → models.default.
+#   Override per-run with DOZER_MODEL_DEV[_<PASS>]="<provider>[:<model>]", or bypass
+#   routing entirely by exporting MODEL_CMD (all three passes then share it). A route
+#   that can't be satisfied FAILS the crew — no silent fallback.
 #
 # Time bounds (GSAI-37): every command this crew hands to a repo or a model runs under
 #   dozers/timebox.sh — the coding agent, the lockfile install, the test run in the task
@@ -54,7 +62,7 @@ cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 
 # fail: print the reason AND record it in $OUT/<id>.fail so the engine can put it
 # in the block comment (GSAI-26 #3) — Directors shouldn't have to read loop.err.log.
 fail() { echo "    [dev] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
-rm -f "$OUT/$ID.fail" 2>/dev/null || true
+rm -f "$OUT/$ID.fail" "$OUT/$ID.merge" 2>/dev/null || true   # .merge receipt: see GSAI-119 block below
 
 # ── Time bounds (GSAI-37) — resolved up front so a bad value fails before any spend ──
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
@@ -116,10 +124,17 @@ link_deps_dir() {  # $1 = source dir (real checkout), $2 = target dir (worktree)
 # reverted (CFW-31 failed 18 attempts that way). Install from the lockfile first, so
 # a failure here is reported as the INSTALL's — never disguised as "merge broke
 # develop". No lockfile → no install (a deps-free package.json is legitimate) and the
-# test run speaks for itself. DEPS_INSTALL=off disables. Output → $OUT/<id>.deps.log
-# (never inside the worktree — it may be a live checkout).
-install_deps() {  # $1 = worktree dir, $2 = label for the failure message
-  local d="$1" what="$2" cmd
+# test run speaks for itself. DEPS_INSTALL=off disables. Output → $OUT/<id>.deps-<stage>.log
+# (never inside the worktree — it may be a live checkout; one log per stage so the
+# green-gate's install can't overwrite the task worktree's).
+#
+# Returns 1 with $DEPS_FAIL_MSG set rather than failing outright (GSAI-124) — the
+# green-gate calls this AFTER it has merged, so it must revert before it fails.
+# Callers with nothing to undo just `|| fail "$DEPS_FAIL_MSG"`.
+DEPS_FAIL_MSG=""
+install_deps() {  # $1 = worktree dir, $2 = stage label (also names the log)
+  local d="$1" what="$2" cmd log
+  DEPS_FAIL_MSG=""; log="$OUT/$ID.deps-${what// /-}.log"
   [[ -f "$d/package.json" ]] || return 0
   [[ -e "$d/node_modules" ]] && return 0
   [[ "${DEPS_INSTALL:-on}" == "off" ]] && { echo "    [dev] $what: deps install off"; return 0; }
@@ -128,10 +143,14 @@ install_deps() {  # $1 = worktree dir, $2 = label for the failure message
   elif [[ -f "$d/yarn.lock" ]];         then cmd="yarn install --frozen-lockfile"
   else echo "    [dev] ⚠ $what: package.json but no lockfile and no node_modules — not installing"; return 0; fi
   echo "    [dev] $what: node_modules missing — $cmd"
-  timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$OUT/$ID.deps.log" 2>&1 && return 0
-  (( TIMEBOX_HIT )) && fail "$(timed_out_msg "$what deps install (\`$cmd\` in $d)" "$T_DEPS" deps) — see $OUT/$ID.deps.log"
-  fail "$what deps install failed ($cmd in $d) — see $OUT/$ID.deps.log; last lines:
-$(tail -n 5 "$OUT/$ID.deps.log" 2>/dev/null | sed 's/^/      /')"
+  timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$log" 2>&1 && return 0
+  if (( TIMEBOX_HIT )); then
+    DEPS_FAIL_MSG="$(timed_out_msg "$what deps install (\`$cmd\` in $d)" "$T_DEPS" deps) — see $log"
+  else
+    DEPS_FAIL_MSG="$what deps install failed ($cmd in $d) — see $log; last lines:
+$(tail -n 5 "$log" 2>/dev/null | sed 's/^/      /')"
+  fi
+  return 1
 }
 
 # ── Test gate (GSAI-27) ──────────────────────────────────────────────────────
@@ -219,18 +238,98 @@ cd "$WORKDIR" 2>/dev/null || fail "workdir missing: $WORKDIR"
 git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git repo: $WORKDIR"
 
 INTEG="${INTEGRATION_BRANCH:-$(cfg integration_branch)}"; INTEG="${INTEG:-develop}"
-# ── Model routing: which brain runs this lane (see dozers/model.sh + config `models:`).
-# MODEL_CMD already in the env wins (legacy/manual override). Otherwise resolve the
-# ROLE's route — fail fast: a bad provider or a missing key stops the crew, it never
-# silently falls back to claude.
+# ── Model routing: the lane runs THREE model passes (architect → build → review), each
+# on its OWN route, resolved just before the pass runs (see dozers/model.sh + config
+# `models:`). A pass's route block is expanded only INSIDE that pass's timebox subshell,
+# so its exports (ANTHROPIC_*, the provider token, MODEL_CMD) live exactly as long as
+# the pass and never leak back into the crew env the merge/test sections see.
+# MODEL_CMD already in the env wins for every pass (legacy/manual override). Otherwise
+# the pass's DOTTED role resolves nested → flat lane → models.default. Fail fast: a bad
+# provider or a missing key stops the crew — it never silently falls back to claude.
 DOZER_ROLE="${DOZER_ROLE:-dev}"
-if [[ -n "${MODEL_CMD:-}" ]]; then
-  DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
-else
-  _route="$("$REPO_ROOT/dozers/model.sh" env "$DOZER_ROLE")" || fail "model routing failed for role '$DOZER_ROLE'"
-  eval "$_route"; unset _route
-fi
-MODEL_DESC="${DOZER_MODEL_PROVIDER:-claude}/${DOZER_MODEL_NAME:-default}"
+PASS_ROWS=()   # "pass: provider/model" per run, in order — the summary reports all three
+
+_PASS_BLOCK=""; _PASS_DESC=""
+resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK + _PASS_DESC
+  local role="$DOZER_ROLE.$1"
+  if [[ -n "${MODEL_CMD:-}" ]]; then
+    DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
+    _PASS_BLOCK=":"; _PASS_DESC="${DOZER_MODEL_PROVIDER}/${DOZER_MODEL_NAME}"
+    return 0
+  fi
+  _PASS_BLOCK="$("$REPO_ROOT/dozers/model.sh" env "$role")" \
+    || fail "model routing failed for role '$role'"
+  # Desc from a throwaway subshell — the route's exports must not enter the crew env.
+  _PASS_DESC="$(eval "$_PASS_BLOCK" >/dev/null; printf '%s/%s' "${DOZER_MODEL_PROVIDER:-?}" "${DOZER_MODEL_NAME:-default}")"
+}
+
+# branch_has_output <dir> <sha> — the gate's question (GSAI-149): "does the branch
+# hold anything to merge?" — is there ANY diff vs the pinned base SHA beyond the pass
+# artifacts (DOZER-DESIGN.md / DOZER-REVIEW.md — committed by the crew's backstops,
+# and a design file is not a deliverable to merge). The ONE definition of "the build
+# did something", shared by build_once's no-commit gate and run_model_pass's
+# changes: proof — no two versions of it (spec point 5). Uncommitted working-tree
+# changes count as output, exactly as they did against the old per-attempt anchor.
+branch_has_output() {  # $1 = dir, $2 = pinned base sha
+  ! git -C "$1" diff --quiet "$2" -- . ':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md' 2>/dev/null
+}
+
+# run_model_pass <pass> <prompt> [proof] — one agent run under its own route, its own
+# timebox. <proof> (GSAI-147, build form GSAI-149) names the pass's deliverable and
+# is consulted ONLY when the session exits non-zero AND it was not a timeout: the exit
+# code is a side-channel, not the deliverable — a model CLI can finish its work (write
+# DOZER-DESIGN.md, commit the build, write the verdict in DOZER-REVIEW.md) and still
+# die on teardown (a final-turn API error, a crash at exit). Before this, one such
+# flake discarded a PASSING review and re-ran the whole task from resume — three model
+# runs of spend for an exit code. Forms:
+#   file:<name>    → the $WT file exists and is non-empty       (architect, review)
+#   changes:<sha>  → the branch holds a diff vs <sha> beyond the pass artifacts
+#                    (branch_has_output)                        (build)
+# The build proof asks the gate's question, not "did THIS attempt advance past its
+# own anchor?": on a resume whose work is already committed, a build flake with
+# nothing new added is rescued by the PRIOR work — the per-attempt commits:/anchor
+# form (pre-GSAI-149) failed the crew before the gate could ever judge, leaving a
+# finished branch unrescuable. A timeout ALWAYS fails (GSAI-37): a killed process may
+# have left a truncated file, and "hung = failed" is not negotiable — TIMEBOX_HIT
+# wins over any artifact. No deliverable → fails exactly as before: the rescue is
+# earned by a deliverable, not by exit-code generosity. Every rescue logs a loud ⚠
+# naming the pass, the exit code, and the artifact — reported, never masked
+# (fail-fast doctrine).
+run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artifact (optional)
+  resolve_pass "$1"
+  echo "    [dev] $1 model: $_PASS_DESC"
+  PASS_ROWS+=("$1: $_PASS_DESC")
+  local rc=0
+  # GSAI-150: the `\$` on _PASS_PROMPT is load-bearing. The prompt is untrusted text —
+  # the review prompt embeds the branch's diff, every prompt embeds the task title —
+  # and it must expand EXACTLY ONCE, inside double quotes, at the second eval's parse.
+  # The old `\"$_PASS_PROMPT\"` expanded it during the FIRST eval, so the second eval
+  # re-parsed the diff as shell code: every $( … ) and backtick in the diff EXECUTED,
+  # and a stray " silently mangled the prompt the model received. As written, the
+  # second eval hands the CLI one byte-identical argv; metacharacters stay inert bytes.
+  _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" timebox "$T_MODEL" "$1 agent" "$WT" \
+    'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"\$_PASS_PROMPT\""' || rc=$?
+  # if/then, not `&& return`/`&& fail`: a false `(( … ))` short-circuits the list to
+  # status 1, and run_model_pass runs as a plain command under set -e — that would
+  # kill the crew silently before either branch below could speak.
+  if (( rc == 0 )); then return 0; fi
+  if (( TIMEBOX_HIT )); then
+    fail "$(timed_out_msg "$1 agent" "$T_MODEL" model); worktree kept for resume"
+  fi
+  case "${3:-}" in
+    file:*)
+      if [[ -s "$WT/${3#file:}" ]]; then
+        echo "    [dev] ⚠ $1 agent exited $rc but ${3#file:} is on disk — continuing from the artifact"
+        return 0
+      fi ;;
+    changes:*)
+      if branch_has_output "$WT" "${3#changes:}"; then
+        echo "    [dev] ⚠ $1 agent exited $rc but $BRANCH holds changes past ${3#changes:} — continuing from its work"
+        return 0
+      fi ;;
+  esac
+  fail "$1 agent failed (worktree kept for resume)"
+}
 PUSH="${PUSH:-$(cfg push)}"
 PREFIX="${BRANCH_PREFIX:-$(cfg branch_prefix)}"; PREFIX="${PREFIX:-dozer}"
 WT_ROOT="${WORKTREE_ROOT:-$(cfg worktree_root)}"; WT_ROOT="${WT_ROOT:-$HOME/.dozers/worktrees}"; WT_ROOT="${WT_ROOT/#\~/$HOME}"; mkdir -p "$WT_ROOT"
@@ -263,7 +362,6 @@ if ! git show-ref --verify --quiet "refs/heads/$INTEG" \
 fi
 
 echo "    [dev] cwd=$(pwd)  integration=$INTEG  branch=$BRANCH"
-echo "    [dev] model: $MODEL_DESC"
 [[ -n "$DOZER_PERSONA" ]] && echo "    [dev] persona: $DOZER_PERSONA" || true
 [[ -f AGENTS.md ]] && echo "    [dev] + project AGENTS.md" || true
 
@@ -274,7 +372,35 @@ RESUMING=0; attempt=1
 if [[ -d "$WT" ]] && git -C "$WT" rev-parse --verify -q "refs/heads/$BRANCH" >/dev/null 2>&1 \
    && [[ -n "$(git -C "$WT" log --oneline "$base..$BRANCH" 2>/dev/null)" ]]; then
   RESUMING=1; attempt=$(( $(cat "$STATE" 2>/dev/null || echo 1) + 1 )); echo "$attempt" > "$STATE"
-  echo "    [dev] RESUMING #$ID (attempt $attempt) — reusing worktree; prior commits:"
+  echo "    [dev] RESUMING #$ID (attempt $attempt) — reusing worktree"
+  # GSAI-70: the integration branch may have ADVANCED after this worktree was built
+  # (`git log "$base..$BRANCH"` alone can't tell — it is non-empty either way, which is
+  # why a stale worktree used to resume as-is and then merge-conflict forever). If
+  # $base is no longer an ancestor of $BRANCH, rebase the task branch onto the new
+  # base BEFORE anything else runs. A rebase that conflicts is ABORTED and reported
+  # as "stale base" with the conflicting files named — the Director sees why, and the
+  # prior commits are never silently discarded. The path taken is logged either way.
+  if git merge-base --is-ancestor "$base" "$BRANCH" 2>/dev/null; then
+    echo "    [dev] resume check: base $base has not moved — resuming as-is"
+  else
+    _old_base="$(git merge-base "$base" "$BRANCH" 2>/dev/null || true)"
+    _new_base="$(git rev-parse --verify --short "$base" 2>/dev/null || echo "$base")"
+    if _rb_out="$(git -C "$WT" rebase "$base" 2>&1)"; then
+      echo "    [dev] base moved — rebased ${_old_base:0:7}..${_new_base}"
+    else
+      _rb_conflicts="$(git -C "$WT" status --porcelain --untracked-files=no 2>/dev/null \
+        | awk '$1 ~ /^(UU|AA|AU|UA|DU|UD|DD)$/ {print $2}' | sort -u | sed 's/^/      /')"
+      git -C "$WT" rebase --abort >/dev/null 2>&1 || true
+      if [[ -n "$_rb_conflicts" ]]; then
+        fail "stale base: $INTEG advanced (${_old_base:0:7} → ${_new_base}) after this worktree was built, and rebasing $BRANCH onto it CONFLICTS — worktree kept, sent back (rebase aborted; nothing discarded). Conflicting files:
+$_rb_conflicts"
+      else
+        fail "stale base: $INTEG advanced (${_old_base:0:7} → ${_new_base}) after this worktree was built, and rebasing $BRANCH onto it failed — worktree kept, sent back (rebase aborted; nothing discarded). git said:
+$(printf '%s\n' "$_rb_out" | tail -n 5 | sed 's/^/      /')"
+      fi
+    fi
+  fi
+  echo "    [dev]   prior commits on $BRANCH off $base:"
   git -C "$WT" log --oneline "$base..$BRANCH" 2>/dev/null | sed 's/^/          /'
 else
   git worktree prune >/dev/null 2>&1 || true
@@ -283,6 +409,21 @@ else
     || fail "could not create worktree $WT off $base: ${_wt_err:-unknown git error}"
   echo "    [dev] worktree $WT (off $base)"; echo 1 > "$STATE"
 fi
+
+# Pin the integration base as a SHA (GSAI-149): the no-commit gate and the build
+# pass's changes: proof diff against the base — and they must compare against the
+# base as it stood when this run's worktree state was settled, NOT against the ref
+# name resolved at gate time inside the worktree. Two traps the pin closes:
+#   • base="HEAD" (the integration branch exists remote-only, so there is no local
+#     ref) — resolved HERE in the main checkout, the same resolution `git worktree
+#     add` just used. A `git -C "$WT" diff HEAD …` at gate time would resolve HEAD
+#     INSIDE the worktree to the branch tip itself — a diff that is empty forever,
+#     failing every build on such repos.
+#   • a resume may have just rebased onto $base's NEW tip — the pin lands AFTER that
+#     rebase, so the diff is exactly the task's commits, never old-base noise.
+# $base the *name* keeps its other roles (resume detection, rebase, merge).
+BASE_SHA="$(git rev-parse --verify "$base" 2>/dev/null)" \
+  || fail "could not resolve the integration base '$base' to a commit — cannot gate the build"
 
 # ── 1b. Test-gate PREFLIGHT (GSAI-32) ──────────────────────────────────────────
 # The gate below runs only AFTER the coding agent, so a repo with no detectable test
@@ -313,40 +454,177 @@ if [[ "${DRY_RUN:-}" != "1" ]]; then
 fi
 
 link_deps "$WT"
-[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree"
+[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
 
-# ── 2. coding agent (implements + tests + commits INSIDE the worktree) ─────────
-read -r -d '' PROMPT <<EOF || true
-You are a Dozer working inside a dedicated git worktree on branch $BRANCH.
-Rules (from $DOZER_PERSONA): do ALL work here; implement the task; run the project's
+# ── 2. three model passes: ARCHITECT → BUILD → REVIEW (each on its own route) ────
+# ARCHITECT turns the spec into DOZER-DESIGN.md; BUILD implements that design (and must
+# still clear every existing gate: deps, tests, no-commit); REVIEW judges spec-vs-diff
+# and writes DOZER-REVIEW.md whose first line is the verdict. A FAIL verdict buys ONE
+# rebuild with the review notes; a second FAIL blocks the task.
+
+# -- prompts ----------------------------------------------------------------------
+read -r -d '' ARCH_PROMPT <<EOF || true
+You are the ARCHITECT pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
+Rules (from $DOZER_PERSONA): read the task spec, then DESIGN the implementation — write
+DOZER-DESIGN.md at the worktree root (approach, files to touch, edge cases, how it gets
+tested) and commit it. Write and commit ONLY DOZER-DESIGN.md: no code, no other edits.
+Do NOT merge, push, switch branches, or remove this worktree.
+
+TASK #$ID: $TITLE
+EOF
+
+read -r -d '' BUILD_PROMPT <<EOF || true
+You are the BUILD pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
+Implement the design in DOZER-DESIGN.md (the architect pass's plan — follow it).
+Rules (from $DOZER_PERSONA): do ALL work here; run the project's
 tests until green; commit. Do NOT merge, push, switch branches, or remove this worktree.
 
 TASK #$ID: $TITLE
 EOF
-if (( RESUMING )); then
-  PROMPT="RESUMING (attempt $attempt). Prior work is ALREADY committed on $BRANCH:
-$(git -C "$WT" log --oneline "$base..$BRANCH")
-Continue from there — do NOT redo committed work; finish the task and commit.
 
-$PROMPT"
+if (( RESUMING )); then
+  _resume_note="RESUMING (attempt $attempt). Prior work is ALREADY committed on $BRANCH:
+$(git -C "$WT" log --oneline "$base..$BRANCH")
+Continue from there — do NOT redo committed work; finish the pass and commit."
+  ARCH_PROMPT="$_resume_note
+If DOZER-DESIGN.md is already committed on this branch, review it and amend ONLY if the
+design must change (then commit it again); otherwise commit nothing new.
+
+$ARCH_PROMPT"
+  BUILD_PROMPT="$_resume_note
+
+$BUILD_PROMPT"
+  unset _resume_note
 fi
 
 if [[ "${DRY_RUN:-}" == "1" ]]; then
-  echo "    [dev] DRY_RUN — skipping model$([[ $RESUMING == 1 ]] && echo ' (resume)')"
+  for _p in architect build review; do
+    resolve_pass "$_p"
+    echo "    [dev] $_p model: $_PASS_DESC"
+    PASS_ROWS+=("$_p: $_PASS_DESC")
+  done
+  unset _p
+  echo "    [dev] DRY_RUN — skipping models$([[ $RESUMING == 1 ]] && echo ' (resume)')"
+  printf '# DOZER-DESIGN (dry-run stub)\n' > "$WT/DOZER-DESIGN.md"
   printf 'dozer #%s attempt %s: %s\n' "$ID" "$attempt" "$TITLE" >> "$WT/.dozer-log"
+  printf 'VERDICT: PASS\n(dry-run stub review)\n' > "$WT/DOZER-REVIEW.md"
   git -C "$WT" add -A && git -C "$WT" commit -q -m "dozer #$ID: $TITLE (dry-run stub, attempt $attempt)" || true
 else
-  if ! timebox "$T_MODEL" "coding agent" "$WT" "$MODEL_CMD \"\$PROMPT\""; then
-    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "coding agent" "$T_MODEL" model); worktree kept for resume"
-    fail "coding agent failed (worktree kept for resume)"
+  # -- 2a. ARCHITECT: spec -> DOZER-DESIGN.md -------------------------------------
+  run_model_pass architect "$ARCH_PROMPT" file:DOZER-DESIGN.md
+  if [[ -z "${MODEL_CMD:-}" ]]; then
+    # The pass was told to write AND commit the design; backstop the commit so the
+    # build diff/merge never lose it (still fail-fast on NO design at all).
+    [[ -s "$WT/DOZER-DESIGN.md" ]] \
+      || fail "architect produced no DOZER-DESIGN.md (worktree kept for resume)"
+    git -C "$WT" add DOZER-DESIGN.md 2>/dev/null \
+      && git -C "$WT" commit -q -m "dozer #$ID: design (architect pass)" 2>/dev/null || true
   fi
-  install_deps "$WT" "task worktree"   # no-op if the agent (or link_deps) already provided node_modules
-  resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
-  if [[ -n "$TEST_CMD" ]] && ! run_tests "$WT" "task worktree"; then
-    (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
-    fail "tests failed — not merging (worktree kept for resume)"
+
+  # -- 2b. BUILD: implement the design + the full downstream gates ----------------
+  # Build is a function because a FAILed review triggers exactly ONE rebuild.
+  build_once() {  # $1 = extra prompt block (review notes on the rebuild)
+    local prompt="$BUILD_PROMPT" anchor
+    [[ -n "${1:-}" ]] && prompt="$prompt
+
+$1"
+    # GSAI-149: the gate's question is "does the branch hold anything to merge?" —
+    # a diff vs $BASE_SHA excluding the pass artifacts (branch_has_output) — NOT "did
+    # THIS attempt add commits?". A resume whose work is already complete correctly
+    # adds nothing, and the old per-attempt anchor failed such finished tasks forever
+    # (GSAI-144 attempt 4, BRD-88): the resume path reuses the worktree precisely
+    # because the branch is already ahead of the base. $anchor survives ONLY to
+    # distinguish "this attempt added nothing" for the resume info line below.
+    anchor="$(git -C "$WT" rev-parse HEAD)"
+    # The build pass's proof shares the gate's question (changes:$BASE_SHA — the same
+    # branch_has_output definition), so a non-timeout build flake on a resume is
+    # rescued by the prior work already on the branch where the per-attempt
+    # commits:$anchor proof killed the crew before the gate could judge.
+    run_model_pass build "$prompt" "changes:$BASE_SHA"
+    # no-op if the agent (or link_deps) already provided node_modules
+    install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
+    resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
+    if [[ -n "$TEST_CMD" ]] && ! run_tests "$WT" "task worktree"; then
+      (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
+      fail "tests failed — not merging (worktree kept for resume)"
+    fi
+    # The gate, restated (GSAI-149): pass when the branch holds anything to merge
+    # beyond the pass artifacts — the question above — so a resume with complete work
+    # proceeds to the merge it earned. A FIRST attempt whose only diff is the design
+    # file still fails (a design is not a deliverable), and the failure text stays
+    # byte-identical: it is still literally true when it fires — no commits, and no
+    # diff, beyond the artifacts. Tests already ran above, so a resume whose work is
+    # not green never reaches this gate.
+    # `if/else`, not `&&`/`||`: build_once is CALLED as a plain command under set -e,
+    # so the function's exit status is its last command's — a bare
+    # `diff --quiet && fail` would return 1 (diff found the commits) and kill the
+    # crew right after a PASSING build. Inside `if`, the diff's status is exempt.
+    if branch_has_output "$WT" "$BASE_SHA"; then
+      # The branch passes, but THIS attempt added nothing — say so in plain words
+      # (a resume whose work was already complete; also a rebuild after a FAILed
+      # review that judged nothing needs fixing).
+      if git -C "$WT" diff --quiet "$anchor" -- 2>/dev/null; then
+        echo "    [dev] build pass added nothing — branch already $(git -C "$WT" rev-list --count "$base..$BRANCH" 2>/dev/null) commits ahead of $base, continuing to test+merge"
+      fi
+    else
+      fail "build agent produced no commits on $BRANCH"
+    fi
+  }
+
+  # -- 2c. REVIEW: spec + diff -> DOZER-REVIEW.md, first line VERDICT: PASS|FAIL --
+  REVIEW_VERDICT=""
+  review_once() {
+    local vline
+    read -r -d '' _rev_prompt <<EOF || true
+You are the REVIEW pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
+Judge, don't build: change NOTHING except the review file. Given the spec and the diff
+of this branch below, decide whether the implementation satisfies the spec and is sound
+(DOZER-DESIGN.md is the architect pass's plan — check the build followed it). Then write
+DOZER-REVIEW.md at the worktree root whose FIRST LINE is exactly "VERDICT: PASS" or
+"VERDICT: FAIL", followed by your reasons, and commit ONLY that file.
+Do NOT merge, push, switch branches, or remove this worktree.
+
+TASK #$ID: $TITLE
+
+DIFF ($base..HEAD):
+$(git -C "$WT" diff "$base" 2>/dev/null)
+EOF
+    run_model_pass review "$_rev_prompt" file:DOZER-REVIEW.md
+    unset _rev_prompt
+    if [[ -z "${MODEL_CMD:-}" ]]; then
+      git -C "$WT" add DOZER-REVIEW.md 2>/dev/null \
+        && git -C "$WT" commit -q -m "dozer #$ID: review (review pass)" 2>/dev/null || true
+      vline="$(head -n1 "$WT/DOZER-REVIEW.md" 2>/dev/null | tr -d '\r' || true)"
+      # A missing or garbled verdict IS a fail — no free pass to merge.
+      case "$vline" in
+        "VERDICT: PASS") REVIEW_VERDICT="PASS" ;;
+        "VERDICT: FAIL") REVIEW_VERDICT="FAIL" ;;
+        *)               REVIEW_VERDICT="FAIL" ;;
+      esac
+      echo "    [dev] review verdict: $REVIEW_VERDICT"
+    else
+      REVIEW_VERDICT="PASS"   # MODEL_CMD bypass (legacy/tests): no verdict contract
+    fi
+  }
+
+  build_once ""
+  review_once
+  if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
+    _notes="$(cat "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+    echo "    [dev] review failed — one rebuild with the review notes"
+    build_once "The REVIEW pass FAILED the previous build. Its notes (DOZER-REVIEW.md):
+
+$_notes
+
+Fix what it names, then run the tests and commit."
+    review_once
+    if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
+      _notes="$(cat "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+      fail "review failed TWICE — not merging (worktree kept, sent back). Review notes:
+$(printf '%s\n' "$_notes" | head -n 40 | sed 's/^/      /')"
+    fi
+    unset _notes
   fi
-  git -C "$WT" diff --quiet "$base" -- 2>/dev/null && fail "agent produced no commits on $BRANCH"
 fi
 
 # ── 2b. Migration gate (LL-31): block a schema change with no matching migration ──
@@ -379,8 +657,6 @@ else
     || git worktree add -B "$INTEG" "$MW" "$base" >/dev/null 2>&1 \
     || fail "could not create merge worktree $MW on $INTEG"
 fi
-link_deps "$MW"   # so the green-gate's `npm test` has node_modules — else every merge reverts
-[[ "${DRY_RUN:-}" == "1" ]] || install_deps "$MW" "green-gate"
 PREMERGE="$(git -C "$MW" rev-parse HEAD)"
 if git -C "$MW" merge --no-ff "$BRANCH" -m "merge $BRANCH into $INTEG — #$ID $TITLE" >/dev/null 2>&1; then
   echo "    [dev] merged $BRANCH → $INTEG"
@@ -394,13 +670,31 @@ else
     fail "merge conflict on $BRANCH → $INTEG — worktree kept, sent back"
   fi
 fi
+# Deps for the green-gate are provisioned on the POST-merge tree (GSAI-124) — the
+# exact tree the gate is about to test. They used to be provisioned BEFORE the merge,
+# while $MW still sat on the untouched integration branch, which silently skipped the
+# one case that needs them most: the task that adds a repo's FIRST package.json. The
+# pre-merge tree had no package.json to install from, so install_deps returned early;
+# the merge then brought package.json in and the gate ran `npm test` bare → "command
+# not found" → the merge was reverted and the issue blocked with the flatly wrong
+# reason "merge broke develop". Same for link_deps: a branch that adds a new workspace
+# package only gets that package's deps linked once its dir is actually on the tree.
+link_deps "$MW"   # so the green-gate's `npm test` has node_modules — else every merge reverts
+
 # green-gate: the integration branch must STILL pass after the merge, else revert it.
 # The same hole is closed here (GSAI-27): a merge with nothing to run is NOT green,
 # it is unverified — revert it and send the task back, exactly as a red one.
+#
+# The merge has already happened at this point, so every rung below reports through
+# $gate_why and lets the single revert-and-fail at the bottom undo it — including the
+# deps install, whose failure must be named AS the install and never mistaken for a
+# broken integration branch.
 GATE_WAIVED=0
 if [[ "${DRY_RUN:-}" != "1" ]]; then
   gate=1; gate_why=""
-  if ! resolve_test_cmd "$MW" "green-gate"; then
+  if ! install_deps "$MW" "green-gate"; then
+    gate=0; gate_why="$DEPS_FAIL_MSG"
+  elif ! resolve_test_cmd "$MW" "green-gate"; then
     gate=0; gate_why="$NO_TEST_MSG"
   elif [[ -z "$TEST_CMD" ]]; then
     GATE_WAIVED=1
@@ -424,6 +718,18 @@ if [[ "$PUSH" == "true" ]]; then
   else echo "    [dev] ⚠ push failed"; fi
 fi
 
+# ── Merge receipt (GSAI-119): the engine labels the issue dozer:merged-develop on the
+# crew's exit code alone, so the label must be backed by a checkable fact, not a claim.
+# Before labeling, dozer.sh runs dozers/verify-merge.sh on THIS receipt: the merge SHA
+# below must exist in the repo and be an ancestor of the branch below. The receipt is
+# written only here — after the merge landed AND the green-gate passed — so an exit 0
+# from any earlier point (or a receipt missing/stale) blocks the issue instead of
+# labeling it merged, which is how phantom merges reached the Ship gate (CFW-215/252).
+MERGE_SHA="$(git -C "$MW" rev-parse HEAD)"
+printf 'branch=%s\nmerge_sha=%s\n' "$INTEG" "$MERGE_SHA" > "$OUT/$ID.merge" 2>/dev/null \
+  || fail "merge landed but the receipt could not be written ($OUT/$ID.merge) — NOT labeling merged; investigate .artifacts/dev writability and re-greenlight"
+echo "    [dev] merge receipt: $(git -C "$MW" rev-parse --short HEAD) on $INTEG"
+
 # ── 4. cleanup (success): drop worktrees + branch + state; merge lock released on EXIT ──
 (( MW_OWNED )) && { git worktree remove --force "$MW" >/dev/null 2>&1 || true; }
 git worktree remove --force "$WT" >/dev/null 2>&1 || true
@@ -439,9 +745,10 @@ EOF
 if [[ "${DRY_RUN:-}" == "1" ]]; then agent_line="stub commit (dry-run)"; tests_line="skipped (dry-run)"; gate_line="skipped (dry-run)"
 elif (( GATE_WAIVED )); then agent_line="implemented + committed"; tests_line="no test command — gate waived for this repo"; gate_line="not verified (test gate opted out)"
 else agent_line="implemented + committed"; tests_line="gate passed"; gate_line="$INTEG green after merge"; fi
+_models=""; for _p in "${PASS_ROWS[@]:-}"; do [[ -n "$_p" ]] && _models+="${_models:+ · }$_p"; done; unset _p
 cat > "$OUT/$ID.summary" <<EOF
 - Picked up: $TITLE$([[ $RESUMING == 1 ]] && echo " (RESUMED, attempt $attempt)")
-- model: $MODEL_DESC
+- models (architect → build → review): ${_models:-unresolved}
 - Worktree $BRANCH off $INTEG (isolated)
 - Coding agent: $agent_line
 - Tests: $tests_line

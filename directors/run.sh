@@ -15,6 +15,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/tasks/adapter.sh"
+# GSAI-60: every scripted comment self-stamps `<!-- board-note by:<this> -->` — the
+# board reconcile reads an unmarked comment as Vas's answer.
+export DOZER_COMMENT_BY="director-cli"
 
 case "${1:-triage}" in
   triage)
@@ -47,7 +50,7 @@ case "${1:-triage}" in
     else
       rc=$?
       case "$rc" in
-        3) echo "[director] #$id still waiting on Vas — every later comment is marked (an agent's). Leave board:to_review on." ;;
+        3) echo "[director] #$id still waiting on Vas — every later comment is marked (an agent's) or was REFUSED as a known agent signature (see the probe's stderr; if a refusal is genuinely his answer, eyeball it and swap by hand). Leave board:to_review on." ;;
         2) echo "[director] #$id has no board-ask marker — nothing to reconcile." ;;
         *) echo "[director] #$id probe failed (exit $rc)" >&2 ;;
       esac

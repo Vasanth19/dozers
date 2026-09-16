@@ -58,6 +58,11 @@ An **artifact to judge** also gets `ln -s <abs-path> ~/ecosystem/board/review/<I
    **never** his answer, whatever the marker's name. Don't eyeball it: `directors/run.sh answer <ID>` (or
    `tasks/_linear_api.py board-answer <ID>`) applies exactly this rule — exit 0 = answered (swap), 3 = waiting
    (leave it), 2 = no ask.
+   Scripted engine comments now **self-stamp** — a `<!-- board-note by:dozer-engine|dozer-reaper|director-cli -->`
+   marker means the Dozer, the reaper, or the CLI wrote it (GSAI-60). The probe also **refuses known agent
+   signatures** (an unmarked "Dozer claimed/blocked/merged/staged…", "Director approved…", "♻️ Reaper requeued…"):
+   it exits 3 with a `REFUSED:` line on stderr. If a refusal is genuinely Vas's answer, eyeball it and swap
+   manually — that judgment is the point of the gate.
 2. No later unmarked comment → leave it alone. Never re-ping, never re-ask.
 
 **Pull in answers he typed elsewhere** (same awake, run before step 1):
@@ -106,7 +111,11 @@ Team keys (live in Linear): **CFW** = cfw-social · **LL** = learnloop · **BRD*
 - **Greenlight** → add labels `dozer:ready` + `lane:dev|lane:marketing|lane:ops` (+ `repo:` if it touches a repo).
 - **Review** → read `dozer:needs-review` issues + the Dozer's summary comment / staged draft.
 - **Approve (mktg)** → remove `dozer:needs-review`, set state **Done**.
-- **Promote (dev)** → after `dozer:merged-develop`, merge develop→main, set `director:merged-main` → **Done**.
+- **Promote (dev)** → after `dozer:merged-develop`, run **`directors/promote.sh <repo-id|path> --summary "<issue ids>"`** — never hand-roll the git — then set `director:merged-main` → **Done**.
+  The script is the invariant: fetch → refuse a dirty checkout → `git merge --no-ff` → verify a **2-parent**
+  merge that adds nothing absent from develop → push. It exits non-zero and changes nothing if main has
+  diverged (a squashed promote, or work committed straight to main — the GSAI-104 bug); reconcile by merging
+  main back into develop first. `--check` reports the state without touching anything.
 - **Send back** → comment what's wrong, set `director:changes-requested`, remove `dozer:ready` so it re-triages.
 - **Escalate** → comment/assign to the **Chief** for anything above your authority.
 
@@ -127,6 +136,7 @@ above to the matching MCP tool call.
 - `directors/run.sh triage` — list untriaged
 - `directors/run.sh ready <ISSUE-ID> dev|marketing` — greenlight
 - `directors/run.sh note <ISSUE-ID> "<text>"` — comment
+- `directors/promote.sh <repo-id|path> [--check] [--dry-run]` — promote develop→main (the ONLY way)
 
 ## The rule that never bends
 
