@@ -471,7 +471,13 @@ doctor() {
   if (( ${#foreign[@]} )); then
     echo "-- other holders' locks (not ours; never reaped) --"
     for lock in "${foreign[@]}"; do
-      pid="$(head -1 "$lock/pid" 2>/dev/null | tr -dc '0-9')"
+      # `|| true` is not decoration: a foreign lock is defined as "no owner file" —
+      # nothing guarantees it has a `pid` file either (pre-GSAI-96 residue, the
+      # director-awake mkdir/pid race window, any future foreign holder). Without the
+      # guard `head` exits 1 on the missing file, pipefail propagates it, the
+      # assignment fails, and `set -e` kills `doctor` mid-report on exactly the
+      # legacy state you'd run it to inspect (same class as failure #1 / hevery= above).
+      pid="$( { head -1 "$lock/pid" 2>/dev/null || true; } | tr -dc '0-9')"
       if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then st="ALIVE pid=$pid"; else st="not alive pid=${pid:-?}"; fi
       printf '   %-24s %s\n' "$(basename "$lock" .lock)" "[$st]"
     done
