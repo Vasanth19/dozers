@@ -5,7 +5,13 @@
 # on, and — the GSAI-31 regression — that it keeps beating WHILE the engine works:
 #   FIELDS    — pid + ts + inflight + poll + every are all present
 #   PID       — heartbeat pid is THIS emitter (a live, probeable process)
-#   INFLIGHT  — count reflects the run-locks in LOCK_DIR at beat time
+#   INFLIGHT  — count reflects the live CREW run-locks in LOCK_DIR at beat time, and
+#               excludes the Directors' own `director-*.lock` passes and dead owners
+#               (GSAI-76: counting either made the stall watchdog gate on a fiction)
+#   SURVIVE   — an owner-less crew lock (a tolerated owner-write failure leaves one
+#               behind for good) must not abort the beat under set -euo pipefail
+#               (GSAI-76 review: the unguarded grep|cut pipeline crashed the ticker
+#               silently AND the main loop — a frozen beacon on a live engine)
 #   ATOMIC    — no leftover *.tmp beacon after the write
 #   TICK      — a beat with no explicit tick keeps the tick already on the beacon
 #   DRAIN     — the beacon advances DURING a blocking drain, and `inflight` is live
@@ -23,15 +29,20 @@ HB="$TMP/heartbeat"
 cleanup() { rm -rf "$TMP" 2>/dev/null || true; }
 trap cleanup EXIT
 
+# A crew run-lock. The owner pid must be LIVE ($$ works) for it to count as in-flight —
+# inflight_count() skips dead owners, so a made-up pid here would silently test nothing.
 mklock() { mkdir -p "$LOCK_DIR/$1.lock"; printf 'pid=%s\ntask=%s\n' "$2" "$1" > "$LOCK_DIR/$1.lock/owner"; }
+# A DIRECTOR pass lock, exactly as ~/ecosystem/scripts/director-awake.sh writes it:
+# same shared dir, a bare `pid` file, no `owner`. Not a crew (GSAI-76).
+mkdirlock() { mkdir -p "$LOCK_DIR/director-$1.lock"; printf '%s\n' "$2" > "$LOCK_DIR/director-$1.lock/pid"; }
 
 fail=0; ok() { echo "  ✓ $1"; }; no() { echo "  ✗ $1" >&2; fail=1; }
 field() { grep -E "^$1=" "$HB" 2>/dev/null | head -1 | cut -d= -f2-; }
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
 
 # ── two tasks in flight -> heartbeat must report inflight=2 ─────────────────────
-mklock HBT-A 111111
-mklock HBT-B 222222
+mklock HBT-A $$
+mklock HBT-B $$
 BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
   bash "$ROOT/dozers/dozer.sh" heartbeat 7 >/dev/null
 
@@ -59,6 +70,53 @@ if ls "$HB".*.tmp >/dev/null 2>&1; then no "leftover .tmp beacon"; else ok "no l
 BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
   bash "$ROOT/dozers/dozer.sh" heartbeat >/dev/null
 [[ "$(field poll)" == 7 ]] && ok "tickless beat preserves poll# (7)" || no "tickless beat lost the tick: got '$(field poll)'"
+
+# ── INFLIGHT counts CREW locks only (GSAI-76) ──────────────────────────────────
+# $LOCK_DIR is shared with the Directors' awake passes. Counting their locks made the
+# beacon publish `crews + live Director passes`, and heartbeat-check gated its stall
+# alarm on that number — inventing busy slots on 2026-09-08 (`inflight=4` against ONE
+# real crew) and, in the mirror case, able to reach `fanout` on Director locks alone and
+# silence a genuine stall. A dead owner is excluded for the same reason: a crashed crew
+# is the reaper's job, and counting its lock holds the beacon high after work stopped.
+mkdirlock chief $$
+mkdirlock dev-director $$
+mkdirlock mktg-director $$
+BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
+  bash "$ROOT/dozers/dozer.sh" heartbeat 8 >/dev/null
+[[ "$(field inflight)" == 2 ]] && ok "3 Director locks beside 2 crews -> inflight stays 2 (a pass is not a crew)" \
+  || no "Director locks leaked into inflight: got '$(field inflight)' want 2"
+
+mklock HBT-DEAD 999999   # a crashed crew: lock present, owner pid long gone
+BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
+  bash "$ROOT/dozers/dozer.sh" heartbeat 9 >/dev/null
+[[ "$(field inflight)" == 2 ]] && ok "a stale lock (dead owner) is not in-flight work -> inflight stays 2" \
+  || no "dead-owner lock counted as in-flight: got '$(field inflight)' want 2"
+
+# ── an owner-less crew lock must NOT be a crash (GSAI-76 review) ──────────────
+# run_one writes `owner` with `> … 2>/dev/null || true`, so a tolerated write
+# failure (or a mkdir→write race, or any future non-Director actor in the shared
+# dir) leaves a crew-named lock with NO owner behind — permanently. Under
+# set -euo pipefail an unguarded `grep … | head | cut` on the missing file failed
+# the whole pipeline through `cut`, failed the assignment, and aborted the shell:
+# silently in the ticker (stderr discarded — frozen beacon, watchdog false-alarm)
+# and fatally in the main loop's once-per-poll beat. This row exercises exactly
+# that case: the beat must SURVIVE, count it as 0, and keep the Beacon honest.
+mkdir -p "$LOCK_DIR/HBT-NO-OWNER.lock"   # crew-named lock, NO owner file
+if BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
+   bash "$ROOT/dozers/dozer.sh" heartbeat 9 >/dev/null 2>&1; then
+  [[ "$(field inflight)" == 2 ]] && ok "owner-less crew lock: the beat survives and skips it (inflight stays 2)" \
+    || no "owner-less lock leaked into inflight: got '$(field inflight)' want 2"
+else
+  no "heartbeat DIED on an owner-less crew lock — set -euo pipefail abort through the grep|cut pipeline"
+fi
+
+# With every crew gone the beacon must read 0 even while the Directors are mid-pass —
+# that zero is what lets the watchdog see an idle engine sitting on queued work.
+rm -rf "$LOCK_DIR"/HBT-*.lock
+BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
+  bash "$ROOT/dozers/dozer.sh" heartbeat 10 >/dev/null
+[[ "$(field inflight)" == 0 ]] && ok "Director locks alone -> inflight=0 (no crew is running)" \
+  || no "Director-only lock dir should read 0: got '$(field inflight)'"
 
 # ── zero locks -> inflight=0 ────────────────────────────────────────────────────
 rm -rf "$LOCK_DIR"/*.lock

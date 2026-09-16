@@ -41,12 +41,47 @@ HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-$POLL_SECONDS}"
 
 # Snapshot count of in-flight run-locks (tasks claimed across every Dozer on this host,
 # since LOCK_DIR is shared). Cheap directory scan, no backend call.
-# LOCK_DIR also holds other holders' mutexes (the Directors' `director-<role>.lock`),
-# which are NOT crews — counting them inflated the heartbeat's in-flight number by up to
-# one per Director. A run-lock is the one carrying an `owner` file (GSAI-96).
+#
+# CREW locks only (GSAI-76). $LOCK_DIR is shared with the DIRECTORS: every awake pass
+# takes a `director-<role>.lock` there as its own single-pass mutex
+# (~/ecosystem/scripts/director-awake.sh), storing a bare `pid` file, never an `owner`.
+# Counting them made the beacon publish `inflight = crews + live Director passes`, and
+# the watchdog gates on that number. Observed 2026-09-08 23:24Z: the beacon said
+# `inflight=4` while exactly ONE crew was running (BRD-82), and heartbeat-check alarmed
+# on the fiction. The dangerous direction is the mirror: three Director locks plus two
+# stuck crews reach `fanout=5`, the not-dispatching gate `inflight < FANOUT` goes false,
+# and a REAL stall reports nothing.
+#
+# GSAI-96 added a second, more general exclusion alongside the name match: skip any
+# lock with no `owner` file, not only ones literally named `director-*.lock`. That
+# survives a foreign mutex under a different name; keeping BOTH guards (rather than
+# swapping one for the other) also covers the case GSAI-76's original comment worried
+# about — a `director-*.lock` that someday grows an `owner` file — since the name match
+# still excludes it even then. It is also now SAFE to rely on the owner-file guard,
+# because run_one() no longer tolerates a failed `owner` write (it fails the run and
+# drops the lock instead); the old "owner-less lock could still be one of OURS, mid-race"
+# case this file used to hedge against cannot happen post-GSAI-96.
+#
+# So three exclusions, all at the source rather than at the reader:
+#   · `director-*.lock` by name — not a crew, never was.
+#   · no `owner` file at all — not a crew lock (a Director's, or any other holder's).
+#   · an `owner` file whose pid is dead — a crashed crew is the reaper's problem, not
+#     in-flight work; counting it holds the beacon high long after the work stopped.
 inflight_count() {
-  local n=0 lock; shopt -s nullglob
-  for lock in "$LOCK_DIR"/*.lock; do [[ -f "$lock/owner" ]] && n=$((n+1)); done
+  local n=0 lock pid; shopt -s nullglob
+  for lock in "$LOCK_DIR"/*.lock; do
+    case "${lock##*/}" in director-*.lock) continue ;; esac
+    [[ -f "$lock/owner" ]] || continue
+    # The || true is load-bearing (GSAI-76 review): this script runs under
+    # `set -euo pipefail`, so a no-match grep would fail the whole pipeline through
+    # the trailing cut, fail the assignment, and abort the shell. Verified live: with
+    # an owner-less lock present, the unguarded line exits 2 with no output. In the
+    # ticker subshell that failure is SILENT (stderr discarded), the beacon freezes,
+    # and the watchdog false-alarms engine-stalled — the exact failure class this fix
+    # exists to kill.
+    pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then n=$((n+1)); fi
+  done
   shopt -u nullglob; printf '%s' "$n"
 }
 
@@ -66,7 +101,10 @@ beacon_epoch() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || e
 # pretends to be a new poll cycle.
 heartbeat() {
   local tick="${1:-}"
-  [[ -z "$tick" ]] && tick="$(grep -E '^poll=' "$HEARTBEAT_FILE" 2>/dev/null | head -1 | cut -d= -f2)"
+  # Same pipefail guard as inflight_count: a missing beacon or a beacon without
+  # a poll= line makes grep exit 1, and under set -e the failed assignment would
+  # abort the whole beacon path (ticker AND the main-loop beat at every poll).
+  [[ -z "$tick" ]] && tick="$( { grep -E '^poll=' "$HEARTBEAT_FILE" 2>/dev/null || true; } | head -1 | cut -d= -f2)"
   [[ -z "$tick" ]] && tick=0
   mkdir -p "$(dirname "$HEARTBEAT_FILE")" 2>/dev/null || true
   local tmp="$HEARTBEAT_FILE.$BASHPID.tmp"

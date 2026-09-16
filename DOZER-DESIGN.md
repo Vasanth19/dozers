@@ -1,95 +1,108 @@
-# GSAI-73 — design: the alarm NOTE in org/config.yaml is stale — the Buzz hop is live and speaks as Guzz
+# GSAI-76 — design: heartbeat-check counts Director locks as crews — false alarms now, a silenced real stall later
 
-**Task:** `org/config.yaml`'s alarm-block NOTE (pre-fix lines 109-114) still described
-the **2026-09-03** state: `BUZZ_PRIVATE_KEY` deliberately cleared from `buzz.env`,
-the Buzz hop skipped, Linear carrying the alarm alone. That stopped being true on
-**2026-09-08**, when Guzz's key was recovered from the macOS login keychain back
-into the vault — `heartbeat-check.sh creds` has reported "Buzz hop: CAN DELIVER ✓"
-since. A config comment that tells an operator a live alarm channel is dead is worse
-than no comment: the operator who reads it will "fix" a working channel or, worse,
-stop trusting the config as a source of truth.
+**Task:** `$LOCK_DIR` (`~/.dozers/locks/`) is shared ground. Every Director awake
+pass (`~/ecosystem/scripts/director-awake.sh`) takes a `director-<role>.lock`
+there as its own single-pass mutex — a directory holding a bare `pid` file, no
+`owner`. But the beacon emitter (`dozer.sh inflight_count()`) counted **every**
+`*.lock` as in-flight work, and the watchdog's not-dispatching gate
+(`heartbeat-check.sh`) gated on the beacon's `inflight=`. Together they counted a
+Director pass as a claimed crew. It lied in **both** directions:
 
-**Repo:** dozers (main-only). **Files touched:** `org/config.yaml` (the NOTE
-rewrite) and `dozers/heartbeat-check.sh` (one reporting line in `creds`).
-Nothing else — no behavior change, no new wiring.
+- **False alarm** (observed 2026-09-08 23:24Z): beacon said `inflight=4` while
+  exactly ONE crew ran (BRD-82) — three of the "crews" were Director locks, and
+  the watchdog paged on the fiction.
+- **The dangerous mirror** (reproduced live while fixing): 4 real crews + 2
+  Director locks → beacon `inflight=6` against `fanout=5`. The old gate
+  `inflight < FANOUT` is false — a poll frozen 30 cycles with 6 greenlit issues
+  queued reports **nothing**. A monitor that goes silent on a real outage is
+  worse than no monitor.
+
+**Repo:** dozers (main-only). **Files touched:** `dozers/dozer.sh`
+(`inflight_count()`), `dozers/heartbeat-check.sh` (`live_crews()`, the stall gate
+in `assess()`), `tests/heartbeat-test.sh`, `tests/heartbeat-check-test.sh`.
 
 > **Provenance note:** the implementation for this task was already committed on
-> this branch (`d53b269`) by the prior session before this design was written.
+> this branch (`47608f0`) by the prior session before this design was written.
 > This document records the design that commit embodies; review of the committed
-> diff found nothing that must change, so the code stands as-is.
+> diff and a full test run found nothing that must change, so the code stands
+> as-is.
 
 ---
 
-## What the NOTE must now say (the current truth)
+## Approach — two fixes at two layers, both about who counts
 
-Four facts, none of which the old NOTE carried:
+**Layer 1 — the emitter stops over-reporting at the source.**
+`dozer.sh inflight_count()` walks the shared lock dir but now applies two
+exclusions, both with a reason:
 
-1. **The hop is LIVE and delivers signed as Guzz** — the Dev-Director identity,
-   which is the Dozer's own voice. History stays in the comment, compressed to
-   two lines: key deliberately cleared 2026-09-03 (identity moved into Buzz
-   Desktop as a managed agent), recovered 2026-09-08 out of the login keychain
-   (service `buzz-desktop`, account `secrets`, stored as `agent:<pubkey> → nsec`)
-   back into `buzz.env`.
-2. **The relay is CLOSED, so the key alone is not enough.** Guzz is only a
-   channel member; publishing 403s `relay_membership_required`. `buzz.env` also
-   carries **`BUZZ_AUTH_TAG`** — a NIP-OA attestation signed by the *owner* key
-   delegating relay membership to Guzz. Events are still authored and signed
-   **by Guzz**; the tag only proves the owner authorized the agent. This was
-   never written down anywhere before — it is the part an operator cannot
-   rediscover from the code.
-3. **How the tag reaches the process:** the whole vault file is sourced under
-   `set -a` in `heartbeat-check.sh`, so the tag reaches the `buzz` child without
-   any code knowing about it. Consequence: **re-mint the tag if the owner key
-   rotates**, or the hop starts 403ing with no visible change in the key check.
-4. **The old rule survives unchanged:** do NOT repoint `alarm_env` at
-   `buzz-owner.env` — that is Vasanth's own key, and an alarm signed as him is a
-   lie about who is speaking. Guzz has his own identity precisely so the watchdog
-   can speak as itself.
+1. `director-*.lock` → skipped by **name pattern**. Not a crew, never was.
+2. A lock whose `owner` file's `pid` is **dead** (`kill -0` fails, or the lock
+   carries no live pid at all) → not in-flight work. A crashed crew is the
+   reaper's job; counting its corpse holds the beacon high long after the work
+   stopped, which would mask the idle-capacity invariant from the other side.
 
-## The `creds` companion: print the auth tag
+The pid is read through `grep | head | cut` (never a bare `cat`) so a missing or
+owner-less lock yields `""` instead of tripping `set -e`.
 
-The NOTE is prose; `heartbeat-check.sh creds` is the command an operator actually
-runs before trusting the alarm. It already prints the vault path, channel,
-mention, `BUZZ_RELAY_URL`/`BUZZ_PRIVATE_KEY` export state, and the `buzz` CLI —
-but the load-bearing `BUZZ_AUTH_TAG` was invisible, so a closed relay could look
-fully armed and still 403 at the moment it was needed.
+**Layer 2 — the reader stops trusting the beacon for the busy-slot count.**
+`heartbeat-check.sh live_crews()` already counted locks by live owner pid
+(`HB_ASSUME_CREWS` override retained for tests); it now also skips
+`director-*.lock` by **name** — not merely by the accident that a Director lock
+happens to carry no `owner` file today. The exclusion must survive a Director
+lock that grows an `owner` file, because this count is what the stall gate
+trusts.
 
-`creds` gains one line after the key loop:
+The not-dispatching gate in `assess()` then compares **`$crews`** (the local,
+pid-verified count) against `fanout` instead of the beacon's `inflight=`:
 
-- tag present → `auth tag : present ✓ (NIP-OA — closed-relay membership via the owner)`
-- tag absent → `auth tag : not set — fine on an open relay; a CLOSED one 403s relay_membership_required`
+```
+old: frozen && [ "$inflight" -lt "$FANOUT" ]        # trusted the emitter's tally
+new: frozen && [ "$crews"  -lt "$FANOUT" ]          # counts the locks itself
+```
 
-**It deliberately does NOT flip the verdict.** The hop's green/red is keyed on
-`BUZZ_PRIVATE_KEY` + relay URL + CLI, and that stays: an open relay needs no tag,
-so a missing tag must not mark a working hop red. The line exists so an
-unannounced 403 at alarm time — the exact failure `creds` exists to rule out —
-is visible before the outage, without breaking the open-relay case.
+The watchdog and the engine are on the same host, so the lock dir is just as
+local as the beacon file — reading locks directly costs nothing extra and
+removes the single point of fiction. **The beacon's `inflight=` still rides in
+the alarm detail** — `crews=2 of fanout=5 (beacon reports inflight=5)` — so any
+future drift between what the engine publishes and what the locks say is
+visible *in the alarm itself* rather than inferred from its silence.
 
 ## Edge cases
 
 | Case | Behavior |
 |---|---|
-| Open relay, no `BUZZ_AUTH_TAG` | Verdict unchanged (CAN DELIVER ✓); line says "fine on an open relay" |
-| Closed relay, tag present | Line confirms ✓ — matches the live config today |
-| Closed relay, tag missing | Line names the 403 (`relay_membership_required`) but verdict stays green — the operator reads the line, not just the verdict |
-| Owner key rotates, tag goes stale | NOTE says re-mint it; `creds` shows the tag state but cannot verify freshness — the failure mode at publish time, out of scope here |
-| `buzz` CLI absent / key absent | Untouched — existing optional-hop logic (quiet skip, verdict "skipped (optional)") |
-| Secrets in output | None — the line prints presence/absence only, never the tag value |
+| Director locks present, 0 real crews | `crews=0` — the not-dispatching alarm still fires (a Director pass is not a crew) |
+| Director locks pushing the **beacon** to `fanout` | Gate reads `crews`, not `inflight` — a real stall still alarms; the beacon value is shown beside the real count |
+| Dead-owner crew lock (crashed crew) | Excluded by both the emitter and the reader — the reaper owns it; counting it would buy the engine false silence |
+| Director lock that someday grows an `owner` file | Still excluded — the skip is by **name** (`director-*.lock`), not by the missing-`owner` accident |
+| Owner-less / legacy lock in the emitter | `grep\|head\|cut` yields `""` → not counted; no `set -e` trip, no crash in the heartbeat path |
+| Full wave (crews == fanout, frozen poll) | Still legitimate → silent, unchanged |
+| Stale beacon whose only "crews" are Director locks | `engine-stalled` still fires — Director locks don't buy silence on the staleness row either |
+| `HB_ASSUME_CREWS` test override | Unchanged — still short-circuits `live_crews()` for rows that aren't about the lock scan |
 
 ## How it gets tested
 
-`tests/heartbeat-check-test.sh` already pins the alarm-hop logic; the committed
-change adds no behavior to pin — only an unconditional print of a presence
-check. The full suite was run on this branch after the fix: **PASS** (all cases
-green, including "creds reports the Buzz hop as live when its key is present"
-and "fails loudly when NEITHER channel can deliver"). No other test asserts on
-NOTE text or `creds` output shape (verified by grep — the only "Buzz hop"
-reference in tests is the pre-existing skip case, which is still true behavior).
+Both suites were run on this branch after the fix — **PASS** (all green):
+
+- `tests/heartbeat-test.sh` pins the **emitter**: 3 Director locks beside 2
+  crews → `inflight=2`; a dead-owner lock → still 2; Director locks alone →
+  `inflight=0`; plus every pre-existing row (atomic write, tick, mid-drain beat).
+- `tests/heartbeat-check-test.sh` pins the **reader**, against the REAL lock
+  scan (no `HB_ASSUME_CREWS`): Director locks + 0 crews still alarms (`crews=0`);
+  Director locks pushing the beacon to `fanout` do **not** silence a real stall
+  (`crews=2`); a stale beacon is not excused by Director locks
+  (`engine-stalled` fires); and the alarm body carries
+  `(beacon reports inflight=N)` beside the real count so drift stays visible.
+  All pre-existing rows (alarm raise/clear/retry, Buzz hop, plist, creds)
+  remain green.
 
 ## Risk
 
-Minimal. A comment rewrite cannot break runtime; the `creds` addition is a
-read-only `printf` on an env-var presence check placed *after* the verdict
-inputs are gathered, so it cannot alter any existing branch. The only real risk
-was leaving the stale NOTE in place — an operator debugging a silent alarm being
-sent down the wrong path by the config itself.
+Low. Both changes narrow a count (skip Director locks, skip dead owners) — they
+can only make the watchdog *more* sensitive to genuine idle capacity, never
+less. The one behavior deliberately kept is silence on a **full wave**
+(`crews == fanout`) with a frozen poll, which stays legitimate. The residual
+risk is naming: if a future crew ever names its lock `director-*`, it would be
+excluded — but crew locks are keyed by task id (e.g. `LIVE-A`), so the collision
+would require a Linear issue literally named `director-*`, which the tests
+would surface on the next run.

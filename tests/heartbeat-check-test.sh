@@ -141,15 +141,19 @@ has "$out" "Buzz hop skipped" && ok "with no BUZZ_PRIVATE_KEY the Buzz hop is sk
 # ── ROW: alive but NOT DISPATCHING (poll frozen + idle slots + queued work) ───
 # The beacon is fresh and a crew is live — every older row stays silent here. The
 # poll tracker in the state file is what catches it: poll unchanged for > 10 cycles,
-# inflight < fanout, and greenlit work queued.
+# live crews < fanout, and greenlit work queued.
 beacon 5 30 $$ 1 42; seed_poll 42 400          # poll=42 first seen 400s ago = 13 cycles of 30s
 out="$(run check HB_ASSUME_CREWS=1 HB_ASSUME_READY=6)"
-if has "$out" "not-dispatching" && has "$out" "inflight=1 of fanout=5" && has "$out" "6 greenlit issue(s) queued"; then
-  ok "poll frozen 13 cycles + inflight<fanout + 6 queued -> ALARM (alive but not dispatching)"
+if has "$out" "not-dispatching" && has "$out" "crews=1 of fanout=5" && has "$out" "6 greenlit issue(s) queued"; then
+  ok "poll frozen 13 cycles + crews<fanout + 6 queued -> ALARM (alive but not dispatching)"
 else no "not-dispatching row did not alarm; got: $out"; fi
-beacon 5 30 $$ 5 42; seed_poll 42 400          # inflight == fanout: a full wave, legitimate
+# The beacon's own tally rides along as reported-vs-actual, so a future drift between
+# what the engine publishes and what the locks say is visible IN the alarm (GSAI-76).
+has "$out" "(beacon reports inflight=1)" && ok "…and the alarm reports the beacon's inflight beside the real crew count" \
+  || no "alarm should carry the beacon value for comparison; got: $out"
+beacon 5 30 $$ 5 42; seed_poll 42 400          # crews == fanout: a full wave, legitimate
 out="$(run check HB_ASSUME_CREWS=5 HB_ASSUME_READY=6)"
-[ -z "$out" ] && ok "poll frozen but inflight == fanout (full wave) -> silent" || no "full wave should be silent; got: $out"
+[ -z "$out" ] && ok "poll frozen but crews == fanout (full wave) -> silent" || no "full wave should be silent; got: $out"
 beacon 5 30 $$ 1 42; seed_poll 42 400
 out="$(run check HB_ASSUME_CREWS=1 HB_ASSUME_READY=0)"
 [ -z "$out" ] && ok "poll frozen + idle slots but NOTHING queued -> silent" || no "empty queue should be silent; got: $out"
@@ -176,6 +180,45 @@ rm -f "$CALLS"; beacon 5 30 $$ 1 7; seed_poll 7 400
 run check HB_ASSUME_CREWS=1 >/dev/null
 grep -q '^count-ready' "$CALLS" 2>/dev/null && ok "a frozen poll with idle slots asks Linear for the queue (count-ready)" \
   || no "count-ready should have been called; calls=$(cat "$CALLS" 2>/dev/null)"
+
+# ── GSAI-76: Director locks share $LOCK_DIR and are NOT crews ─────────────────
+# ~/ecosystem/scripts/director-awake.sh takes `director-<role>.lock` in the same dir as
+# its single-pass mutex, holding a bare `pid` file (no `owner`). The engine used to count
+# every *.lock into the beacon's `inflight=`, and this gate used to read that number —
+# so a Director pass inflated the busy-slot count. It lied twice over: it invented busy
+# slots (the 2026-09-08 23:24Z false alarm: `inflight=4`, one real crew), and — the
+# reason this matters — enough Director locks could reach `fanout` and SILENCE a real
+# stall. Both directions are pinned here, against the REAL lock scan (no HB_ASSUME_CREWS).
+dirlock() { mkdir -p "$LOCKS/director-$1.lock"; printf '%s\n' "$2" > "$LOCKS/director-$1.lock/pid"; }
+crewlock() { mkdir -p "$LOCKS/$1.lock"; printf 'pid=%s\ntask=%s\nlane=dev\n' "$2" "$1" > "$LOCKS/$1.lock/owner"; }
+
+rm -rf "$LOCKS"/*.lock; rm -f "$STATE"
+dirlock chief "$$"; dirlock dev-director "$$"; dirlock mktg-director "$$"
+beacon 5 30 $$ 3 42; seed_poll 42 400          # beacon over-reports inflight=3; 0 real crews
+out="$(run check HB_ASSUME_READY=6)"
+if has "$out" "not-dispatching" && has "$out" "crews=0 of fanout=5" && has "$out" "(beacon reports inflight=3)"; then
+  ok "3 Director locks + 0 live crews -> crews=0, alarm still fires (a Director pass is not a crew)"
+else no "Director locks were counted as crews; got: $out"; fi
+
+# The silencing case, which is the dangerous one: Director locks push the BEACON to
+# fanout while only two crews actually run. Gating on the beacon here reports nothing.
+rm -f "$STATE"
+crewlock LIVE-A "$$"; crewlock LIVE-B "$$"
+beacon 5 30 $$ 5 42; seed_poll 42 400          # inflight=5 == fanout, but crews=2
+out="$(run check HB_ASSUME_READY=6)"
+if has "$out" "not-dispatching" && has "$out" "crews=2 of fanout=5" && has "$out" "(beacon reports inflight=5)"; then
+  ok "Director locks pushing the beacon to fanout do NOT silence a real stall (crews=2 < 5)"
+else no "a real stall was silenced by the beacon's inflated inflight; got: $out"; fi
+
+# The same exclusion has to hold for the OTHER rows that buy silence with a crew count:
+# a stale beacon whose only "crews" are Director locks is a stall, not a long task.
+rm -rf "$LOCKS"/*.lock; rm -f "$STATE"
+dirlock chief "$$"; dirlock ops-director "$$"
+beacon 200 30 $$
+out="$(run check)"
+has "$out" "engine-stalled" && ok "a stale beacon is NOT excused by Director locks (engine-stalled still fires)" \
+  || no "Director locks bought the stalled engine silence; got: $out"
+rm -rf "$LOCKS"/*.lock; rm -f "$STATE"
 
 # ── live crews are counted by LIVE owner pid, not by lock presence ─────────────
 rm -f "$STATE"; beacon 200 30 $$
