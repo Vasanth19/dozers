@@ -21,14 +21,17 @@
 #   beacon missing + no loop process                    -> silent (nothing is meant to run)
 #   beacon names a DEAD pid on this host                -> ALARM  engine process gone
 #   beacon stale (age >= 3x its cadence) + no live crew -> ALARM  engine stalled
-#   poll= frozen > 10 cycles + inflight < fanout
+#   poll= frozen > 10 cycles + live crews < fanout
 #                            + greenlit work queued     -> ALARM  alive but not dispatching
 #   beacon stale + a live crew is holding a run-lock    -> silent, but logged (long task)
 #   beacon fresh                                        -> silent
 #
 # Staleness is measured against the cadence the beacon PUBLISHES (`every=`), and the
 # slot count against `fanout:` in org/config.yaml — nothing is duplicated here, so the
-# emitter, the engine and the watchdog cannot drift apart.
+# emitter, the engine and the watchdog cannot drift apart. Busy slots, though, are
+# counted HERE from the run-locks (live_crews) rather than read off the beacon: the
+# lock dir is shared with the Directors, and trusting the emitter's tally let Director
+# passes masquerade as crews (GSAI-76).
 #
 # ── Where the alarm goes ─────────────────────────────────────────────────────────
 # PRIMARY: Linear. The alarm IS a label — `board:to_review` on the standing tracking
@@ -138,11 +141,17 @@ engine_alive() {
 # How many crews are genuinely running right now: run-locks whose owner pid is alive.
 # A stale lock left by a crashed crew must not buy the engine silence — that is the
 # reaper's problem, and counting it here would mask a real stall.
+#
+# $LOCK_DIR is shared with the DIRECTORS, whose awake passes take `director-<role>.lock`
+# as their own mutex (GSAI-76). Those are skipped BY NAME, not merely by the fact that
+# they carry no `owner` file today — the exclusion has to survive a Director lock that
+# grows one, because this count is what the stall gate below trusts.
 live_crews() {
   if [ -n "${HB_ASSUME_CREWS:-}" ]; then printf '%s' "$HB_ASSUME_CREWS"; return 0; fi
   local n=0 lock pid
   for lock in "$LOCK_DIR"/*.lock; do
     [ -d "$lock" ] || continue
+    case "${lock##*/}" in director-*.lock) continue ;; esac
     pid="$(field "$lock/owner" pid)"
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && n=$((n+1))
   done
@@ -218,14 +227,23 @@ assess() {
 
   # Alive (beating) but not dispatching: the poll counter has not moved for more than
   # STALL_CYCLES cadences while slots sit idle AND greenlit work is queued. A full wave
-  # (inflight == fanout) with a frozen poll is legitimate; idle capacity beside queued
+  # (crews == fanout) with a frozen poll is legitimate; idle capacity beside queued
   # work is the invariant that should never hold, whatever breaks it (GSAI-37 is the
   # known cause — this only detects it after the fact).
-  if [ "$frozen_cycles" -gt "$STALL_CYCLES" ] && [ "$inflight" -lt "$FANOUT" ]; then
+  #
+  # The idle-capacity test reads $crews — the LOCAL, pid-verified count from live_crews()
+  # — and NOT the beacon's `inflight=`. Until GSAI-76 it gated on the beacon, which the
+  # engine computed over every lock in the shared dir, Director passes included. That
+  # number lied in both directions: it invented busy slots (the 2026-09-08 23:24Z false
+  # alarm claimed `inflight=4` against one real crew) and, worse, it could reach `fanout`
+  # on Director locks alone and silence a genuine stall. The beacon value is still
+  # REPORTED below, beside the real count, so a future drift is visible in the alarm
+  # itself rather than inferred from it.
+  if [ "$frozen_cycles" -gt "$STALL_CYCLES" ] && [ "$crews" -lt "$FANOUT" ]; then
     queued="$(queued_work)"
     if [ -n "$queued" ] && [ "$queued" -gt 0 ]; then
       VERDICT=alarm; REASON="not-dispatching"
-      DETAIL="beacon is fresh (beat ${age}s ago) but poll=${poll} has not moved for ${frozen_for}s (${frozen_cycles} cycles of ${cadence}s) with inflight=${inflight} of fanout=${FANOUT} and ${queued} greenlit issue(s) queued. The engine is alive but not claiming work."
+      DETAIL="beacon is fresh (beat ${age}s ago) but poll=${poll} has not moved for ${frozen_for}s (${frozen_cycles} cycles of ${cadence}s) with crews=${crews} of fanout=${FANOUT} (beacon reports inflight=${inflight}) and ${queued} greenlit issue(s) queued. The engine is alive but not claiming work."
       return
     fi
   fi

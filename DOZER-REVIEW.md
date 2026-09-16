@@ -1,60 +1,75 @@
 VERDICT: PASS
 
-Reviewed the develop..HEAD diff against the spec (GSAI-73: the `org/config.yaml`
-alarm-block NOTE is stale — the Buzz hop is live and delivers as Guzz) and the
-architect pass's DOZER-DESIGN.md, then re-verified every load-bearing claim and
-ran the repo's full suite from this worktree.
+Re-review after the FAIL (c7f0541). The branch now carries the build (47608f0),
+the architect's design (d37a012), that FAIL, and the fix commit (d0c8f69) —
+which closes every item the FAIL demanded, and nothing else. Verified the fix
+in the tree, probed the crash path directly, and re-ran the tests from this
+worktree.
 
-## What shipped, and scope
+## Prior FAIL — closed, item by item
 
-Diff is exactly the design's file set and nothing else: `org/config.yaml` (the
-NOTE rewrite — comment-only, zero YAML values changed) + `dozers/heartbeat-check.sh`
-(+7: one presence-only print + its comment) + the two process documents. No
-behavior change anywhere else in the engine.
+1. **Required fix (the `set -euo pipefail` abort in `inflight_count`)** — done
+   (dozer.sh:71): `pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"`.
+   The guard is exactly the FAIL's suggested shape, and its in-code comment
+   documents *why* it is load-bearing (silent ticker death → frozen beacon →
+   watchdog false-alarm — the failure class this task exists to kill).
+2. **Required test row (non-director lock, no `owner`)** — added and green:
+   `heartbeat-test.sh` now creates `HBT-NO-OWNER.lock`, asserts the beat
+   SURVIVES and `inflight` stays 2. This was the exact coverage gap the FAIL
+   identified ("they pass because the crashing case is unexercised").
+3. **The companion suggestion (same guard on `heartbeat()`'s tick read,
+   dozer.sh:96)** — also done, so the beacon path is uniformly crash-proof
+   rather than crash-proof-by-accident, as the FAIL asked.
 
-## Spec satisfaction and design fidelity — verified, not assumed
+The fix commit touches only `dozers/dozer.sh` (+16) and `tests/heartbeat-test.sh`
+(+22) — no scope creep, nothing else disturbed.
 
-1. **The NOTE now states the current truth** (org/config.yaml:117-131): hop
-   LIVE and signed as Guzz; the compressed 2026-09-03 → 2026-09-08 key history
-   (cleared → recovered from the login keychain into the vault); the closed-relay
-   reality (Guzz is only a channel member; `BUZZ_AUTH_TAG` is the NIP-OA owner
-   attestation that makes publishing possible; re-mint on owner-key rotation);
-   and the preserved rule against repointing `alarm_env` at buzz-owner.env.
-2. **The NOTE's claims are true LIVE, not just on paper.** This review read the
-   vault directly (names only, never values): `buzz.env` holds `BUZZ_RELAY_URL`,
-   `BUZZ_PRIVATE_KEY`, `BUZZ_PUBLIC_KEY`, and `BUZZ_AUTH_TAG` — so "the hop is
-   live and the tag is in the vault" is fact, and `buzz-owner.env` really exists,
-   making the do-not-repoint warning guard an actual file.
-3. **The mechanism claim holds in code.** The vault is sourced under `set -a`
-   (heartbeat-check.sh:90-93 — its own comment calls that load-bearing), so
-   `BUZZ_AUTH_TAG` reaches the `buzz messages send` child (heartbeat-check.sh:284)
-   with zero code changes — exactly what the NOTE now tells an operator.
-4. **The `creds` addition matches the design verbatim** (heartbeat-check.sh:359-365):
-   prints presence only — never the tag value — consistent with the function's
-   no-secrets contract (the test's leak assertions stay green); placed after the
-   key loop; and it deliberately does NOT flip the verdict (`buzz_ok` untouched —
-   an open relay needs no tag, so a missing tag must not mark a working hop red).
-5. **No collateral assertions break.** Grep confirms nothing else asserts on NOTE
-   text or `creds` output shape; the only "Buzz hop" assertions in tests are the
-   pre-existing optional-skip and substring-verdict cases, all unaffected.
+## Independent verification (not just trusting the diff)
+
+- **Re-probed the crash path live:** under `set -euo pipefail`, the unguarded
+  `grep | head | cut` on an owner-less lock still exits 2 (the FAIL's claim
+  reproduces), and the guarded form survives with `pid=""` — the fix is real,
+  not cosmetic.
+- **Reader immunity re-confirmed:** `heartbeat-check.sh` runs `set -uo pipefail`
+  without `-e` (line 64), so its identical `field()` pattern cannot abort it.
+- **Both directions of the Director-lock lie stay pinned** in the tree: emitter
+  (3 Director locks beside 2 crews → `inflight=2`; dead owner excluded;
+  owner-less lock survives; Director-only → 0) and reader (Director locks + 0
+  crews still alarms `crews=0`; Director locks pushing the beacon to `fanout`
+  do NOT silence a real stall `crews=2`; a stale beacon is not excused by
+  Director locks). The gate reads the local pid-verified `$crews`, and the alarm
+  carries `(beacon reports inflight=N)` beside the real count for drift
+  visibility — matching the design's Layer 1 / Layer 2 verbatim.
+- **No collateral exposure:** of the other suites, only `dozer-fanout-test.sh`
+  asserts on beacon `inflight` — with real live crews, which the pid-verified
+  count still counts. `reaper-test.sh`'s dead-pid locks are the reaper's own
+  fixture, untouched.
 
 ## Test evidence — run by this review
 
-`make test` from this worktree: **run-all: PASS — 33/33 in 650s**, including
-`heartbeat-check-test.sh` (23s) with its creds cases: green on Linear alone,
-Buzz hop reported live when its key is present, loud failure when NEITHER
-channel can deliver, and no key value ever printed.
+- `tests/heartbeat-test.sh`: **PASS** (20/20 rows, standalone re-run).
+- `tests/heartbeat-check-test.sh`: **PASS** (46/46 rows, standalone re-run).
+- `tests/run-all.sh`: **32/33 in 697s**. The single failure,
+  `dev-lane-timeout-per-repo-test.sh` ("grandchild sleep survived"), is a
+  kill-race flake in dev-lane timeout group-kill logic — zero code shared with
+  this diff — and **passes cleanly on immediate re-run** (all rows green,
+  including the one that failed). Not a branch defect; worth a flake-retry
+  discussion in the repo someday, not here.
 
 ## Notes (non-blocking)
 
-- The "auth tag: present ✓" branch has no test fixture (fixture vaults carry no
-  tag, so the "not set" branch is what the green suite exercises). A presence-only
-  printf behind a one-line `if` — negligible risk, not worth fixture plumbing.
-- The tag's *freshness* cannot be checked by `creds` (only presence); the NOTE's
-  re-mint-on-rotation warning is the documented mitigation. Out of scope here.
-- Provenance, openly disclosed in the design: the implementation (`d53b269`)
-  predates the design pass (`bbb692e`); this review confirms the committed code
-  matches the design as written. The two nits the prior review pass raised were
-  closed in 5ffd733 (the `alarm_env` inline comment now names `BUZZ_AUTH_TAG`;
-  the auth-tag print now sits after the key loop) — both verified in the current
-  tree.
+- **DOZER-DESIGN.md's mechanism sentence is now slightly stale:** it still says
+  the pid is "read through `grep | head | cut` … instead of tripping `set -e`"
+  (lines 44-45, and the matching edge-case row). Pre-fix, that claim was
+  empirically false — which is precisely why d0c8f69 added `|| true`. The
+  *behavior* the design promises (owner-less lock → `""`, no crash) now holds,
+  so this is a wording drift in a frozen process document, not a defect; the
+  in-code comment in dozer.sh records the true mechanism.
+- The emitter's own `mklock` fixtures now use live pids (`$$`) where they
+  previously used fake dead ones (111111/222222) — a correctness upgrade the
+  dead-owner exclusion forced, since a fixture with a dead pid would have
+  silently tested nothing under the new logic.
+
+Everything the FAIL review held correct (exclusions, gate, alarm wording, test
+rows, incident comments) stands unchanged and verified. The one blocking defect
+is fixed at the source, pinned by the test row that was missing. Ship it.
