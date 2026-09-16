@@ -1,75 +1,97 @@
-VERDICT: PASS
+VERDICT: FAIL
 
-Re-review after the FAIL (c7f0541). The branch now carries the build (47608f0),
-the architect's design (d37a012), that FAIL, and the fix commit (d0c8f69) —
-which closes every item the FAIL demanded, and nothing else. Verified the fix
-in the tree, probed the crash path directly, and re-ran the tests from this
-worktree.
+# GSAI-96 — review
 
-## Prior FAIL — closed, item by item
+One blocking defect, in `dozer.sh doctor`'s new foreign-locks section. The core
+of the task — the reaper — is correct, well-tested, and matches the design; the
+merge superset with GSAI-76 (`inflight_count` / `live_crews`) is also correct.
+But the diff reintroduces, in a path it touches, the exact failure class this
+task exists to kill, and contradicts two explicit claims in DOZER-DESIGN.md.
 
-1. **Required fix (the `set -euo pipefail` abort in `inflight_count`)** — done
-   (dozer.sh:71): `pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"`.
-   The guard is exactly the FAIL's suggested shape, and its in-code comment
-   documents *why* it is load-bearing (silent ticker death → frozen beacon →
-   watchdog false-alarm — the failure class this task exists to kill).
-2. **Required test row (non-director lock, no `owner`)** — added and green:
-   `heartbeat-test.sh` now creates `HBT-NO-OWNER.lock`, asserts the beat
-   SURVIVES and `inflight` stays 2. This was the exact coverage gap the FAIL
-   identified ("they pass because the crashing case is unexercised").
-3. **The companion suggestion (same guard on `heartbeat()`'s tick read,
-   dozer.sh:96)** — also done, so the beacon path is uniformly crash-proof
-   rather than crash-proof-by-accident, as the FAIL asked.
+## Blocking: `doctor` aborts mid-report on a foreign lock with no `pid` file
 
-The fix commit touches only `dozers/dozer.sh` (+16) and `tests/heartbeat-test.sh`
-(+22) — no scope creep, nothing else disturbed.
+`dozers/dozer.sh:474`:
 
-## Independent verification (not just trusting the diff)
+```bash
+pid="$(head -1 "$lock/pid" 2>/dev/null | tr -dc '0-9')"
+```
 
-- **Re-probed the crash path live:** under `set -euo pipefail`, the unguarded
-  `grep | head | cut` on an owner-less lock still exits 2 (the FAIL's claim
-  reproduces), and the guarded form survives with `pid=""` — the fix is real,
-  not cosmetic.
-- **Reader immunity re-confirmed:** `heartbeat-check.sh` runs `set -uo pipefail`
-  without `-e` (line 64), so its identical `field()` pattern cannot abort it.
-- **Both directions of the Director-lock lie stay pinned** in the tree: emitter
-  (3 Director locks beside 2 crews → `inflight=2`; dead owner excluded;
-  owner-less lock survives; Director-only → 0) and reader (Director locks + 0
-  crews still alarms `crews=0`; Director locks pushing the beacon to `fanout`
-  do NOT silence a real stall `crews=2`; a stale beacon is not excused by
-  Director locks). The gate reads the local pid-verified `$crews`, and the alarm
-  carries `(beacon reports inflight=N)` beside the real count for drift
-  visibility — matching the design's Layer 1 / Layer 2 verbatim.
-- **No collateral exposure:** of the other suites, only `dozer-fanout-test.sh`
-  asserts on beacon `inflight` — with real live crews, which the pid-verified
-  count still counts. `reaper-test.sh`'s dead-pid locks are the reaper's own
-  fixture, untouched.
+`dozer.sh` runs under `set -euo pipefail`. A foreign lock is defined as "no
+`owner` file" — nothing guarantees it has a `pid` file. When it doesn't,
+`head` exits 1, `pipefail` propagates it through `tr` (exit 0), the assignment
+fails, and `set -e` kills `doctor` mid-report.
 
-## Test evidence — run by this review
+**Reproduced on this branch** (temp LOCK_DIR with `director-chief.lock` carrying
+a pid, plus `legacy-crew.lock` — no `owner`, no `pid`):
 
-- `tests/heartbeat-test.sh`: **PASS** (20/20 rows, standalone re-run).
-- `tests/heartbeat-check-test.sh`: **PASS** (46/46 rows, standalone re-run).
-- `tests/run-all.sh`: **32/33 in 697s**. The single failure,
-  `dev-lane-timeout-per-repo-test.sh` ("grandchild sleep survived"), is a
-  kill-race flake in dev-lane timeout group-kill logic — zero code shared with
-  this diff — and **passes cleanly on immediate re-run** (all rows green,
-  including the one that failed). Not a branch defect; worth a flake-retry
-  discussion in the repo someday, not here.
+```
+-- other holders' locks (not ours; never reaped) --
+   director-chief           [not alive pid=12345]
+doctor RC=1          <- legacy-crew never printed; heartbeat, worktrees,
+                        and backend-in-flight sections all lost
+```
 
-## Notes (non-blocking)
+This is precisely the `_field`-aborts-the-sweep bug the design documents as
+failure #1 — missing-file read under `pipefail` → failed assignment → `set -e`
+abort — and the same function already condemns this class three lines below
+(`hevery=` comment: "the health command dying on the exact legacy state you'd
+run it to inspect").
 
-- **DOZER-DESIGN.md's mechanism sentence is now slightly stale:** it still says
-  the pid is "read through `grep | head | cut` … instead of tripping `set -e`"
-  (lines 44-45, and the matching edge-case row). Pre-fix, that claim was
-  empirically false — which is precisely why d0c8f69 added `|| true`. The
-  *behavior* the design promises (owner-less lock → `""`, no crash) now holds,
-  so this is a wording drift in a frozen process document, not a defect; the
-  in-code comment in dozer.sh records the true mechanism.
-- The emitter's own `mklock` fixtures now use live pids (`$$`) where they
-  previously used fake dead ones (111111/222222) — a correctness upgrade the
-  dead-owner exclusion forced, since a fixture with a dead pid would have
-  silently tested nothing under the new logic.
+The state is not hypothetical; three ways to reach it:
 
-Everything the FAIL review held correct (exclusions, gate, alarm wording, test
-rows, incident comments) stands unchanged and verified. The one blocking defect
-is fixed at the source, pinned by the test row that was missing. Ship it.
+1. **Pre-GSAI-96 residue** — an owner-less run-lock from the old best-effort
+   `owner` write (`> "$lock/owner" 2>/dev/null || true`) has no `pid` file
+   either. This diff's own reaper now classifies that residue as `foreign` and
+   (correctly, per the design) never reaps it — so it can sit in LOCK_DIR
+   indefinitely, and `doctor` dies on it every time it's run.
+2. **director-awake.sh race window** — `mkdir "$LOCK"` (line 103) succeeds
+   before `echo "$$" > "$LOCK/pid"` (line 111); a `doctor` run in that window
+   aborts.
+3. **Any future foreign holder** without a `pid` file — the design's own
+   edge-case row ("A future non-Director foreign holder in LOCK_DIR — same
+   rules apply — the boundary is 'has no owner'").
+
+It contradicts the design twice:
+
+- Edge-case table: "set -e / pipefail on any missing-file read — **Every field
+  read is non-fatal; absence reads as empty, never as an abort.**" This one is
+  fatal.
+- Approach section: "`doctor` … no longer aborts on them for the same `set -e`
+  reason as failure #1." It does — for exactly the foreign locks most likely to
+  be the residue of the bug being fixed.
+
+Note the reaper already solved this correctly: `_lock_pid`
+(`dozers/reaper.sh:72`) guards with `[[ -f "$lock/pid" ]]` before reading. The
+fix is one line — e.g.
+`pid="$( { head -1 "$lock/pid" 2>/dev/null || true; } | tr -dc '0-9')"` —
+plus ideally a `doctor` test row with a pid-less foreign lock (the current
+`reaper-test.sh` only stages Director locks that carry a pid, which is why the
+suites stay green despite the bug).
+
+## What is sound — verified, no changes needed
+
+- **reaper.sh** — `_field` non-fatal (`|| true`), `_lock_foreign` boundary,
+  `_lock_pid` dual-layout read, `_reap_lock` refusing foreign locks before any
+  kill/`rm -rf`, the `foreign` verdict in `_lock_state` (in-flight tasks left
+  alone, not requeued — requeue under a standing lock would loop, matching the
+  design), and the `foreign-skipped=N` counter. All match the design.
+- **run_one's owner write is now fatal-on-failure** — lock released via the
+  EXIT trap, task stays `ready` and is retried next poll; loud message. This is
+  what makes the "no owner ⇒ not ours" invariant safe, as designed.
+- **inflight_count / live_crews dual guards** (name match + owner-file check)
+  — the GSAI-76 merge superset, defense in depth, as designed.
+- **Test results on this branch:** `tests/reaper-test.sh` PASS (all 10 rows,
+  including live-Director-lock preservation and the Director process left
+  running), `tests/heartbeat-test.sh` PASS, `tests/heartbeat-check-test.sh`
+  PASS. Director lock layout claim verified against
+  `~/ecosystem/scripts/director-awake.sh` (bare `pid`, no `owner`).
+- One accepted tradeoff, fine as designed: pre-GSAI-96 owner-less residue is
+  now permanently `foreign` and never reaped — but it is *reported* every
+  sweep (`foreign-skipped` / "left alone" lines), so it's visible, not silent.
+
+## Verdict
+
+The reaper fix is the task and it is done right. But this branch ships a new
+instance of the bug class the task was cut to eliminate, in the health
+command, on states this bug's own residue creates — and the design explicitly
+claims that's fixed. One-line fix plus a test row; then this is a PASS.
