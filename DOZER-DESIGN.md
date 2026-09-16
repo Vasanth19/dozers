@@ -1,207 +1,159 @@
-# DOZER-DESIGN — #GSAI-149: the no-commit gate asks "did this attempt add commits" instead of "is the branch ahead of base"
+# GSAI-144 — design: `--no-push` must not require an `origin`
 
-## The bug
+**Task:** promote.sh refuses a local-only promote — `--no-push` still requires an
+origin, stranding GSAI-142 (`~/ecosystem`, no remote) and BRD-4
+(`~/initiatives/brands/mr-growth-guide`, no remote).
 
-`build_once` (dozers/dev-lane/crew.sh:492-509) anchors at the *current* HEAD
-immediately before the build pass and fails when the branch did not advance past
-it:
+**Repo:** dozers (main-only). **Files touched:** `directors/promote.sh`,
+`tests/promote-test.sh`. Nothing else.
 
-```bash
-anchor="$(git -C "$WT" rev-parse HEAD)"
-run_model_pass build "$prompt" "commits:$anchor"
-...
-if git -C "$WT" diff --quiet "$anchor" -- 2>/dev/null; then
-  fail "build agent produced no commits on $BRANCH"
-fi
+---
+
+## The bug, precisely
+
+`directors/promote.sh` enforces invariant 3 ("origin is the truth") *before* it ever
+considers the `PUSH` flag:
+
+- `directors/promote.sh:81` — dies when there is no `origin` remote, even under
+  `--no-push`.
+- `directors/promote.sh:89-91` — dies when `origin/$FROM` or `origin/$TO` is missing
+  after fetch, even under `--no-push`.
+
+So the one mode that provably needs no origin (merge local develop → local main,
+publish nothing) is the one being refused. Every later stage of the script already
+works fine on local refs — the refusal is purely at the front door.
+
+## Approach — a `LOCAL_ONLY` mode, gated on BOTH "no origin" and "--no-push"
+
+After args parsing and repo resolution (which stay untouched), replace the
+unconditional origin block with:
+
+```
+HAS_ORIGIN: does `git remote get-url origin` succeed?
+if no origin:
+    PUSH  → die (the existing refusal, message updated to mention --no-push as the
+             local-only escape hatch) — "Done when" #4, unchanged behavior
+    !PUSH → LOCAL_ONLY=1; say "local-only promote — measured against LOCAL <TO>,
+             never published" — and SKIP fetch + the origin-ref existence loop
+else:
+    fetch + origin-ref existence checks exactly as today (a repo WITH an origin
+    behaves exactly as it does today — "Done when" #3)
 ```
 
-On a **resume whose work is already complete** the build agent correctly adds
-nothing — there is nothing left to write — so the diff is quiet and the crew
-fails a task that holds finished, tested work ahead of the base (GSAI-144:
-attempt 4; BRD-88). The script contradicts itself: the resume path reuses the
-worktree precisely *because* `git log "$base..$BRANCH"` is non-empty, then the
-gate fails the same task for not producing *more*. A completed task can never
-finish; each attempt burns a full architect+build+review cycle to rediscover the
-work is done.
+`LOCAL_ONLY` is **only** reachable when the repo has no origin remote at all. It is
+NOT a "skip the remote checks" flag: with an origin present, `--no-push` keeps the
+current semantics (fetch still happens, `origin/$ref` must exist, `_effective` still
+picks between local and origin tips). This keeps the spec's "no behaviour change for
+repos with an origin" exactly true.
 
-The GSAI-147 `commits:$anchor` proof argument inside `run_model_pass` has the
-same blind spot: on a resume, a build flake (non-zero exit, not a timeout) with
-nothing new committed fails the whole crew *before* the gate could judge — a
-finished branch is unrescuable too.
+Then every remaining use of `origin/<branch>` is guarded so local-only mode never
+touches a remote ref:
 
-## Approach
+1. **`_effective()` (line 110)** — in local-only mode:
+   - `refs/heads/$br` missing → `die "no local branch '$br' and no origin to fall
+     back on — nothing to promote"` (a fresh clone with neither local develop nor a
+     remote gets a clear refusal, not a confusing rev-parse error).
+   - otherwise echo `"$br"` — local is the ONLY truth in this mode. No `_rel`
+     comparison, no divergence adjudication (there is nothing to diverge from).
 
-The gate's question changes from **"did this attempt add commits?"** to **"does
-the branch hold anything to merge?"** — one definition, shared by the gate and
-the build pass's proof artifact (spec point 5: no two versions of "the build did
-something").
+   Existing with-origin path byte-identical.
 
-### Why not the spec's literal `git log "$base..$BRANCH"`
+2. **UNPUSHED_SRC block (lines 125-130)** — guarded by `! LOCAL_ONLY`. In local-only
+   mode every commit on develop is trivially "unpushed"; the informational lines and
+   the internal sanity check at line 131 (`origin/$FROM ⊆ $SRC`) are skipped.
 
-The spec's point 2 claims a first attempt with a no-op build "naturally" has an
-empty `$base..$BRANCH`. That is wrong on the production (routed) path: the
-architect backstop (crew.sh:481-482) commits `DOZER-DESIGN.md` to the branch
-*before* the build runs, so the log is non-empty even when the build wrote
-nothing. A literal log-based gate would pass a no-op first build and only block
-it two review passes later — violating the spec's own "must still fail with a
-clear message". The gate therefore asks a **diff** question instead:
+3. **No-op path (lines 174-181)** — the "origin is behind this machine, publishing
+   the earlier promote" follow-up is guarded by `! LOCAL_ONLY`; local-only exits 0
+   with "nothing to promote" and moves nothing. (In a no-origin repo there IS no
+   earlier unpublished promote to finish — that concept doesn't exist.)
 
-> Does the branch differ from the integration base in anything **other than the
-> pass artifacts** (`DOZER-DESIGN.md`, `DOZER-REVIEW.md`)?
+4. **`_publish()` (line 153)** — already returns early when `PUSH=0`; extend the
+   early-return message to say, in local-only mode, that `<TO>` exists only on this
+   machine and a future run after a remote exists is the publishing path. In
+   with-origin `--no-push` mode the existing "push skipped (--no-push) — origin still
+   lacks this promote" wording is kept.
 
-This satisfies both sides at once:
+5. **Header comment** — add invariant 6: "A repo with no `origin` can still promote
+   under `--no-push`: local `<TO>` is both the base and the truth, and nothing is
+   published. Without `--no-push` a missing origin stays fatal." Update the usage
+   line's flag comment likewise.
 
-- resume, work complete, nothing added → feature diff vs base is non-empty →
-  **pass** (the headline fix), logging a plain resume line;
-- first attempt, no-op build → the only diff is the design file → excluded →
-  **fail**, exactly as today;
-- first attempt with real output → non-empty → pass, as today.
+**What is deliberately NOT changed:**
 
-Diff (not log) keeps one parity with the old gate: uncommitted working-tree
-changes count as output, just as they did against `$anchor`.
-
-### The base must be a pinned SHA, not the `$base` ref name
-
-`base` is the literal string `HEAD` when the integration branch has no *local*
-ref (develop remote-only — crew.sh:344). A `git -C "$WT" diff HEAD …` at gate
-time resolves HEAD **inside the worktree** to the branch tip — diff always
-empty — which would fail every build on such repos (a regression the anchor
-didn't have). So one SHA is pinned in `$WORKDIR` **after** the isolate/resume
-block (after crew.sh:387), where:
-
-- a resume just rebased onto `$base`'s current tip → `BASE_SHA` is exactly that
-  tip → the diff is exactly the task's commits;
-- a fresh worktree was created off `$base` → `BASE_SHA` is its creation commit;
-- `base="HEAD"` resolves in the main checkout to the very commit the worktree
-  was built from (same resolution `git worktree add` used).
-
-`$base` the *name* keeps its existing roles (resume detection, rebase, merge);
-only the gate/proof comparisons move to `BASE_SHA`.
-
-### The change
-
-1. **`branch_has_output <dir> <sha>`** — new tiny helper next to
-   `run_model_pass`: `! git -C "$dir" diff --quiet "<sha>" -- . \
-   ':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md'`. One definition of
-   "the build did something", shared by the gate and the proof.
-2. **`BASE_SHA`** pinned after the isolate block (see above).
-3. **`run_model_pass`**: the `commits:<sha>` proof form is **replaced** by
-   `changes:<sha>` (branch holds diff beyond the pass artifacts vs that sha).
-   The rescue line keeps the `⚠ <pass> agent exited <rc> but … — continuing`
-   shape so the GSAI-147 test's prefix assertion still matches. Timeout
-   precedence (TIMEBOX_HIT before any proof) is untouched.
-4. **`build_once`**:
-   - proof argument becomes `changes:$BASE_SHA` (consistency, spec point 5);
-   - the gate becomes `if branch_has_output "$WT" "$BASE_SHA"; then … else
-     fail "build agent produced no commits on $BRANCH"; fi`;
-   - when the branch passes **but** this attempt added nothing
-     (`git diff --quiet "$anchor"`), log the spec's plain line:
-     `build pass added nothing — branch already N commits ahead of <base>,
-     continuing to test+merge` (N via `rev-list --count "$base..$BRANCH"`).
-     `$anchor` survives only to distinguish "added nothing" for that line.
-5. **Nothing downstream changes.** Tests still run and still gate the merge;
-   a test failure still blocks; a timeout still fails; the review verdict
-   contract (GSAI-147) is untouched. Note the order inside `build_once` is
-   already tests → no-commit gate, so "a resume whose tests fail still fails"
-   holds by construction — the gate is only reached on green tests.
-
-The fail message stays byte-identical ("build agent produced no commits on
-$BRANCH") — it is still literally true when it fires (no commits, and no diff,
-beyond the artifacts).
-
-## Files to touch
-
-- `dozers/dev-lane/crew.sh` — `branch_has_output` helper; `BASE_SHA` pin;
-  `run_model_pass` `commits:`→`changes:` form (+ its doc comment); `build_once`
-  gate + proof argument + resume info line; comment blocks at crew.sh:266-280
-  and 492-494 rewritten to state the new question.
-- `tests/dev-lane-no-commit-gate-test.sh` — new regression test (below).
-
-`tests/dev-lane-model-exit-test.sh` needs **no edit** — its build-rescue
-assertion is a prefix (`⚠ build agent exited 3 but`) that the new message
-keeps — but it must stay green under `make test` (it pins that the GSAI-147
-rescue still fires when the build *did* deliver commits, and that timeout
-precedence survives).
+- The merge itself (line 226): still `git merge --no-ff` on a clean checkout or a
+  throwaway worktree; 2-parent post-check, no-squash, no-rebase, never fast-forward.
+- Dirty-tree refusal (line 201) — fires identically in local-only mode.
+- The stray-commit check (line 138): in local-only mode `$DST`/`$SRC` are the local
+  branches, so a hand-rolled hotfix or squash on local main is still refused as
+  divergence. Invariant 2 survives the mode.
+- Exit codes and idempotency (AHEAD==0 → clean no-op, exit 0).
 
 ## Edge cases
 
-1. **First attempt, routed, no-op build** — design commit sits ahead of base, so
-   a naive log gate would pass it; the artifact-excluding diff fails it
-   (TESTED, case FIRST-ATTEMPT-NOOP — this pins the spec's point-2 protection,
-   which the literal log check would NOT deliver).
-2. **Resume, work complete, build adds nothing** — passes with the plain resume
-   line, proceeds to tests and merges (TESTED, case RESUME-FINISHED).
-3. **Resume whose tests fail** — blocks at the test gate, which runs *before*
-   the no-commit gate; the new gate never weakens it (TESTED, case
-   RESUME-TESTS-FAIL).
-4. **Build flake on a resume** (non-zero exit, non-timeout, nothing new) — the
-   `changes:$BASE_SHA` proof now rescues where `commits:$anchor` killed the
-   crew; after the rescue the gate itself passes on the prior work.
-5. **Timeout** — TIMEBOX_HIT is checked before any proof; still always fails
-   (pinned by dev-lane-model-exit-test).
-6. **Rebuild after a FAILed review where the build judges nothing needs
-   fixing** — commits nothing; the gate now passes it to the re-review instead
-   of failing "no commits". The verdict gate still decides — arguably the old
-   behavior was wrong here too, and this is strictly more faithful to "review
-   judges, gate only guarantees there is something to judge".
-7. **`base="HEAD"`** (develop remote-only) — resume was already impossible there
-   (pre-existing); `BASE_SHA` keeps first attempts working where a by-name
-   worktree diff would have broken them.
-8. **Stale base + rebase on resume** — `BASE_SHA` is pinned after the rebase, so
-   the diff is exactly the task's commits, not "old base..branch" noise.
-9. **Uncommitted changes count as output** — parity with the old anchor diff;
-   merges still only carry commits, review still sees the working-tree diff
-   (its prompt diffs `$base`, unchanged).
-10. **Branch differing from base only in the artifacts** — fails (a design file
-    is not a deliverable to merge). Exclusions are the exact top-level names
-    `DOZER-DESIGN.md` / `DOZER-REVIEW.md`.
-11. **DRY_RUN** — bypasses `build_once` entirely; unaffected.
+| Case | Behavior |
+|---|---|
+| No origin + no `--no-push` | Hard refusal (unchanged, message now points at `--no-push`) |
+| No origin + `--no-push` + no local `develop` | Refused: "no local branch 'develop' and no origin to fall back on" |
+| No origin + `--no-push` + no local `main` | Refused, same shape — there is nothing to merge into |
+| No origin + `--no-push` + dirty `main` checkout | Refused by the existing dirty guard |
+| No origin + `--no-push` + stray commit on local `main` | Refused by invariant 2 (local main vs local develop) |
+| No origin + `--check` / `--dry-run` | Report the real gap, touch nothing |
+| Second run after a local-only promote | Clean no-op ("nothing to promote", exit 0) |
+| Origin present, any flags | Byte-identical to today (mode never engages) |
+| Origin present but missing `origin/main` or `origin/develop`, `--no-push` | Unchanged: still fatal after fetch — fixing that is not in this spec |
+
+One real-world nuance the fixture must honor: a plain clone of a bare origin only
+has a local `main` — so whatever fixture shape is used, it must end up with a local
+`develop` carrying real commits, mirroring `~/ecosystem` where the crew's merge left
+a real local `develop` behind. The cleanest shape is a `fixture_localonly()` that
+builds the repo **directly** — `git init`, commit base on `main`, branch `develop`,
+commit local work, back to `main` — with **no bare origin, no clone, and no remote
+ever existing**. That is the purest form of the "no origin" precondition (it matches
+`~/ecosystem` and `mr-growth-guide`, where no remote ever existed rather than one
+having been removed) and skips the cost of a clone on a slow disk. Do NOT build it
+as a clone + `git remote remove origin` — that re-adds clone cost to say nothing the
+pure form doesn't already say.
 
 ## How it gets tested
 
-New `tests/dev-lane-no-commit-gate-test.sh`, in the idiom of
-`dev-lane-model-exit-test.sh`: throwaway repo on `main`+`develop` (`mkproj`),
-a stub agent driven through the **routed** path (stub `claude` on PATH +
-`SCRUB_ROUTE`, because the garbled-review trick and the verdict parse need the
-non-bypass branch; the crew's design backstop commit — the case-1 pin — also
-only exists there). The stub counts invocations (1=architect, then
-build/review alternate) with `BUILD_MODE=work|nothing` and
-`REVIEW_MODE=pass|garbled`.
+`tests/promote-test.sh` gains local-only cases next to the existing no-origin refusal
+(test 11). The new cases use the pure `fixture_localonly()` described above — built
+directly, never a clone with the remote removed:
 
-- **RESUME-FINISHED (headline):** run 1 with `REVIEW_MODE=garbled` → two garbled
-  reviews → blocked "review failed TWICE", worktree **kept** holding design +
-  build commits. Run 2 (resume) with `BUILD_MODE=nothing REVIEW_MODE=pass`:
-  the build adds nothing. Assert: crew exits 0; the log carries `build pass
-  added nothing — branch already … commits ahead`; the merge landed on develop;
-  the GSAI-119 receipt is written and verifiable.
-- **FIRST-ATTEMPT-NOOP:** fresh project, `BUILD_MODE=nothing`: the architect
-  commits the design, the build writes nothing, tests are green. Assert:
-  blocked with exactly `build agent produced no commits on dozer/TEST-…`,
-  develop untouched, worktree kept — a naive log-based gate would have passed
-  this (the design-commit hole).
-- **RESUME-TESTS-FAIL:** same run-1 construction as above; between runs, commit
-  a failing `t.sh` onto the kept task branch (setup, simulating prior work that
-  is not green). Run 2 with `BUILD_MODE=nothing`: the gate passes on the
-  existing feature diff, tests run and fail. Assert: blocked with `tests
-  failed — not merging (worktree kept for resume)`, develop untouched.
+- **11b — no origin + `--no-push --check`**: exit 0, "promotable", origin untouched
+  (n/a), and — the "Done when" #1 shape — the run reports the commit gap rather than
+  refusing.
+- **11c — no origin + `--no-push`**: exit 0; local `main` in the clone gains the
+  2-parent merge; `git rev-list --count main..develop` == 0; output contains the
+  local-only/"not published" line (the "Done when" #2 shape).
+- **11d — no origin + `--no-push`, dirty `main` checkout**: exit 1, "dirty" in
+  output, local `main` unmoved — the dirty guard is proven intact in the new mode.
+- **11e — second run**: exit 0, "nothing to promote", no further movement
+  (idempotency holds with no origin).
+- **Test 11 (existing) tightened**: no origin without `--no-push` still exit 1 and
+  now also asserts the message mentions `--no-push`.
 
-Then: `make test` (`tests/run-all.sh` auto-discovers the new file). The whole
-existing suite must stay green unchanged — in particular
-`dev-lane-model-exit-test.sh` (GSAI-147 rescue + timeout precedence) and
-`dev-lane-stale-base-test.sh` (resume/rebase path the `BASE_SHA` pin lives in).
-
-**Verified in the wild** (the spec's last done-when, post-merge): the
-Dev-Director re-greenlights GSAI-144 — its 4-attempt worktree resumes, the
-build adds nothing, and the crew reaches `ok #GSAI-144 merged to develop`
-without hand intervention, unblocking the promote chain (GSAI-66, GSAI-142,
-BRD-4).
+All existing tests must keep passing untouched — they are the proof that
+with-origin behavior is unchanged. The suite runs offline against throwaway fixtures
+(bare origin + clone), consistent with the file's existing style; no new helpers
+beyond a small `fixture_localonly()`-style block, reusing `run`, `parents`, and the
+established ok/bad pattern.
 
 ## Risk
 
-Low and contained. One function + its call sites in `crew.sh`; every downstream
-gate (test gate, migration gate, green-gate, merge receipt, review verdict,
-timeout precedence) is untouched, and the gate only *loosens* one thing: a
-resume with complete work stops failing. The one true sharp edge — `base="HEAD"`
-repos, where a by-name diff in the worktree would have broken every build — is
-handled by pinning `BASE_SHA` in the main checkout, and the fail case keeps its
-exact old message so existing failure text consumers are unaffected.
+Low. The change is a guarded front-door + four `! LOCAL_ONLY` guards; the merge
+machinery and every post-merge invariant are untouched. The main hazard is
+accidentally engaging the mode for repos that DO have an origin — prevented by
+gating on `HAS_ORIGIN=0` explicitly rather than on `--no-push` alone. Second hazard:
+a silent `_rel`/`origin/…` rev-parse inside local-only mode would produce a
+misleading "does not exist" refusal — mitigated by the dedicated missing-local-branch
+die in `_effective`, which is the ONLY branch-tip resolution in that mode.
+
+## Post-merge verification (for the Dev-Director, not this pass)
+
+- `promote.sh ~/ecosystem --no-push --check` → reports the 2-commit GSAI-142 gap.
+- `promote.sh ~/ecosystem --no-push --summary "GSAI-142"` → 2-parent merge on local
+  `main` of `~/ecosystem`, explicit not-published line.
+- Same for BRD-4 in `~/initiatives/brands/mr-growth-guide` (5 commits).
+- Whether `~/ecosystem` should gain a remote at all stays a human board decision —
+  this task unblocks the promote either way.

@@ -3,6 +3,8 @@
 #
 #   directors/promote.sh <repo-id|path> [--from develop] [--to main]
 #                        [--check] [--dry-run] [--no-push] [--summary "<text>"]
+#         (--no-push = merge locally, publish nothing — and the ONLY mode that works
+#          in a repo with no origin remote at all; see invariant 6)
 #
 # WHY THIS IS A SCRIPT AND NOT A SENTENCE
 # The Director docs used to say "promote develop→main" with no mechanics, so every
@@ -26,6 +28,9 @@
 #   4. Nothing runs on a dirty checkout, and a merge whose result fails the post-check
 #      is reset back to where it started — main is never left mid-promote.
 #   5. Idempotent: with nothing on <from> that <to> lacks, it is a clean no-op (exit 0).
+#   6. A repo with no origin can still promote under --no-push: local <to> is both
+#      the base and the truth, and nothing is published. Without --no-push a missing
+#      origin stays fatal.
 #
 # Exit codes:  0 promoted (or already promoted / check passed) · 1 refused, nothing
 # changed · 2 usage error. Anything non-zero means main was NOT moved.
@@ -77,18 +82,30 @@ fi
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repo: $REPO"
 say "repo $REPO   promote $FROM → $TO"
 
-# ── fetch (invariant 3: origin is the truth) ────────────────────────────────
-git -C "$REPO" remote get-url origin >/dev/null 2>&1 \
-  || die "no 'origin' remote in $REPO — a promote is measured against origin/$TO, and this checkout has none"
-_ferr="$(git -C "$REPO" fetch --prune origin 2>&1 >/dev/null)" \
-  || die "git fetch origin failed in $REPO: ${_ferr:-unknown git error}"
-
+# ── fetch (invariant 3: origin is the truth — when there is one) ────────────
+# LOCAL_ONLY (invariant 6): a repo with NO origin remote can still promote under
+# --no-push — local $TO is both the base and the truth, and nothing is published.
+# The mode is gated on BOTH "no origin" AND "--no-push": with an origin present,
+# --no-push keeps exactly today's semantics (fetch runs, origin/<ref> must exist,
+# local/origin adjudication still decides each side's tip).
 _has()  { git -C "$REPO" rev-parse --verify -q "$1^{commit}" >/dev/null 2>&1; }
 _count(){ git -C "$REPO" rev-list --count "$@" 2>/dev/null || echo 0; }
 
-for ref in "origin/$FROM" "origin/$TO"; do
-  _has "$ref" || die "$ref does not exist after fetch — is '$ref' the right branch name?"
-done
+HAS_ORIGIN=0; git -C "$REPO" remote get-url origin >/dev/null 2>&1 && HAS_ORIGIN=1
+LOCAL_ONLY=0
+if (( ! HAS_ORIGIN )); then
+  if (( PUSH )); then
+    die "no 'origin' remote in $REPO — a promote is measured against origin/$TO, and this checkout has none (for a local-only promote that publishes nothing, re-run with --no-push)"
+  fi
+  LOCAL_ONLY=1
+  say "local-only promote — measured against LOCAL $TO, never published"
+else
+  _ferr="$(git -C "$REPO" fetch --prune origin 2>&1 >/dev/null)" \
+    || die "git fetch origin failed in $REPO: ${_ferr:-unknown git error}"
+  for ref in "origin/$FROM" "origin/$TO"; do
+    _has "$ref" || die "$ref does not exist after fetch — is '$ref' the right branch name?"
+  done
+fi
 
 # ── which tip of each branch is the real one: local or origin? ─────────────
 # Both directions are legitimate here and neither may be guessed:
@@ -109,6 +126,10 @@ _rel() {   # relationship of $1 to $2: same | ahead | behind | diverged
 UNPUSHED_SRC=0
 _effective() {   # print the ref to use for branch $1 (local or origin/<1>)
   local br="$1"
+  if (( LOCAL_ONLY )); then   # no origin at all: local is the ONLY truth, no adjudication
+    _has "refs/heads/$br" || die "no local branch '$br' and no origin to fall back on — nothing to promote"
+    echo "$br"; return 0
+  fi
   if ! _has "refs/heads/$br"; then echo "origin/$br"; return 0; fi
   case "$(_rel "$br" "origin/$br")" in
     same|behind) echo "origin/$br" ;;
@@ -122,13 +143,15 @@ _effective() {   # print the ref to use for branch $1 (local or origin/<1>)
 SRC="$(_effective "$FROM")" || exit 1     # what we merge
 DST="$(_effective "$TO")"   || exit 1     # what we measure against, and merge into
 
-if [[ "$SRC" == "$FROM" ]]; then
-  UNPUSHED_SRC="$(_count "$FROM" "^origin/$FROM")"
-  say "local $FROM is $UNPUSHED_SRC commit(s) ahead of origin/$FROM (the Dozer merges locally, push: false)"
-  (( PUSH )) && say "   → $FROM will be published first, so origin/$TO never gets a commit origin/$FROM lacks"
+if (( ! LOCAL_ONLY )); then   # with no origin, "unpushed" is everything — these lines and checks are n/a
+  if [[ "$SRC" == "$FROM" ]]; then
+    UNPUSHED_SRC="$(_count "$FROM" "^origin/$FROM")"
+    say "local $FROM is $UNPUSHED_SRC commit(s) ahead of origin/$FROM (the Dozer merges locally, push: false)"
+    (( PUSH )) && say "   → $FROM will be published first, so origin/$TO never gets a commit origin/$FROM lacks"
+  fi
+  [[ "$DST" == "$TO" ]] && say "local $TO is $(_count "$TO" "^origin/$TO") commit(s) ahead of origin/$TO (an earlier promote that was never pushed)"
+  (( $(_count "origin/$FROM" "^$SRC") == 0 )) || die "internal: $SRC does not contain origin/$FROM"
 fi
-[[ "$DST" == "$TO" ]] && say "local $TO is $(_count "$TO" "^origin/$TO") commit(s) ahead of origin/$TO (an earlier promote that was never pushed)"
-(( $(_count "origin/$FROM" "^$SRC") == 0 )) || die "internal: $SRC does not contain origin/$FROM"
 
 # ── invariant 2: $TO must not already carry commits absent from $FROM ───────
 # Merge commits are excluded — a proper promote leaves a 2-parent merge on main that
@@ -151,7 +174,14 @@ fi
 # behind puts commits on origin/$TO that origin/$FROM has never seen — the same
 # divergence, arriving by a different door.
 _publish() {
-  (( PUSH )) || { say "· push skipped (--no-push) — origin still lacks this promote"; return 0; }
+  if (( ! PUSH )); then
+    if (( LOCAL_ONLY )); then
+      say "· nothing published — there is no origin; $TO moved only on this machine (when a remote exists, re-run to publish)"
+    else
+      say "· push skipped (--no-push) — origin still lacks this promote"
+    fi
+    return 0
+  fi
   local pushed=0
   if (( $(_count "$FROM" "^origin/$FROM") > 0 )); then
     _serr="$(git -C "$REPO" push origin "$FROM" 2>&1 >/dev/null)" \
@@ -174,7 +204,7 @@ if (( AHEAD == 0 )); then
   say "✓ nothing to promote — $DST already contains every commit on $SRC (no-op)"
   # ...but an earlier promote may have been made and never published. Finishing that is
   # still this script's job — otherwise the only way to complete it is hand-rolled git.
-  if (( $(_count "$FROM" "^origin/$FROM") > 0 || $(_count "$TO" "^origin/$TO") > 0 )); then
+  if (( ! LOCAL_ONLY )) && (( $(_count "$FROM" "^origin/$FROM") > 0 || $(_count "$TO" "^origin/$TO") > 0 )); then
     say "origin is behind this machine — publishing the earlier promote"
     _publish
   fi
