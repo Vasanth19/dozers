@@ -85,8 +85,16 @@ gen_plist() {
     <true/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <!-- ProcessType = Standard, NOT Background (GSAI-151): the engine IS the factory —
+         its children do all the real work (the poll loop, every crew, every model
+         pass, both timeboxed make-test runs), and launchd's Background band pins that
+         whole tree to darwinbg QoS: lowest CPU priority and E-core-only scheduling on
+         Apple Silicon. It measured this repo's own suite 4-8x slower in-crew than
+         standalone and killed green runs at the 900s bound (GSAI-73, twice). Not
+         Adaptive either — that demotes under load heuristics, i.e. exactly when the
+         factory is busiest (5 parallel crews). -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
     <key>StandardOutPath</key>
     <string>$(xesc "$OUT_LOG")</string>
     <key>StandardErrorPath</key>

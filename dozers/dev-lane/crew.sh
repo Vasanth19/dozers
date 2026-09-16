@@ -71,15 +71,58 @@ T_MODEL="$(timebox_secs model 3600)" || fail "bad timeout_model / DOZER_TIMEOUT_
 T_TEST="$(timebox_secs test 900)"    || fail "bad timeout_test / DOZER_TIMEOUT_TEST"
 T_DEPS="$(timebox_secs deps 900)"    || fail "bad timeout_deps / DOZER_TIMEOUT_DEPS"
 T_PUSH="$(timebox_secs push 300)"    || fail "bad timeout_push / DOZER_TIMEOUT_PUSH"
+
+ecosystem_flag() {  # $1 = key, $2 = path → echo the repo's ecosystem.yaml value, or nothing (not set)
+  python3 "$REPO_ROOT/tasks/ecosystem_workdir.py" --flag "$1" --path "$2" 2>/dev/null || true
+}
+
+# test-bound state, refreshed on EVERY run_tests call (see the lazy-resolution note
+# there); TEST_ELAPSED lets the failure lines say how far a red/timed-out run got.
+TEST_BOUND="$T_TEST"; TEST_SRC="DOZER_TIMEOUT_TEST / timeout_test in org/config.yaml"; TEST_ELAPSED=0
+
 # run_tests: the one place a test command is executed, so both runs (task worktree and
 # green-gate) get the same bound. Returns the command's status; 124 + TIMEBOX_HIT=1 on
 # a hang. Callers turn TIMEBOX_HIT into a failure text that NAMES the timeout.
+#
+# GSAI-151 — the bound is re-resolved on EVERY call, most-specific first:
+#   DOZER_TIMEOUT_TEST (env, per-run) > `timeout_test:` on the repo's ecosystem.yaml
+#   entry (next to no_test_gate) > org/config.yaml > 900. Lazy on purpose, unlike the
+#   upfront knobs above: this task (GSAI-151 itself) is the one that ADDED the dozers
+#   entry, and resolving once at crew start would have locked this crew's own gates to
+#   the old 900 — the change blocking on itself a third time. A per-repo value that is
+#   not whole seconds fails LOUD (also validated upfront before any spend) — never a
+#   silent fall-through to the global bound.
 run_tests() {  # $1 = dir, $2 = stage label
-  timebox "$T_TEST" "$2 tests (\`$TEST_CMD\`)" "$1" "$TEST_CMD"
+  local pr rc=0
+  TEST_BOUND="$(timebox_secs test 900)" || fail "bad timeout_test / DOZER_TIMEOUT_TEST"
+  if [[ -n "${DOZER_TIMEOUT_TEST:-}" ]]; then
+    TEST_SRC="DOZER_TIMEOUT_TEST (this run)"
+  else
+    pr="$(ecosystem_flag timeout_test "$WORKDIR")"
+    if [[ -n "$pr" ]]; then
+      [[ "$pr" =~ ^[0-9]+$ ]] \
+        || fail "timeout_test '$pr' for this repo in ~/ecosystem/ecosystem.yaml must be whole seconds"
+      TEST_BOUND="$pr"; TEST_SRC="timeout_test (per-repo) in ~/ecosystem/ecosystem.yaml"
+    else
+      TEST_SRC="DOZER_TIMEOUT_TEST / timeout_test in org/config.yaml"
+    fi
+  fi
+  local t0=$SECONDS
+  timebox "$TEST_BOUND" "$2 tests (\`$TEST_CMD\`)" "$1" "$TEST_CMD" || rc=$?
+  TEST_ELAPSED=$(( SECONDS - t0 ))
+  return "$rc"
 }
 timed_out_msg() {  # $1 = what, $2 = seconds, $3 = knob name → the failure text for a hang
   printf '%s timed out after %ss (DOZER_TIMEOUT_%s / timeout_%s in org/config.yaml) — killed its process group' \
     "$1" "$2" "${3^^}" "$3"
+}
+# The TEST hang message carries the bound, the ELAPSED time (how far the run got —
+# failed-at-3s and timed-out-at-1799s tell a Director very different things), and the
+# effective SOURCE of the bound, so `x #<id> failed: tests timed out` is actionable
+# on its own (GSAI-151).
+tests_timed_out_msg() {  # $1 = what (e.g. "tests (`make test`)")
+  printf '%s timed out after %ss — ran %ss before the kill (%s; DOZER_TIMEOUT_TEST to override for one run) — killed its process group' \
+    "$1" "$TEST_BOUND" "$TEST_ELAPSED" "$TEST_SRC"
 }
 
 # Symlink uncommitted build deps (node_modules, env files) from the real checkout
@@ -181,7 +224,7 @@ test_gate_waiver() {  # $1 = dir → echoes WHY the gate is off for this repo, e
   [[ "${TEST_GATE:-on}" == "off" ]] && { echo "TEST_GATE=off for this run"; return 0; }
   [[ -f "$WORKDIR/.dozers-no-test-gate" || -f "$d/.dozers-no-test-gate" ]] \
     && { echo ".dozers-no-test-gate marker in the repo"; return 0; }
-  flag="$(python3 "$REPO_ROOT/tasks/ecosystem_workdir.py" --flag no_test_gate --path "$WORKDIR" 2>/dev/null || true)"
+  flag="$(ecosystem_flag no_test_gate "$WORKDIR")"
   [[ "$flag" == "true" ]] && { echo "no_test_gate: true in ecosystem.yaml"; return 0; }
   return 1
 }
@@ -236,6 +279,14 @@ $schema_hits"
 
 cd "$WORKDIR" 2>/dev/null || fail "workdir missing: $WORKDIR"
 git rev-parse --git-dir >/dev/null 2>&1 || fail "not a git repo: $WORKDIR"
+
+# Upfront validation of the PER-REPO test bound (GSAI-37's fail-before-spend): the
+# bound itself resolves lazily in run_tests, but a garbage ecosystem.yaml value must
+# stop the crew HERE, naming the value and file, before any model time is spent.
+_pr_test="$(ecosystem_flag timeout_test "$WORKDIR")"
+[[ -z "$_pr_test" || "$_pr_test" =~ ^[0-9]+$ ]] \
+  || fail "timeout_test '$_pr_test' for this repo in ~/ecosystem/ecosystem.yaml must be whole seconds"
+unset _pr_test
 
 INTEG="${INTEGRATION_BRANCH:-$(cfg integration_branch)}"; INTEG="${INTEG:-develop}"
 # ── Model routing: the lane runs THREE model passes (architect → build → review), each
@@ -545,8 +596,8 @@ $1"
     install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
     resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
     if [[ -n "$TEST_CMD" ]] && ! run_tests "$WT" "task worktree"; then
-      (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
-      fail "tests failed — not merging (worktree kept for resume)"
+      (( TIMEBOX_HIT )) && fail "$(tests_timed_out_msg "tests (\`$TEST_CMD\`)"); not merging (worktree kept for resume)"
+      fail "tests failed after ${TEST_ELAPSED}s — not merging (worktree kept for resume)"
     fi
     # The gate, restated (GSAI-149): pass when the branch holds anything to merge
     # beyond the pass artifacts — the question above — so a resume with complete work
@@ -702,7 +753,7 @@ if [[ "${DRY_RUN:-}" != "1" ]]; then
     gate=0
     # A hang on the integration branch is not "red", it is unverified — same outcome
     # (revert + send back) but the reason must say TIMEOUT, not "broke develop".
-    if (( TIMEBOX_HIT )); then gate_why="$(timed_out_msg "green-gate tests (\`$TEST_CMD\` on $INTEG)" "$T_TEST" test)"
+    if (( TIMEBOX_HIT )); then gate_why="$(tests_timed_out_msg "green-gate tests (\`$TEST_CMD\` on $INTEG)")"
     else gate_why="merge broke $INTEG"; fi
   fi
   if (( ! gate )); then
