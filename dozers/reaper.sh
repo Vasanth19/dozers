@@ -29,6 +29,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ADAPTER_QUIET=1 source "$ROOT/tasks/adapter.sh"
+# GSAI-60: every scripted comment self-stamps `<!-- board-note by:<this> -->` — the
+# board reconcile reads an unmarked comment as Vas's answer.
+export DOZER_COMMENT_BY="dozer-reaper"
 
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
 REAPER_MAX_AGE="${REAPER_MAX_AGE:-21600}"

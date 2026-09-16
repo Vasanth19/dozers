@@ -58,6 +58,11 @@ An **artifact to judge** also gets `ln -s <abs-path> ~/ecosystem/board/review/<I
    **never** his answer, whatever the marker's name. Don't eyeball it: `directors/run.sh answer <ID>` (or
    `tasks/_linear_api.py board-answer <ID>`) applies exactly this rule — exit 0 = answered (swap), 3 = waiting
    (leave it), 2 = no ask.
+   Scripted engine comments now **self-stamp** — a `<!-- board-note by:dozer-engine|dozer-reaper|director-cli -->`
+   marker means the Dozer, the reaper, or the CLI wrote it (GSAI-60). The probe also **refuses known agent
+   signatures** (an unmarked "Dozer claimed/blocked/merged/staged…", "Director approved…", "♻️ Reaper requeued…"):
+   it exits 3 with a `REFUSED:` line on stderr. If a refusal is genuinely Vas's answer, eyeball it and swap
+   manually — that judgment is the point of the gate.
 2. No later unmarked comment → leave it alone. Never re-ping, never re-ask.
 
 **Pull in answers he typed elsewhere** (same awake, run before step 1):
