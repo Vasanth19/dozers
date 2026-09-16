@@ -29,6 +29,13 @@
 #               review -> "review failed TWICE". Proves the rescue feeds the verdict
 #               gate instead of going around it — a truncated artifact can buy a
 #               rebuild, never a merge.
+#   TITLED-VERDICT (GSAI-155) — the review opens with a markdown title, then
+#               "VERDICT: PASS" (CRLF throughout) and exits 1: rescued, parsed PASS,
+#               merged, NO rebuild. Pre-fix: head -n1 read the title -> FAIL -> rebuild
+#               -> re-FAIL -> blocked (the CFW-254 regression).
+#   TITLED-VERDICT-FAIL — same title shape but "VERDICT: FAIL": the tolerant scan must
+#               NOT smuggle FAILs through — blocked with "review failed TWICE" after
+#               one rebuild, develop untouched.
 #
 # Run:  bash tests/dev-lane-model-exit-test.sh   (exits non-zero on failure)
 set -euo pipefail
@@ -63,7 +70,7 @@ mkproj() {  # $1 = dir
 # pass, 2 the build, 3 the review, and the cycle repeats (4 would be the rebuild after
 # a FAILed review, 5 the re-review). Behaviors per env:
 #   ARCH_MODE   ok (default) | nothing | hang     ARCH_EXIT   (default 0)
-#   REVIEW_MODE pass (default) | garbled          REVIEW_EXIT (default 0)
+#   REVIEW_MODE pass (default) | garbled | titled | titled-fail   REVIEW_EXIT (default 0)
 #   BUILD_EXIT  (default 0)
 STUB="$TMP/stub-agent.sh"
 cat > "$STUB" <<'EOS'
@@ -93,11 +100,12 @@ case "$pass" in
     git add -A && git commit -q -m "build $n"
     rc="${BUILD_EXIT:-0}" ;;
   review)
-    if [[ "${REVIEW_MODE:-pass}" == garbled ]]; then
-      printf 'Reviewing the diff, but the write was truncated before any verdict line\n' > DOZER-REVIEW.md
-    else
-      printf 'VERDICT: PASS\nall good\n' > DOZER-REVIEW.md
-    fi
+    case "${REVIEW_MODE:-pass}" in
+      garbled)    printf 'Reviewing the diff, but the write was truncated before any verdict line\n' > DOZER-REVIEW.md ;;
+      titled)     printf '# Review — verdict behind a title\r\n\r\nVERDICT: PASS\r\nall good\r\n' > DOZER-REVIEW.md ;;
+      titled-fail) printf '# Review — verdict behind a title\r\n\r\nVERDICT: FAIL\r\nnot good\r\n' > DOZER-REVIEW.md ;;
+      *)          printf 'VERDICT: PASS\nall good\n' > DOZER-REVIEW.md ;;
+    esac
     git add -A && git commit -q -m "review $n" || true
     rc="${REVIEW_EXIT:-0}" ;;
 esac
@@ -218,6 +226,42 @@ r="$(reason "$ROOT" TEST-ME-D)"
   || { no "GARBLED-VERDICT: expected 2 review rescue lines"; dump "$LOG"; }
 [[ "$(dev_head "$PD")" == "init" ]] && ok "GARBLED-VERDICT: develop untouched — no merge from a truncated PASS" \
   || no "GARBLED-VERDICT: develop advanced to '$(dev_head "$PD")'"
+
+# ── TITLED-VERDICT (GSAI-155): a title above "VERDICT: PASS" is cosmetic, not FAIL ──
+# The CFW-254 regression end-to-end: non-zero exit also exercises the rescue→parse
+# interplay, mirroring how the real failure fired.
+PE="$TMP/titled"; mkproj "$PE"
+LOG="$TMP/e.log"; rc=0
+run_crew_routed "$PE" "TEST-ME-E" "$LOG" REVIEW_MODE=titled REVIEW_EXIT=1 || rc=$?
+[[ $rc -eq 0 ]] && ok "TITLED-VERDICT: crew exits 0 — the titled PASS scored PASS" \
+  || { no "TITLED-VERDICT: crew exited $rc (pre-fix: FAIL -> rebuild -> blocked)"; dump "$LOG"; }
+[[ "$(dev_head "$PE")" == merge*TEST-ME-E* ]] && ok "TITLED-VERDICT: merge landed on develop" \
+  || no "TITLED-VERDICT: develop HEAD is '$(dev_head "$PE")'"
+grep -q 'review verdict: PASS' "$LOG" \
+  && ok "TITLED-VERDICT: log shows the parse scored PASS (not the bypass)" \
+  || { no "TITLED-VERDICT: no 'review verdict: PASS' line"; dump "$LOG"; }
+[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW.md is on disk' "$LOG")" == 1 ]] \
+  && ok "TITLED-VERDICT: exactly one rescued review — no rebuild round-trip" \
+  || { no "TITLED-VERDICT: expected 1 review rescue line"; dump "$LOG"; }
+[[ "$(count TEST-ME-E)" == 3 ]] && ok "TITLED-VERDICT: stub ran 3 times (arch,build,review — no rebuild)" \
+  || { no "TITLED-VERDICT: stub ran $(count TEST-ME-E) times, expected 3"; dump "$LOG"; }
+
+# ── TITLED-VERDICT-FAIL: tolerance must not smuggle FAILs through ───────────────
+PF="$TMP/titled-fail"; mkproj "$PF"
+LOG="$TMP/f.log"; rc=0
+run_crew_routed "$PF" "TEST-ME-F" "$LOG" REVIEW_MODE=titled-fail REVIEW_EXIT=1 || rc=$?
+[[ $rc -ne 0 ]] && ok "TITLED-VERDICT-FAIL: crew blocked (exit $rc)" \
+  || { no "TITLED-VERDICT-FAIL: crew merged with a titled FAIL review"; dump "$LOG"; }
+r="$(reason "$ROOT" TEST-ME-F)"
+[[ "$r" == *"review failed TWICE"* ]] && ok "TITLED-VERDICT-FAIL: two titled FAILs block the task" \
+  || { no "TITLED-VERDICT-FAIL: wrong reason: '$r'"; dump "$LOG"; }
+[[ "$(grep -c 'review verdict: FAIL' "$LOG")" == 2 ]] \
+  && ok "TITLED-VERDICT-FAIL: both titled FAILs parsed FAIL through the tolerant scan" \
+  || { no "TITLED-VERDICT-FAIL: expected 2 'review verdict: FAIL' lines"; dump "$LOG"; }
+[[ "$(count TEST-ME-F)" == 5 ]] && ok "TITLED-VERDICT-FAIL: the one rebuild ran (5 passes)" \
+  || { no "TITLED-VERDICT-FAIL: stub ran $(count TEST-ME-F) times, expected 5"; dump "$LOG"; }
+[[ "$(dev_head "$PF")" == "init" ]] && ok "TITLED-VERDICT-FAIL: develop untouched" \
+  || no "TITLED-VERDICT-FAIL: develop advanced to '$(dev_head "$PF")'"
 
 if [[ $fail == 0 ]]; then echo "dev-lane-model-exit-test: PASS"
 else echo "dev-lane-model-exit-test: FAIL" >&2; exit 1; fi
