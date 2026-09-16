@@ -1,185 +1,179 @@
-# GSAI-60 — design: board reconcile must not auto-approve on an agent's own comment
+# GSAI-151 — design: per-repo test timeout + elapsed-on-failure, and the root cause of the 4-8x — the whole engine runs in launchd's Background band
 
-**Task:** the board reconcile reads "any later comment with no marker is Vas" —
-but every *scripted* comment in the engine is posted unmarked. The Dozer's claim /
-blocked / merged lines (`dozers/dozer.sh:245,261,309,326,333`), the reaper's requeue
-note (`dozers/reaper.sh:82`), and `directors/run.sh`'s "Director approved" / `note`
-lines (`directors/run.sh:31,36`) all land after a pending `board-ask` with **no
-`<!-- … -->` marker**, so the next Director awake flips `board:to_review` →
-`board:responded` and "acts on" a machine status line as if Vas had answered. The
-Chief's 2026-09-08 sweep measured it live: **11 of 22 board issues** had unmarked
-agent comments sitting after the last ask (50 comments total) — an auto-approval
-path around the human gate that never fired only because Directors eyeballed the
-text. The Chief backfilled `<!-- board-note by:agent -->` onto all 50 (the board is
-safe *today*), and the fix decision is made: **invert to positive identification.**
+**Task:** `repo:dozers` — this repo's own suite runs **4-8x slower in-crew than standalone**, so
+`timeout_test: 900` kills work that is green (GSAI-73, twice). Spec (GSAI-151) asks for four
+things, all designed here:
 
-**Repo:** dozers (main-only). **Files touched:** `tasks/_linear_api.py` (the fix),
-`dozers/dozer.sh` + `dozers/reaper.sh` + `directors/run.sh` (one identity line each),
-`directors/LINEAR.md` (the reconcile rule), `tests/board-reconcile-test.sh` (the
-regression). Nothing else.
+1. a **per-repo test timeout**, configured in `~/ecosystem/ecosystem.yaml` (where `no_test_gate`
+   already lives), raised for `repo:dozers` specifically — other repos keep the tighter wall;
+2. the **gate stays enforced** — no repo-wide opt-out anywhere in this change;
+3. **elapsed test time on the failure line**, so `x <id> failed: tests timed out` says how far it got;
+4. **investigate the 4-8x gap and report** whether the heavy suites are slow by nature or slow
+   because the crew environment makes them retry/wait.
 
----
+**Repo:** dozers (main-only). **Files touched:** `dozers/dev-lane/crew.sh` (1+3),
+`tests/dev-lane-timeout-per-repo-test.sh` (new regression), `tests/dev-lane-no-commit-gate-test.sh`
+(one un-pinned assertion), `dozers/service.sh` + `tests/service-test.sh` (the root-cause fix + its
+regression), `tests/run-all.sh` (one line: suite total), plus the one-line **live registry edit** in
+`~/ecosystem/ecosystem.yaml` (documented below — the runtime reads it directly, no merge delivers it).
 
-## Why the hole survived GSAI-41
+## Findings (spec item 4): slow by nature; the 4-9x MULTIPLIER is the environment — and it has one name
 
-GSAI-41 already fixed the *read* side: `is_agent_comment()` treats **any** HTML
-comment as an agent's (`tasks/_linear_api.py:424-430`), and `board_answers()` returns
-only unmarked later comments as Vas's answers. The contract — "an agent comment MUST
-carry a marker; an unmarked comment is Vas" — is prose in LINEAR.md and all four
-Director templates, and `tests/board-reconcile-test.sh` pins both.
+**What the data says.** From GSAI-73's in-crew run vs the standalone measurements: the ENTIRE
+standalone suite is 155s; `merge-verify-test.sh` alone took **167s in-crew**. Per-test in-crew
+averages ≈ 42s against ≈ 4.8s standalone — but not uniformly: `heartbeat-test.sh`, whose cost is
+almost entirely **fixed sleeps** (~20s of `sleep` calls), came in at 23s — **flat**, no multiplier.
+The tests that scaled 4-9x are the spawn/CPU-heavy ones, and none of them wait or retry on anything
+environmental: `merge-verify-test.sh` is real, deterministic work (three full crew runs, a whole
+engine copy `cp -R`, 450 `git commit-tree`s); `dev-lane-timeout-test.sh` is bounded hangs + git work.
+No retry loops, no env-conditional polling, no lock waits. **The suite is not waiting on anything —
+it is being scheduled slowly.** (Fixed-sleep tests staying flat while process-spawn tests scale is
+the exact fingerprint of CPU scheduling throttling, not of contention-induced waiting.)
 
-The hole is the *write* side: the contract is only enforced on LLM-authored
-comments. Every scripted `task_comment` call goes
-`dozer.sh/reaper.sh/run.sh` → `tasks/linear.sh:37 task_comment` →
-`_linear_api.py comment()` → `commentCreate` — **verbatim, no marker added**. The
-engine posts five distinct unmarked comment shapes on ordinary runs, so the moment a
-board issue also carries a pending ask (a re-greenlight while `board:to_review` is
-still on, or a Dozer claim racing the ask), the probe's exit 0 is guaranteed and the
-ask is auto-answered. As the Chief's data shows, it didn't need the race — it just
-needed any unmarked agent comment after the ask.
+**Root cause — one line in this repo.** `dozers/service.sh:89` — `gen_plist()` emits:
 
-## Approach — stamp at the choke point, guard at the probe
-
-Three layers, matching the Chief's numbered decision exactly:
-
-### 1. Write-side fix (the important one): every scripted comment self-stamps
-
-`tasks/_linear_api.py comment()` is the single choke point every scripted Linear
-comment passes through (`_comment_url()` is the second — the watchdog's
-alarm path, whose callers pre-mark). A `_stamp_marker(body)` helper appends
-
-```
-<!-- board-note by:<DOZER_COMMENT_BY:-dozer-engine> -->
+```xml
+<key>ProcessType</key>
+<string>Background</string>
 ```
 
-to any body that carries **no** `<!-- … -->` marker already (same `MARKER_RE`),
-and leaves an already-marked body **byte-identical** — so `alarm_raise`/
-`alarm_clear`/`board-mirror` comments (which pre-mark) are unchanged, and a
-Director using `run.sh note` with a marked mirror text never gets a double stamp.
-The marker name is the Chief's own backfill shape (`board-*`), so the read-side
-classifier already treats it as an agent's.
+and the live `~/Library/LaunchAgents/com.dozers.loop.plist` carries it (verified on this machine,
+2026-09-16). launchd's **Background** band puts the engine's entire process tree in **darwinbg QoS**:
+lowest CPU priority and, on Apple Silicon, **E-core-only scheduling**. Everything the engine spawns
+inherits it — the poll loop, every crew, every model pass (`claude -p` is a node process), and both
+timeboxed `make test` runs (task worktree + green-gate). Spawn-heavy bash suites are the worst case
+for E-core pinning; run from an interactive shell on P-cores, the same suite is 4-9x faster. The repo
+already recorded this load-sensitivity without naming the cause — `tests/dev-lane-timeout-test.sh:73-79`
+("a bound measuring machine load, not behaviour"). Fanout-5 concurrency compounds it; the band alone
+explains the window.
 
-The `DOZER_COMMENT_BY` identity is set at the three callers (one export line
-each): `dozer.sh` → `dozer-engine`, `reaper.sh` → `dozer-reaper`, `run.sh` →
-`director-cli`. This is provenance, not security — the default covers any future
-call site that forgets to set it. **New scripted posters cannot recur the bug**:
-forgetting the marker becomes impossible at the only door they all walk through.
+**Report line for the task comment:** the 4-8x is the launchd Background band throttling the whole
+tree; the heavy suites are heavy by nature (real crews, real git work) but nothing in them retries
+or waits — and the band fix (below) should collapse in-crew time toward the 155s standalone baseline.
 
-The `files` and `github-issues` backends are untouched — their comments never reach
-the Linear board reconcile (and the files backend's card files are local).
+## The build
 
-### 2. Read-side guard at the probe: refuse known agent signatures
+### 1. Per-repo `timeout_test` (crew.sh) — resolved LAZILY, on purpose
 
-The stamp protects the future; the **guard** protects against the residual — any
-unmarked comment that still looks machine-authored (an old pre-fix comment, an
-LLM-authored comment that forgot its marker, or a future poster bypassing
-`comment()`). A small, anchored signature list of the engine's own stable comment
-openers:
+New precedence, most-specific first:
 
-```python
-AGENT_SIGNATURES = [
-    r"^Dozer (claimed|blocked|merged|staged)\b",   # dozer.sh:245,261,309,326,333
-    r"^Director approved\b",                        # run.sh:31
-    r"^♻️ Reaper requeued\b",                        # reaper.sh:82
-]
+```
+DOZER_TIMEOUT_TEST (env, per-run)  >  timeout_test: on the repo's ecosystem.yaml entry  >  timeout_test: in org/config.yaml  >  900
 ```
 
-A shared `is_human_answer(body)` = unmarked **and** matches no signature replaces
-the bare `not is_agent_comment(...)` in **both** consumers:
+Implementation: `run_tests()` re-resolves the bound on **every call** —
 
-- `board_answers()` — the reconcile probe (`run.sh answer` / `board-answer`):
-  signature-matching unmarked comments are **refused** — excluded from the
-  answers, so the probe exits 3 (waiting) and the ask stays `board:to_review`.
-  The CLI prints each refusal loudly to stderr — `REFUSED: comment at <ts>
-  matches agent signature '<sig>' — not read as Vas's answer` — so the refusal is
-  *visible*, and the exit-3 message in `run.sh answer` names the case.
-- `alarm_clear()` (`_linear_api.py:533`) — same classifier, same refusal: an
-  unmarked "Dozer blocked…" line after the watchdog's ask must not hand the ball
-  to `board:responded`.
+- `timebox_secs test 900` first (env > org config, exactly as today);
+- when no env override is set, `tasks/ecosystem_workdir.py --flag timeout_test --path "$WORKDIR"`
+  is consulted; a value present replaces the bound and sets the **source label**
+  (`timeout_test (per-repo) in ~/ecosystem/ecosystem.yaml`) so the timeout message names the knob
+  that was actually in force;
+- a per-repo value that is not whole seconds **fails loud** (`timeout_test '90O' for <repo> in
+  ~/ecosystem/ecosystem.yaml must be whole seconds`) — no silent fall-through to the global bound;
+- an absent registry entry / missing key is "not set" (the documented `--flag` contract) → global bound.
 
-This is deliberately a *guard*, not the primary mechanism: it cannot enumerate
-everything an agent might post, and it must **fail toward visible** (GSAI-41's
-asymmetry: over-refusing leaves a real answer un-swapped for one awake — the
-Director sees the stderr line and can swap manually after eyeballing; under-refusing
-loses the question for good). If Vas genuinely quotes a status line as his answer,
-the probe refuses, the Director reads the refusal, recognizes the answer, and swaps
-by hand — the exact human-judgment path the protocol wants anyway.
+**Why lazy, not at crew start (the current `T_TEST=` line):** the crew resolves its bounds before
+the model passes run — but THIS task's build pass is the one that adds `timeout_test: 1800` to the
+dozers registry entry. Resolved upfront, this crew's own gates would still run at 900s and the task
+would block on itself a third time (a standalone 155s suite cannot exceed 900s — that exact reasoning
+is what the spec says was wrong twice). Lazy resolution closes the bootstrap bind: the registry edit
+the build pass makes is live for this crew's own task-worktree and green-gate runs, with no Director
+override — which is precisely the spec's "Done when". The other knobs (model/deps/push) stay upfront:
+their sources don't change mid-run.
 
-### 3. The reconcile rule in LINEAR.md says all of this
+**Upfront validation is preserved (GSAI-37's fail-before-spend):** crew start keeps a
+validation-only read — env, org config, and the per-repo flag are each regex-checked before the
+architect pass; garbage in any of them fails the crew with the value and source named, before any
+model time. Both runs (task worktree + green-gate) get the same bound — same repo.
 
-`directors/LINEAR.md` §"Every awake, reconcile FIRST" gains two sentences:
-scripted engine comments now self-stamp (a Director seeing `<!-- board-note … -->`
-knows it's the engine), and the probe **refuses known agent signatures** — exit 3
-with a stderr refusal line; if a refusal is genuinely Vas's answer, eyeball it and
-swap manually. The one-sentence contract itself ("an agent comment MUST carry a
-marker; an unmarked comment is Vas") is unchanged — the fix makes it *true*, not
-different.
+**The registry edit** (live, by the crew, before its own gates run — reported in the summary):
+on the `id: dozers` entry (`~/ecosystem/ecosystem.yaml:276-284`):
 
-**Director templates need no edit** — all four already carry the every-comment-
-carries-a-marker rule (chief.md:37, dev-director.md:63, mktg-director.md:85,
-ops-director.md:47), and the existing test case 12 pins it.
+```yaml
+    timeout_test: 1800   # GSAI-151: own suite ~155s standalone / ~1350s in-crew (measured, GSAI-73) — 900 killed green runs twice
+```
+
+1800 ≈ 1.3x the measured in-crew ceiling; after the plist fix it is comfortable headroom, and the
+hang guard degrades only in the one repo whose suite is known-heavy — every other repo keeps 900.
+
+### 2. Elapsed test time on the failure line (crew.sh)
+
+`run_tests()` records `$SECONDS` around the timebox and the two failure texts carry it:
+
+- red: `tests failed after 412s — not merging (worktree kept for resume)` (elapsed is genuinely new
+  information here — failed-at-3s vs failed-at-412s tells a Director very different things);
+- timeout: the existing `timed_out_msg` gains the elapsed and the **effective source**:
+  `tests (\`make test\`) timed out after 1800s — ran 1800s before the kill (timeout_test per-repo in
+  ~/ecosystem/ecosystem.yaml; DOZER_TIMEOUT_TEST to override for one run) — killed its process group`.
+
+These texts land in `.artifacts/dev/<id>.fail`, which `dozers/dozer.sh:333-337` already threads verbatim
+into `x #$id failed: $reason` and the block comment — no engine change needed. **Blast radius:**
+`tests/dev-lane-no-commit-gate-test.sh:214` pins the exact old red text; its assertion widens to a
+substring match (`*"tests failed after"*` + `*"not merging"*`). `tests/dev-lane-timeout-test.sh` and
+`dev-lane-model-exit-test.sh` assert substrings only (`*"timed out after ${BOUND}s"*`) and survive
+as-is.
+
+### 3. The plist fix (service.sh) — the root cause of the 4-8x
+
+`gen_plist()`: `ProcessType` goes `Background` → **`Standard`** (launchd's default band: fair
+scheduling — kept explicit and greppable, not omitted), with a comment: the engine IS the factory —
+its children do all the real work; the Background band is darwinbg QoS (lowest priority, E-core-only
+on Apple Silicon) for the entire tree, which measured this repo's own suite 4-8x slower in-crew and
+killed green runs (GSAI-151); `Standard` is deliberate. Why not `Adaptive` — it demotes under load
+heuristics, i.e. exactly when the factory is busiest (5 parallel crews), reintroducing the same
+unpredictable slowness. `KeepAlive`/`RunAtLoad`/`ThrottleInterval` untouched. The systemd unit has no
+equivalent throttle — unchanged.
+
+**The crew does NOT self-install.** `service.sh install` bootouts + bootstraps the agent; run from
+inside a crew it kills the crew's own parent tree mid-task. The activation step is post-merge,
+run by Vas/the Director from the main checkout: `dozers/service.sh install` (KeepAlive relaunches the
+loop at once; in-flight-task recovery is the reaper's, but the trigger is still not ours to pull).
+The per-repo timeout (item 1) is the protection that holds until then, and on any machine that has
+not reinstalled.
+
+### 4. `tests/run-all.sh` — one line: the suite total
+
+The final line gains the total elapsed (`run-all: PASS — 33/33 in 187s`). Per-test seconds are
+already printed; the total is what makes the standalone-vs-in-crew comparison — the whole basis of
+this issue's numbers — readable from a crew log without arithmetic across 33 lines. Report-only.
 
 ## Edge cases
 
-| Case | Behavior |
-|---|---|
-| Body already carries any `<!-- … -->` marker | Byte-identical, no double stamp (alarm/mirror paths unchanged) |
-| Empty / whitespace body from a scripted site | Stamped — an empty agent comment is still an agent comment |
-| Unmarked "Dozer claimed…" after an ask | Refused by the guard → exit 3, refusal logged, ask stays open |
-| Unmarked agent-signature line **and** a later genuine Vas comment | The signature line is refused, Vas's comment still answers → exit 0 with the right comment |
-| Vas quotes/repeats a status line as his real answer | Refused (fail toward visible) → Director eyeballs the refusal, swaps manually |
-| Pre-fix unmarked comments NOT matching a signature | Still auto-approve — residual, mitigated: the Chief backfilled all 50 on 2026-09-08 |
-| `alarm_clear` (heartbeat) path | Same classifier; a signature match → flag removed, never `board:responded` |
-| `DOZER_COMMENT_BY` unset | Default `dozer-engine` — the stamp never silently disappears |
-| files / github-issues backends | Untouched — their comments never reach the Linear reconcile |
-| Unicode openers (`♻️`, `→`) in signatures | Regex-anchored on the exact bytes the call sites emit |
+1. **Bootstrap bind** (this task's own gates run under the still-Background engine): solved by lazy
+   resolution + the live registry edit landing before the gates — no Director override, matching
+   the spec's Done-when. If anything still times out, the failure text now names the knob and source.
+2. **Garbage per-repo value** — fails loud at crew start AND at run time; never silently demoted.
+3. **Repo absent from the registry** (or stale `local:` path) — flag lookup misses → global 900;
+   the registry-sweep already guards stale paths.
+4. **Env override always wins** — a Director's deliberate per-run choice beats both configs.
+5. **The gate is never waived** — no `TEST_GATE` logic is touched; no `.dozers-no-test-gate` added.
+6. **`run-all.sh`'s own per-test watchdog** (`TEST_TIMEOUT`, default 240s) is a separate, env-tunable
+   bound; worst in-crew per-test measurement (167s) sits under it. Left alone, noted here so the
+   knob is discoverable if a single test ever needs more.
+7. **Non-macOS:** the plist assertions run against `service.sh plist` output anywhere; the systemd
+   path is untouched.
+8. **Old plists in the wild:** any machine installed before this fix carries Background until
+   `service.sh install` is re-run from the fixed repo — the regression test prevents reintroduction
+   at the source.
 
 ## How it gets tested
 
-Extend `tests/board-reconcile-test.sh` — same protocol, same regression file,
-keeping its python-harness idiom (`LINEAR_API_KEY=test-not-used`, pure functions
-+ stubbed I/O, assertions in bash so a failure names itself):
-
-- **STAMP (the acceptance: "a fresh Dozer run leaves zero unmarked comments").**
-  Stub `lin.gql`/`lin.issue` to capture the `commentCreate` body; assert: an
-  unmarked body gains the `board-note by:dozer-engine` marker; `DOZER_COMMENT_BY`
-  is honored; an already-marked body round-trips **byte-identical** (no double
-  stamp); `_comment_url()` (alarm path) stamps the same way.
-- **GUARD (the incident).** `board_answers` with the exact GSAI-60 shapes — an
-  unmarked `Dozer claimed - lane:marketing` / `♻️ Reaper requeued` /
-  `Director approved → …` comment after an ask → NOT answered; the CLI probe exits
-  3 **with the refusal on stderr**; mixed case (signature line, then Vas's real
-  answer) → exit 0 returning Vas's line only. With the current code this FAILS
-  (the status line reads as the answer) — the test is the repro.
-- **ALARM.** `alarm_clear` with an unmarked signature line after the watchdog's
-  ask → flag removed, not `board:responded` (mirrors existing case 11).
-- **STRUCTURE PIN.** A bash grep asserting the only `commentCreate` sites in
-  `_linear_api.py` are `comment()` and `_comment_url()` and both route through
-  `_stamp_marker` — a future raw poster cannot slip in unnoticed.
-- **Existing cases 1-12 stay green** — the `answered()` helper unpacks the
-  extended `board_answers` return; no pinned behavior changes. No new file to
-  register (`run-all.sh` globs `tests/*-test.sh`; the GSAI-30 scrub keeps
-  `LINEAR_API_KEY` out).
-
-Full `tests/run-all.sh` must stay green — nothing else in the repo pins comment
-text (verified: no test asserts on the engine's comment bodies or the
-`comment()` mutation).
-
-## Post-merge verification (for the Dev-Director, not this pass)
-
-The acceptance "a reconcile dry-run over the current 22 board issues flips
-nothing": loop `directors/run.sh answer <id>` over every `board:to_review` issue
-in the Board view — every one must exit 2 or 3; any exit 0 must be a comment Vas
-actually wrote. Plus: the next natural Dozer run on any board issue leaves
-`<!-- board-note by:… -->` on its status comments — one glance at a fresh claim
-comment confirms the write side live.
-
-## Risk
-
-Low and layered. The stamp changes only bodies that today are guaranteed unmarked
-(making them match the read-side rule that already exists), the guard only
-*removes* auto-approvals (never creates one), and both are pinned by a regression
-test that reproduces the measured incident. The one real behavioral risk — a
-refusal swallowing a genuine answer — is by design visible (stderr + the ask stays
-on the Board) and recoverable by hand, which is strictly safer than the status quo:
-a question Vas never saw being marked answered by a machine.
+- **`tests/dev-lane-timeout-per-repo-test.sh` (new)** — drives the REAL crew against a throwaway
+  repo, in the dev-lane family's style, with `ECOSYSTEM_REGISTRY` pointed at a fixture registry:
+  - **PER-REPO**: registry maps the repo to `timeout_test: 4`; a hanging test command → blocked,
+    reason names `timed out after 4s` AND the per-repo source (ecosystem.yaml)
+  - **ENV WINS**: same repo + `DOZER_TIMEOUT_TEST=6` → reason names 6s
+  - **FALLBACK**: repo absent from the fixture registry, org-config `timeout_test: 5` (via
+    `TIMEBOX_CONFIG`) → reason names 5s
+  - **ELAPSED**: a fast-failing test command → `.fail` carries `failed after` + seconds
+  - **GARBAGE**: registry value `90O` → crew fails fast naming the value and file, before spend
+  - plus the family's standing checks: develop untouched, process group actually killed
+- **`tests/service-test.sh`**: the generated plist carries `ProcessType` = `Standard` and must NOT
+  contain `Background`; `plutil -lint` (already run) confirms the value is legal.
+- **`tests/dev-lane-timeout-test.sh` / `dev-lane-model-exit-test.sh`**: still green as-is (substring
+  assertions; env path unchanged). **`dev-lane-no-commit-gate-test.sh`**: assertion widened as above.
+- **Full suite:** `make test` green — red = not done.
+- **Mechanism confirmation (post-merge, reported on the task):** after `service.sh install`,
+  `launchctl print gui/$(id -u)/com.dozers.loop` shows the job at standard, and the next dozers-repo
+  crew's log shows the suite total near the 155s standalone baseline — the 4-8x collapsed, GSAI-73's
+  failure mode unreachable both ways (per-repo headroom even if a machine is still Background).
