@@ -622,7 +622,7 @@ $1"
     fi
   }
 
-  # -- 2c. REVIEW: spec + diff -> DOZER-REVIEW.md, first line VERDICT: PASS|FAIL --
+  # -- 2c. REVIEW: spec + diff -> DOZER-REVIEW.md, verdict line (tolerant scan, GSAI-155) --
   REVIEW_VERDICT=""
   review_once() {
     local vline
@@ -645,12 +645,25 @@ EOF
     if [[ -z "${MODEL_CMD:-}" ]]; then
       git -C "$WT" add DOZER-REVIEW.md 2>/dev/null \
         && git -C "$WT" commit -q -m "dozer #$ID: review (review pass)" 2>/dev/null || true
-      vline="$(head -n1 "$WT/DOZER-REVIEW.md" 2>/dev/null | tr -d '\r' || true)"
-      # A missing or garbled verdict IS a fail — no free pass to merge.
+      # A missing or garbled verdict IS a fail — no free pass to merge. But the verdict
+      # need not be the literal first line: a markdown title above it is cosmetic, not a
+      # judgment (GSAI-155 — a titled PASS scored FAIL and rejected CFW-254 twice). Scan
+      # the file for the first line that is EXACTLY a verdict, skipping fenced code
+      # blocks (a review quoting the previous round's "VERDICT: FAIL" inside ``` is
+      # quoting, not concluding) — the prompt still demands the verdict first, so the
+      # model's own verdict is the first hit. CRLF, leading whitespace, and casing are
+      # tolerated; anything else on the line is still garbled.
+      vline="$(awk '
+        { sub(/\r$/, "") }                                  # CRLF-proof every line first
+        /^```/ { f = !f; next }                             # fence toggle; ```bash opens too
+        f { next }                                          # inside a fence: quoted text
+        toupper($0) ~ /^[ \t]*VERDICT:[ \t]*PASS[ \t]*$/ { print "PASS"; exit }
+        toupper($0) ~ /^[ \t]*VERDICT:[ \t]*FAIL[ \t]*$/ { print "FAIL"; exit }
+      ' "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
       case "$vline" in
-        "VERDICT: PASS") REVIEW_VERDICT="PASS" ;;
-        "VERDICT: FAIL") REVIEW_VERDICT="FAIL" ;;
-        *)               REVIEW_VERDICT="FAIL" ;;
+        PASS) REVIEW_VERDICT="PASS" ;;
+        FAIL) REVIEW_VERDICT="FAIL" ;;
+        *)    REVIEW_VERDICT="FAIL" ;;   # empty/missing file or no verdict line anywhere
       esac
       echo "    [dev] review verdict: $REVIEW_VERDICT"
     else
