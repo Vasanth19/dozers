@@ -45,6 +45,8 @@ fi
 
 LOGS="$(mktemp -d)"; trap 'rm -rf "$LOGS"' EXIT
 pass=0; failed=()
+suite_start=$SECONDS   # GSAI-151: the TOTAL is what the standalone-vs-in-crew
+                       # comparison reads — per-test seconds are printed per line.
 
 for t in "${TESTS[@]}"; do
   name="$(basename "$t")"
@@ -68,9 +70,10 @@ for t in "${TESTS[@]}"; do
 done
 
 echo
+suite_took=$(( SECONDS - suite_start ))
 if (( ${#failed[@]} == 0 )); then
-  echo "run-all: PASS — ${pass}/${#TESTS[@]}"
+  echo "run-all: PASS — ${pass}/${#TESTS[@]} in ${suite_took}s"
 else
-  printf 'run-all: FAIL — %s/%s passed; failures: %s\n' "$pass" "${#TESTS[@]}" "$(IFS=', '; echo "${failed[*]}")" >&2
+  printf 'run-all: FAIL — %s/%s passed in %ss; failures: %s\n' "$pass" "${#TESTS[@]}" "$suite_took" "$(IFS=', '; echo "${failed[*]}")" >&2
   exit 1
 fi

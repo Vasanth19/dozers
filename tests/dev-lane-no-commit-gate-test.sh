@@ -40,8 +40,9 @@
 #   RESUME-TESTS-FAIL — same run-1 construction; between runs a failing t.sh is
 #               committed onto the kept task branch (prior work that is NOT green).
 #               Run 2 with BUILD_MODE=nothing: the gate passes on the existing
-#               feature diff, the tests run and fail → blocked with "tests failed —
-#               not merging (worktree kept for resume)", develop untouched. The gate
+#               feature diff, the tests run and fail → blocked with "tests failed
+#               after Ns — not merging (worktree kept for resume)" (GSAI-151 added
+#               the elapsed), develop untouched. The gate
 #               runs AFTER the tests by construction, so it never rescues red work.
 #
 # Run:  bash tests/dev-lane-no-commit-gate-test.sh   (exits non-zero on failure)
@@ -211,7 +212,9 @@ run_crew "$PC" "$ID_C" "$LOG" COUNT_FILE="$TMP/c-r2.count" BUILD_MODE=nothing RE
 [[ $rc -ne 0 ]] && ok "RESUME-TESTS-FAIL: the resume blocks (exit $rc)" \
   || { no "RESUME-TESTS-FAIL: red prior work MERGED (the tests stopped gating)"; dump "$LOG"; }
 r="$(reason "$ID_C")"
-[[ "$r" == "tests failed — not merging (worktree kept for resume)" ]] \
+# GSAI-151: the red line now carries the elapsed seconds ("tests failed after Ns —
+# not merging …"), so this pins the semantics, not the exact string.
+[[ "$r" == *"tests failed after"* && "$r" == *"not merging"* ]] \
   && ok "RESUME-TESTS-FAIL: blocked by the TEST gate, which runs before the merge" \
   || { no "RESUME-TESTS-FAIL: wrong reason: '$r'"; dump "$LOG"; }
 grep -qF 'build agent produced no commits' "$LOG" \

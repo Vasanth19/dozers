@@ -40,6 +40,12 @@ echo "$PLIST" | grep -q "$ENV_FILE"                                && ok "env fi
 echo "$PLIST" | grep -q "$LOG_DIR/loop.out.log"                    && ok "stdout redirected to log"          || no "StandardOutPath missing"
 echo "$PLIST" | grep -q "$LOG_DIR/loop.err.log"                    && ok "stderr redirected to log"          || no "StandardErrorPath missing"
 echo "$PLIST" | grep -q '<string>45</string>'                      && ok "POLL_SECONDS threaded into env"    || no "POLL_SECONDS not passed"
+# GSAI-151: the engine runs in Standard (fair scheduling), never the Background band —
+# darwinbg QoS pins the whole process tree to E-cores and measured the repo's own
+# suite 4-8x slower in-crew, killing green runs at the 900s bound (GSAI-73).
+echo "$PLIST" | grep -A1 '<key>ProcessType</key>' | grep -q '<string>Standard</string>' \
+                                                                 && ok "ProcessType Standard (fair scheduling)" || no "ProcessType not Standard"
+echo "$PLIST" | grep -q '<string>Background</string>'            && no "ProcessType Background — the darwinbg band that 4-8x'd the engine (GSAI-151)" || ok "Background band gone (GSAI-151)"
 
 # Well-formed plist XML — only assert where plutil exists (macOS).
 if command -v plutil >/dev/null 2>&1; then
