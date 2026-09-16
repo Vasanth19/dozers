@@ -1,141 +1,175 @@
-# GSAI-96 — design: reaper deletes live Director locks — `director-*.lock` has no `owner`, so its pid reads empty
+# GSAI-155 — design: a passing review scored FAIL because the verdict parse reads `head -n1` only
 
-**Task:** `~/.dozers/locks/` is a shared namespace. Besides the Dozer's run-locks
-it holds the Directors' `director-<role>.lock`, written by
-`ecosystem/scripts/director-awake.sh` — a directory with a **bare `pid` file and no
-`owner` at all**. The reaper (`dozers/reaper.sh`) read the owning pid only from
-`owner`, so a Director lock read as an empty pid. Two distinct failures came out
-of that, and the worse one was not the reported one:
+**The bug.** `dozers/dev-lane/crew.sh` (`review_once`, ~lines 647–655) scores the
+review pass by reading exactly one line of `DOZER-REVIEW.md`:
 
-1. **The sweep died before it started.** `_field` was
-   `grep … | head -1 | cut …`; grep on a *missing* file exits 2, `pipefail`
-   propagates it, and under `set -e` the assignment
-   `local_id="$(_field "$lock/owner" task)"` aborted the whole script at exit 2 —
-   a failure swallowed by dozer.sh's `recover() … || true`. So for as long as ANY
-   Director held a lock, every reaper run was a no-op: no orphan requeue, no
-   stale-lock reaping. **Crash recovery was silently off.** Reproduced: one
-   `director-*.lock` in LOCK_DIR makes the pre-fix reaper exit 2 having done
-   nothing.
-2. **It deleted live Director locks.** Make `_field` tolerant on its own — the
-   obvious one-line fix — and the sweep now reaches those locks with an empty
-   pid, `_alive ""` is false, so it calls a mid-pass Director "stale" and
-   `rm -rf`s its mutex. The next launchd fire then starts a second pass on top
-   of the running one. Verified by test: a `_field`-only patch passes the abort
-   assertions and fails the preservation ones.
+```bash
+vline="$(head -n1 "$WT/DOZER-REVIEW.md" 2>/dev/null | tr -d '\r' || true)"
+case "$vline" in
+  "VERDICT: PASS") REVIEW_VERDICT="PASS" ;;
+  "VERDICT: FAIL") REVIEW_VERDICT="FAIL" ;;
+  *)               REVIEW_VERDICT="FAIL" ;;
+esac
+```
 
-**Repo:** dozers. **Files touched:** `dozers/reaper.sh`,
-`dozers/dozer.sh` (run_one's `owner` write, `inflight_count`, `doctor`),
-`dozers/heartbeat-check.sh` (`live_crews`), `tests/reaper-test.sh`.
+The review prompt demands the verdict as the FIRST line, but models sometimes open
+with a markdown title — `# Review of CFW-254` — before writing `VERDICT: PASS`.
+`head -n1` then returns the title, the `case` falls to `*)`, and a PASSING review is
+scored FAIL. Consequence: one pointless rebuild (model spend), a re-review, and a
+second FAIL for the same cosmetic reason → **CFW-254 was rejected twice and blocked**.
+The parse runs only on the routed path (non-`MODEL_CMD`), which is the production
+path — the `MODEL_CMD` bypass auto-passes and every existing test that stubs via
+`MODEL_CMD` never exercises it.
 
-> **Provenance note:** the implementation for this task was already committed on
-> this branch (`bd336a0`) by the prior session before this design was written.
-> This document records the design that commit embodies. A later merge from
-> develop (`f325eb0`) carried GSAI-76's overlapping work on
-> `inflight_count`/`live_crews`; the resolution is a **superset** of both
-> designs (name-skip *and* owner-file guard) and review of the merged code plus
-> a full `tests/reaper-test.sh` run (PASS on the reaper sweep) found nothing
-> that must change.
->
-> **Correction (post-review):** the `doctor` clause above was written as design
-> intent, but `bd336a0` had not implemented it — the review pass (9cb0b49)
-> caught `doctor` aborting on a pid-less foreign lock for the same `set -e`
-> reason as failure #1. The fix landed in `7051b27`: `doctor` now tolerates
-> missing `pid` files and reports foreign locks in their own section without
-> dying, and `tests/reaper-test.sh` gained three assertions pinning it
-> (completes, reports the lock, keeps reporting past it). Full suite on this
-> branch: **PASS**.
+**The invariant to keep.** "A missing or garbled verdict IS a fail — no free pass to
+merge." The fix widens WHERE the verdict line may sit; it does not loosen WHAT a
+verdict line is. An absent, ambiguous, or malformed verdict still scores FAIL.
 
----
+## Approach
 
-## Approach — a lane boundary, not a pid-parsing tweak
+Replace the `head -n1` read with a **tolerant scan** for the first verdict-shaped
+line anywhere in the file, printed in canonical form:
 
-The bug is not "we parsed the wrong file"; it is "we forgot the lock dir is
-shared ground." Tolerating a missing `owner` would have shipped failure #2 as a
-fix for failure #1. The design therefore separates **whose lock is this?** from
-**is its holder alive?** and refuses the first question before answering the
-second.
+```bash
+# A missing or garbled verdict IS a fail — no free pass to merge. But the verdict
+# need not be the literal first line: a markdown title above it is cosmetic, not a
+# judgment (GSAI-155 — a titled PASS scored FAIL and rejected CFW-254 twice). Scan
+# the file for the first line that is EXACTLY a verdict, skipping fenced code
+# blocks (a review quoting the previous round's "VERDICT: FAIL" inside ``` is
+# quoting, not concluding) — the prompt still demands the verdict first, so the
+# model's own verdict is the first hit. CRLF, leading whitespace, and casing are
+# tolerated; anything else on the line is still garbled.
+vline="$(awk '
+  { sub(/\r$/, "") }                                  # CRLF-proof every line first
+  /^```/ { f = !f; next }                             # fence toggle; ```bash opens too
+  f { next }                                          # inside a fence: quoted text
+  toupper($0) ~ /^[ \t]*VERDICT:[ \t]*PASS[ \t]*$/ { print "PASS"; exit }
+  toupper($0) ~ /^[ \t]*VERDICT:[ \t]*FAIL[ \t]*$/ { print "FAIL"; exit }
+' "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+case "$vline" in
+  PASS) REVIEW_VERDICT="PASS" ;;
+  FAIL) REVIEW_VERDICT="FAIL" ;;
+  *)    REVIEW_VERDICT="FAIL" ;;   # empty/missing file or no verdict line anywhere
+esac
+```
 
-**In `reaper.sh`:**
+Notes on the shape:
 
-- `_lock_foreign <lock>` — a lock with **no `owner` file is not ours**. Never
-  killed, never removed, only reported; its holder does its own stale recovery
-  (director-awake.sh already probes `kill -0` and clears). This is the load-
-  bearing invariant: *every* Dozer run-lock writes `owner`, so "no owner" means
-  "not a run-lock."
-- `_lock_state` gains a **`foreign`** verdict beside `live|stale|none`; an
-  in-flight task whose lock is foreign is left alone with a report line —
-  requeueing while the lock stands would just loop (drain skips locked ids).
-- `_reap_lock` refuses foreign locks outright (`return 1`), before any kill or
-  `rm -rf`.
-- `_lock_pid` reads the pid from **either** layout (`owner`'s `pid=` field, or
-  the bare `pid` file) — purely so the *report* tells the truth about a foreign
-  holder's liveness; the verdict never depends on it.
-- `_field` can no longer be fatal: `… || true` so a missing file is an empty
-  answer, not an abort. Absence is data.
-- New `foreign-skipped=N` counter in the summary line, so foreign locks are
-  visible in routine output instead of being silently ignored.
+- **First match wins**, and the prompt is left byte-identical — it still says "FIRST
+  LINE is exactly VERDICT: PASS|FAIL". The scan is a backstop for models that add a
+  title, not a license to bury the verdict; a compliant review's verdict precedes
+  any quoted old verdicts, so first-match picks the model's own conclusion.
+- **Fenced blocks are skipped.** A rebuild's review often quotes the previous FAIL
+  (the rebuild prompt embeds its notes). A quoted `VERDICT: FAIL` inside ``` must not
+  beat the review's own `VERDICT: PASS`. Two awk lines buy that; a plain
+  `grep -m1` does not.
+- **The verdict line itself stays strict** — `VERDICT:` + exactly `PASS`/`FAIL` +
+  whitespace, nothing else. `VERDICT: PASS — LGTM` is still garbled → FAIL, by
+  fail-fast doctrine: the tolerance covers the observed failure class (a title
+  above the verdict), not every model flourish. Casing, leading indentation, and
+  CRLF are the only further relaxations, all direction-neutral.
+- **`|| true` + `case` on the canonical token** preserve the existing set -e /
+  pipefail safety: awk on a missing file exits non-zero; empty output falls to `*)`
+  and FAILs, exactly as the empty `head -n1` did.
+- macOS awk (BWK) supports `toupper`, `[ \t]` classes, and `sub` — no GNU-isms.
 
-**In `dozer.sh`:**
+**Not touched:**
 
-- run_one's `owner` write is **no longer best-effort**. That file is the
-  reaper's *proof* the lock is ours; a failed write now releases the lock and
-  skips the task (`return 1`) instead of creating a run-lock that is invisible
-  to the reaper and unreapable. This is what makes "no owner ⇒ not ours" safe
-  to rely on — there is no mid-race window where one of OUR locks lacks
-  `owner`.
-- `inflight_count` counts run-locks only (skip `director-*.lock` by name, skip
-  owner-less locks, skip dead owners) — Director locks were inflating the
-  beacon by up to 4.
-- `doctor` lists other holders' locks in their own section rather than as
-  DEAD/stale run-locks — and no longer aborts on them for the same `set -e`
-  reason as failure #1.
+- The review prompt text (lines ~634–635) — contract unchanged.
+- The `MODEL_CMD` bypass (auto-PASS, line 657) and the DRY_RUN stub (line 561) —
+  the stub already writes the verdict on line 1.
+- The rescue path (`run_model_pass file:` proof) — a rescued review still feeds the
+  same `review_once` parse, so it inherits the fix (that interplay is exactly what
+  the new TITLED case exercises).
+- `promote.sh` / `audit-merged.sh` / `verify-merge.sh` — their `head -n1` reads
+  parse other things (config lines, receipts), not review verdicts. Out of scope.
 
-**In `heartbeat-check.sh`:** `live_crews` skips owner-less locks explicitly —
-same behavior, now intentional rather than incidental. (Post-GSAI-76 merge it
-also skips `director-*.lock` by name; the two guards are deliberate defense in
-depth, see Edge cases.)
+## Files to touch
+
+| File | Change |
+|---|---|
+| `dozers/dev-lane/crew.sh` | Replace the `head -n1` verdict read in `review_once` (~647–654) with the fence-aware scan above; update the section comment at ~625 ("first line VERDICT") to say "verdict line (tolerant scan, GSAI-155)" |
+| `tests/dev-lane-model-exit-test.sh` | Extend the shared stub's `REVIEW_MODE` with `titled` / `titled-fail`; add the two cases below |
 
 ## Edge cases
 
-| Case | Behavior |
-|---|---|
-| Live Director mid-pass (`director-*.lock`, pid alive) | `foreign` — never killed, never reaped, reported; holder process untouched |
-| Leftover Director lock (holder pid dead) | Still `foreign` — still not ours to reap; the Directors' own awake script clears it |
-| In-flight Linear task whose lock is foreign | Reported, **not** requeued — requeueing under a standing lock loops (drain skips locked ids) |
-| One of OUR locks whose `owner` write just failed | run_one releases the lock and skips the task — no owner-less run-lock can exist, so the foreign rule never strands our own work |
-| Runaway own worker (alive but over `REAPER_MAX_AGE`) | Unchanged: killed then lock reaped — the watchdog path only ever touches locks WITH an `owner` |
-| `director-*.lock` that someday grows an `owner` file | Excluded from crew counts by **name** (GSAI-76's guard), and would be treated as ours by the reaper — but crew locks are keyed by task id (e.g. `LIVE-A`), so a real collision requires a Linear issue literally named `director-*` |
-| A future non-Director foreign holder in LOCK_DIR | Same rules apply — the boundary is "has no `owner`," not a hardcoded Directors list |
-| `set -e` / `pipefail` on any missing-file read | Every field read is non-fatal; absence reads as empty, never as an abort |
+1. **Title above the verdict** (the bug) → verdict found → correct score.
+2. **CRLF line endings** → stripped per line in awk before matching.
+3. **Indented verdict line** (`  VERDICT: PASS`) → matches.
+4. **Lowercase** (`verdict: pass`) → matches via `toupper` (direction-neutral).
+5. **No `VERDICT:` line anywhere** (the garbled/truncated case) → FAIL — unchanged
+   behavior, still covered by the existing GARBLED-VERDICT case.
+6. **Empty or missing file** → empty `vline` → FAIL — unchanged.
+7. **Quoted old verdict inside a ``` fence** → skipped; the review's own verdict
+   wins.
+8. **Fence marker inside a longer line** (`use ``` fences` mid-prose) → does not
+   toggle (anchored `^``` `); an indented fence also does not toggle — accepted
+   imprecision, fail-safe direction (worst case: a quoted verdict inside an
+   indented fence is *also* skipped, which is what we want anyway).
+9. **`VERDICT: PASS` with trailing prose on the same line** → still FAIL (strict
+   token; deliberate — see "invariant").
+10. **UTF-8 BOM before a line-1 verdict** → no match → FAIL. Same as today
+    (`head -n1` failed on it too); not a regression, not worth the escape-sequence
+    gymnastics in awk.
+11. **Verdict after a fenced block closes** → `f` toggles back on the closing
+    fence, so trailing verdicts still match.
 
 ## How it gets tested
 
-`tests/reaper-test.sh` stages Director locks (live + dead-pid leftover) beside
-the normal crew fixtures for the **whole run**, so every pre-existing
-requeue/reap assertion doubles as the failure-#1 regression (the sweep must
-reach its verdicts with foreign locks present). It asserts: rc=0 and a summary
-line (the pre-fix script exits 2 with no output), both foreign locks preserved,
-and the Director holder process still running. Since `7051b27` it also asserts
-`doctor` against a pid-less foreign lock: completes rc=0, reports the lock,
-and keeps reporting past it (the review pass found the pre-fix `doctor`
-aborting there). Run on this branch after the
-GSAI-76 merge: **PASS** — including "live Director lock preserved",
-"foreign lock never reaped", "Director process left running", and the three
-`doctor` assertions.
+The parse is inline in `review_once`, so the test drives the real crew through the
+routed path (`run_crew_routed` in `tests/dev-lane-model-exit-test.sh` — the same
+harness the GARBLED-VERDICT case built, because the verdict parse is skipped under
+the `MODEL_CMD` bypass).
 
-Related suites that pin the same boundary elsewhere:
-`tests/heartbeat-test.sh` and `tests/heartbeat-check-test.sh` (GSAI-76) pin
-`inflight_count`/`live_crews` against Director locks; `make test` at commit
-time was 19/21 with the two failures pre-existing and unrelated (fanout timing
-assertion; ecosystem-workdir registry drift).
+**Stub change** — restructure the review branch's `if/else` into a `case`:
 
-## Risk
+```bash
+case "${REVIEW_MODE:-pass}" in
+  garbled)    printf 'Reviewing the diff, but the write was truncated before any verdict line\n' > DOZER-REVIEW.md ;;
+  titled)     printf '# Review — verdict behind a title\r\n\r\nVERDICT: PASS\r\nall good\r\n' > DOZER-REVIEW.md ;;
+  titled-fail) printf '# Review — verdict behind a title\r\n\r\nVERDICT: FAIL\r\nnot good\r\n' > DOZER-REVIEW.md ;;
+  *)          printf 'VERDICT: PASS\nall good\n' > DOZER-REVIEW.md ;;
+esac
+```
 
-Low, and asymmetrically safe: every change either *narrows* who the reaper may
-touch (foreign locks become untouchable) or makes a read non-fatal (absence is
-an answer, not an abort). The one new hard edge — run_one failing a task when
-the `owner` write fails — is strictly better than the alternative it replaces
-(a lock the reaper can neither see nor reap), and it surfaces loudly ("could
-not write $lock/owner") instead of silently. The residual risk is the name/
-owner duality shared with GSAI-76: both guards must stay in sync if the lock
-layout ever changes, and both test suites pin exactly that.
+(`titled` uses CRLF so one case covers title + CRLF tolerance together; the file
+format is cosmetic to the parser under test.)
+
+**New case TITLED-VERDICT** (the CFW-254 regression, end-to-end):
+`run_crew_routed … TEST-ME-E REVIEW_MODE=titled REVIEW_EXIT=1` — the non-zero exit
+also exercises the rescue→parse interplay, mirroring how the real failure fired.
+Assert:
+
+- crew exits 0 and develop advanced to `merge*TEST-ME-E*` (pre-fix: FAIL → rebuild
+  → re-FAIL → blocked);
+- log contains `review verdict: PASS` (proof the parse scored it, not the bypass);
+- exactly **1** `⚠ review agent exited 1 but DOZER-REVIEW.md is on disk` line;
+- stub ran **3** times (arch, build, review — no rebuild; pre-fix: 5).
+
+**New case TITLED-VERDICT-FAIL** (tolerance must not smuggle FAILs through):
+`run_crew_routed … TEST-ME-F REVIEW_MODE=titled-fail REVIEW_EXIT=1`. Assert:
+
+- crew blocked, reason contains `review failed TWICE`;
+- log shows `review verdict: FAIL` twice;
+- stub ran **5** times (the one rebuild);
+- develop untouched (`init`).
+
+**Unchanged guard:** GARBLED-VERDICT already proves "no verdict line anywhere →
+FAIL → rebuild → FAIL → blocked"; it must stay green byte-for-byte (no-verdict is
+a different failure class than titled-verdict).
+
+**Commands:**
+
+```bash
+bash tests/run-all.sh dev-lane-model-exit-test.sh   # targeted, fast
+make test                                           # full suite (the repo's own gate)
+```
+
+Plus a one-shot manual sanity check of the awk against the real CFW-254 shape
+(`# <title>` then `VERDICT: PASS`) and the GSAI-96 DOZER-REVIEW.md at this worktree
+root (verdict on line 1 — must still read PASS).
+
+**Provenance note:** the DOZER-DESIGN.md / DOZER-REVIEW.md currently at the worktree
+root are the previous task's pass artifacts, already merged into develop and
+inherited by this branch; this design overwrites the design file per the crew
+convention (`branch_has_output` excludes both from the merge gate).
