@@ -9,6 +9,8 @@ Env it reads:
   LINEAR_TEAMS     comma list of team keys, e.g. "CFW,LL"          — multi-team
   LINEAR_TEAM      a single team key, e.g. "CFW"                   — single-team
                    (LINEAR_TEAMS wins if both are set)
+  DOZER_COMMENT_BY identity stamped on every scripted comment's
+                   `<!-- board-note by:… -->` marker (GSAI-60)     — default dozer-engine
 
 Label lifecycle (dozer:* = execution; lane:/repo: = routing):
   greenlight -> dozer:ready + lane:<name>          (a Director sets both) — and a RESET:
@@ -405,7 +407,7 @@ def description(identifier):
 def comment(identifier, text):
     iss = issue(identifier)
     gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ success } }',
-        {"id": iss["id"], "b": text})
+        {"id": iss["id"], "b": _stamp_marker(text)})
 
 
 # --- board protocol: who wrote a comment? (GSAI-41) ------------------------------
@@ -421,13 +423,66 @@ def comment(identifier, text):
 # So the match is deliberately BROAD: any `<!-- … -->` at all means "an agent wrote this".
 # Over-matching leaves a real answer un-swapped for one awake (visible, on the Board);
 # under-matching loses the question for good (invisible). Fail toward visible.
+#
+# GSAI-60: GSAI-41 fixed the READ side, but the WRITE side relied on every scripted
+# poster remembering to mark — and none of them did. The Chief's 2026-09-08 sweep
+# measured it live: 11 of 22 board issues had unmarked agent comments (the Dozer's
+# claim/blocked/merged lines, the reaper's requeue note, run.sh's approvals) sitting
+# after the last board-ask — 50 comments, each one an auto-approval under the rule
+# above. Two defenses now:
+#
+#   WRITE side — comment() and _comment_url() are the ONLY commentCreate doors, and
+#   both route the body through _stamp_marker(): any scripted comment that forgot its
+#   marker self-identifies as `<!-- board-note by:<DOZER_COMMENT_BY> -->` before
+#   posting. Forgetting the marker is impossible at the only door they all walk
+#   through.
+#
+#   READ side — is_human_answer() adds a signature guard on top of the marker rule:
+#   an unmarked comment whose opener matches AGENT_SIGNATURES (a pre-fix comment, an
+#   LLM-authored comment that forgot its marker, a poster that bypassed comment()) is
+#   REFUSED as an answer, loudly. Same asymmetry as the marker rule: over-refusing is
+#   visible and recoverable by hand; under-refusing loses the question for good.
 MARKER_RE = re.compile(r"<!--.*?-->", re.S)
 ASK_RE = re.compile(r"<!--\s*board-ask\b[^>]*-->")
+
+# Anchored on the EXACT openers the engine's scripted call sites emit
+# (dozers/dozer.sh claim/blocked/merged lines, directors/run.sh ready, dozers/reaper.sh).
+AGENT_SIGNATURES = [
+    re.compile(r"^Dozer (claimed|blocked|merged|staged)\b"),   # dozers/dozer.sh status lines
+    re.compile(r"^Director approved\b"),                        # directors/run.sh ready
+    re.compile(r"^♻️ Reaper requeued\b"),                        # dozers/reaper.sh
+]
 
 
 def is_agent_comment(body):
     """True when the body carries ANY `<!-- … -->` marker — i.e. an agent wrote it."""
     return bool(MARKER_RE.search(body or ""))
+
+
+def _stamp_marker(body):
+    """Append `<!-- board-note by:<DOZER_COMMENT_BY:-dozer-engine> -->` to any body
+    that carries no `<!-- … -->` marker at all. An already-marked body (board-ask,
+    board-mirror, board-clear, a Director's own note) passes through BYTE-IDENTICAL —
+    never double-stamped. The `by:` is provenance, not security; the default covers a
+    future call site that forgets to set it. Read at call time so the three callers
+    (dozer.sh → dozer-engine, reaper.sh → dozer-reaper, run.sh → director-cli) can
+    name themselves with one export each."""
+    body = body or ""
+    if MARKER_RE.search(body):
+        return body
+    return f"{body}\n\n<!-- board-note by:{os.environ.get('DOZER_COMMENT_BY') or 'dozer-engine'} -->"
+
+
+def _matching_signature(body):
+    """The first agent signature an UNMARKED body matches, or None."""
+    return next((s for s in AGENT_SIGNATURES if s.search(body or "")), None)
+
+
+def is_human_answer(body):
+    """The only comment the reconcile may read as Vas's answer: no marker AND no
+    known agent signature."""
+    body = body or ""
+    return not is_agent_comment(body) and _matching_signature(body) is None
 
 
 def _latest_ask(comments):
@@ -438,27 +493,45 @@ def _latest_ask(comments):
 
 def board_answers(comments):
     """Vas's answers to the newest ask: every comment AFTER the latest `board-ask` that
-    carries NO marker. Pure — takes the sorted comment list, no I/O.
-    Returns (ask, answers): ask is None when there is no board-ask at all."""
+    carries NO marker and NO known agent signature. Pure — takes the sorted comment
+    list, no I/O.
+    Returns (ask, answers, refused): ask is None when there is no board-ask at all.
+    refused is [(comment, signature_pattern)] — unmarked comments the guard excluded;
+    consumers surface them on stderr so a refusal is never silent."""
     comments = sorted(comments, key=lambda c: c["createdAt"])
     ask = _latest_ask(comments)
     if ask is None:
-        return None, []
+        return None, [], []
     later = [c for c in comments if c["createdAt"] > ask["createdAt"]]
-    return ask, [c for c in later if not is_agent_comment(c.get("body"))]
+    answers, refused = [], []
+    for c in later:
+        body = c.get("body") or ""
+        if is_agent_comment(body):
+            continue
+        sig = _matching_signature(body)
+        if sig:
+            refused.append((c, sig.pattern))
+        else:
+            answers.append(c)
+    return ask, answers, refused
 
 
 def board_answer(identifier):
     """CLI: did Vas answer the newest board-ask on <issue>?  Read-only.
     stdout: one line per answer `<createdAt>\t<first line>` ; exit 0 = answered,
-    3 = still waiting (nothing unmarked after the ask), 2 = no board-ask on the issue.
-    A Director swaps board:to_review -> board:responded ONLY on exit 0."""
-    ask, answers = board_answers(_issue_comments(identifier))
+    3 = still waiting (nothing unmarked-and-human after the ask), 2 = no board-ask.
+    A Director swaps board:to_review -> board:responded ONLY on exit 0.
+    GSAI-60: an unmarked comment matching a known agent signature is REFUSED and named
+    on stderr — if it genuinely is his answer, eyeball it and swap by hand."""
+    ask, answers, refused = board_answers(_issue_comments(identifier))
     if ask is None:
         print(f"{identifier}: no board-ask marker on this issue", file=sys.stderr)
         sys.exit(2)
+    for c, sig in refused:
+        print(f"REFUSED: comment at {c['createdAt']} matches agent signature '{sig}' — "
+              "not read as Vas's answer", file=sys.stderr)
     if not answers:
-        print(f"{identifier}: waiting — no unmarked comment after the ask at {ask['createdAt']}",
+        print(f"{identifier}: waiting — no unmarked human comment after the ask at {ask['createdAt']}",
               file=sys.stderr)
         sys.exit(3)
     for c in answers:
@@ -495,7 +568,7 @@ def _issue_comments(identifier):
 def _comment_url(identifier, body):
     iss = issue(identifier)
     d = gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ success comment{ url } } }',
-            {"id": iss["id"], "b": body})
+            {"id": iss["id"], "b": _stamp_marker(body)})
     return (d["commentCreate"].get("comment") or {}).get("url") or ""
 
 
@@ -530,8 +603,19 @@ def alarm_clear(identifier, body):
             last_ask = c["createdAt"]
     # GSAI-41: "human" = no marker AT ALL, not merely "not ours" — a Director's own
     # marked comment (`<!-- honey-preflight -->`, another board-ask) is never Vas.
-    human = any(c["createdAt"] > last_ask and not is_agent_comment(c["body"])
-                for c in comments) if last_ask else False
+    # GSAI-60: AND no known agent signature — an unmarked "Dozer blocked…" status line
+    # after the watchdog's ask must not hand the ball to board:responded.
+    human = False
+    if last_ask:
+        for c in comments:
+            if c["createdAt"] <= last_ask or is_agent_comment(c.get("body")):
+                continue
+            sig = _matching_signature(c.get("body"))
+            if sig:
+                print(f"REFUSED: comment at {c['createdAt']} matches agent signature "
+                      f"'{sig.pattern}' — not read as the human answer", file=sys.stderr)
+            else:
+                human = True
     if human:
         _relabel(iss, add=[BOARD_RESPONDED], remove=[BOARD_REVIEW])
     else:

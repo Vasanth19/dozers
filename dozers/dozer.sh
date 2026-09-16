@@ -19,6 +19,9 @@ set -euo pipefail
 export PATH="$HOME/.npm-global/bin:$PATH"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/tasks/adapter.sh"
+# GSAI-60: every scripted comment self-stamps `<!-- board-note by:<this> -->` — the
+# board reconcile reads an unmarked comment as Vas's answer.
+export DOZER_COMMENT_BY="dozer-engine"
 
 cfg() { grep -E "^$1:" "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
 POLL_SECONDS="${POLL_SECONDS:-30}"
