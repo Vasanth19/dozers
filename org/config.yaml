@@ -113,7 +113,7 @@ alarm_issue: "GSAI-38"                                  # standing tracking issu
 alarm_linear_env: "~/ecosystem/vault/linear.env"        # vault file holding LINEAR_API_KEY
 alarm_channel: "79c94c7b-4969-4320-a379-c4edc67df34b"   # Buzz channel: cfw.social (optional hop)
 alarm_mention: "557d141c51da17bab381925acbd26fc4bb2805cfd4d461c337b355d27f2477f6"  # @Fizz (chief)
-alarm_env: "~/ecosystem/vault/buzz.env"                 # vault file holding BUZZ_PRIVATE_KEY + BUZZ_RELAY_URL
+alarm_env: "~/ecosystem/vault/buzz.env"                 # vault file holding BUZZ_PRIVATE_KEY + BUZZ_RELAY_URL + BUZZ_AUTH_TAG
 # NOTE (2026-09-08): the Buzz hop is LIVE and delivers signed as Guzz — the Dev-Director
 # identity, which is the Dozer's own voice. History: the key was deliberately cleared on
 # 2026-09-03 when the identity moved into Buzz Desktop as a managed agent, then recovered
