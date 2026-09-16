@@ -8,6 +8,10 @@
 #   INFLIGHT  — count reflects the live CREW run-locks in LOCK_DIR at beat time, and
 #               excludes the Directors' own `director-*.lock` passes and dead owners
 #               (GSAI-76: counting either made the stall watchdog gate on a fiction)
+#   SURVIVE   — an owner-less crew lock (a tolerated owner-write failure leaves one
+#               behind for good) must not abort the beat under set -euo pipefail
+#               (GSAI-76 review: the unguarded grep|cut pipeline crashed the ticker
+#               silently AND the main loop — a frozen beacon on a live engine)
 #   ATOMIC    — no leftover *.tmp beacon after the write
 #   TICK      — a beat with no explicit tick keeps the tick already on the beacon
 #   DRAIN     — the beacon advances DURING a blocking drain, and `inflight` is live
@@ -87,6 +91,24 @@ BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
   bash "$ROOT/dozers/dozer.sh" heartbeat 9 >/dev/null
 [[ "$(field inflight)" == 2 ]] && ok "a stale lock (dead owner) is not in-flight work -> inflight stays 2" \
   || no "dead-owner lock counted as in-flight: got '$(field inflight)' want 2"
+
+# ── an owner-less crew lock must NOT be a crash (GSAI-76 review) ──────────────
+# run_one writes `owner` with `> … 2>/dev/null || true`, so a tolerated write
+# failure (or a mkdir→write race, or any future non-Director actor in the shared
+# dir) leaves a crew-named lock with NO owner behind — permanently. Under
+# set -euo pipefail an unguarded `grep … | head | cut` on the missing file failed
+# the whole pipeline through `cut`, failed the assignment, and aborted the shell:
+# silently in the ticker (stderr discarded — frozen beacon, watchdog false-alarm)
+# and fatally in the main loop's once-per-poll beat. This row exercises exactly
+# that case: the beat must SURVIVE, count it as 0, and keep the Beacon honest.
+mkdir -p "$LOCK_DIR/HBT-NO-OWNER.lock"   # crew-named lock, NO owner file
+if BACKEND=files ADAPTER_QUIET=1 LOCK_DIR="$LOCK_DIR" HEARTBEAT_FILE="$HB" \
+   bash "$ROOT/dozers/dozer.sh" heartbeat 9 >/dev/null 2>&1; then
+  [[ "$(field inflight)" == 2 ]] && ok "owner-less crew lock: the beat survives and skips it (inflight stays 2)" \
+    || no "owner-less lock leaked into inflight: got '$(field inflight)' want 2"
+else
+  no "heartbeat DIED on an owner-less crew lock — set -euo pipefail abort through the grep|cut pipeline"
+fi
 
 # With every crew gone the beacon must read 0 even while the Directors are mid-pass —
 # that zero is what lets the watchdog see an idle engine sitting on queued work.

@@ -60,8 +60,15 @@ inflight_count() {
   local n=0 lock pid; shopt -s nullglob
   for lock in "$LOCK_DIR"/*.lock; do
     case "${lock##*/}" in director-*.lock) continue ;; esac
-    # pipe through cut so a missing/owner-less lock yields "" instead of tripping set -e
-    pid="$(grep -E '^pid=' "$lock/owner" 2>/dev/null | head -1 | cut -d= -f2-)"
+    # The || true is load-bearing (GSAI-76 review): this script runs under
+    # `set -euo pipefail`, so a no-match grep (owner-less lock — a tolerated
+    # owner-write failure, or a mkdir→write race window) would fail the whole
+    # pipeline through the trailing cut, fail the assignment, and abort the
+    # shell. Verified live: with an owner-less lock present, the unguarded line
+    # exits 2 with no output. In the ticker subshell that failure is SILENT
+    # (stderr discarded), the beacon freezes, and the watchdog false-alarms
+    # engine-stalled — the exact failure class this fix exists to kill.
+    pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then n=$((n+1)); fi
   done
   shopt -u nullglob; printf '%s' "$n"
@@ -83,7 +90,10 @@ beacon_epoch() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || e
 # pretends to be a new poll cycle.
 heartbeat() {
   local tick="${1:-}"
-  [[ -z "$tick" ]] && tick="$(grep -E '^poll=' "$HEARTBEAT_FILE" 2>/dev/null | head -1 | cut -d= -f2)"
+  # Same pipefail guard as inflight_count: a missing beacon or a beacon without
+  # a poll= line makes grep exit 1, and under set -e the failed assignment would
+  # abort the whole beacon path (ticker AND the main-loop beat at every poll).
+  [[ -z "$tick" ]] && tick="$( { grep -E '^poll=' "$HEARTBEAT_FILE" 2>/dev/null || true; } | head -1 | cut -d= -f2)"
   [[ -z "$tick" ]] && tick=0
   mkdir -p "$(dirname "$HEARTBEAT_FILE")" 2>/dev/null || true
   local tmp="$HEARTBEAT_FILE.$BASHPID.tmp"
