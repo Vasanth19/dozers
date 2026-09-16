@@ -263,21 +263,38 @@ resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK + _P
   _PASS_DESC="$(eval "$_PASS_BLOCK" >/dev/null; printf '%s/%s' "${DOZER_MODEL_PROVIDER:-?}" "${DOZER_MODEL_NAME:-default}")"
 }
 
+# branch_has_output <dir> <sha> — the gate's question (GSAI-149): "does the branch
+# hold anything to merge?" — is there ANY diff vs the pinned base SHA beyond the pass
+# artifacts (DOZER-DESIGN.md / DOZER-REVIEW.md — committed by the crew's backstops,
+# and a design file is not a deliverable to merge). The ONE definition of "the build
+# did something", shared by build_once's no-commit gate and run_model_pass's
+# changes: proof — no two versions of it (spec point 5). Uncommitted working-tree
+# changes count as output, exactly as they did against the old per-attempt anchor.
+branch_has_output() {  # $1 = dir, $2 = pinned base sha
+  ! git -C "$1" diff --quiet "$2" -- . ':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md' 2>/dev/null
+}
+
 # run_model_pass <pass> <prompt> [proof] — one agent run under its own route, its own
-# timebox. <proof> (GSAI-147) names the pass's deliverable and is consulted ONLY when
-# the session exits non-zero AND it was not a timeout: the exit code is a side-channel,
-# not the deliverable — a model CLI can finish its work (write DOZER-DESIGN.md, commit
-# the build, write the verdict in DOZER-REVIEW.md) and still die on teardown (a
-# final-turn API error, a crash at exit). Before this, one such flake discarded a
-# PASSING review and re-ran the whole task from resume — three model runs of spend
-# for an exit code. Forms:
-#   file:<name>    → the $WT file exists and is non-empty  (architect, review)
-#   commits:<sha>  → the branch advanced past <sha>        (build)
-# A timeout ALWAYS fails (GSAI-37): a killed process may have left a truncated file,
-# and "hung = failed" is not negotiable — TIMEBOX_HIT wins over any artifact. No
-# deliverable → fails exactly as before: the rescue is earned by a deliverable, not
-# by exit-code generosity. Every rescue logs a loud ⚠ naming the pass, the exit code,
-# and the artifact — reported, never masked (fail-fast doctrine).
+# timebox. <proof> (GSAI-147, build form GSAI-149) names the pass's deliverable and
+# is consulted ONLY when the session exits non-zero AND it was not a timeout: the exit
+# code is a side-channel, not the deliverable — a model CLI can finish its work (write
+# DOZER-DESIGN.md, commit the build, write the verdict in DOZER-REVIEW.md) and still
+# die on teardown (a final-turn API error, a crash at exit). Before this, one such
+# flake discarded a PASSING review and re-ran the whole task from resume — three model
+# runs of spend for an exit code. Forms:
+#   file:<name>    → the $WT file exists and is non-empty       (architect, review)
+#   changes:<sha>  → the branch holds a diff vs <sha> beyond the pass artifacts
+#                    (branch_has_output)                        (build)
+# The build proof asks the gate's question, not "did THIS attempt advance past its
+# own anchor?": on a resume whose work is already committed, a build flake with
+# nothing new added is rescued by the PRIOR work — the per-attempt commits:/anchor
+# form (pre-GSAI-149) failed the crew before the gate could ever judge, leaving a
+# finished branch unrescuable. A timeout ALWAYS fails (GSAI-37): a killed process may
+# have left a truncated file, and "hung = failed" is not negotiable — TIMEBOX_HIT
+# wins over any artifact. No deliverable → fails exactly as before: the rescue is
+# earned by a deliverable, not by exit-code generosity. Every rescue logs a loud ⚠
+# naming the pass, the exit code, and the artifact — reported, never masked
+# (fail-fast doctrine).
 run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artifact (optional)
   resolve_pass "$1"
   echo "    [dev] $1 model: $_PASS_DESC"
@@ -298,9 +315,9 @@ run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artif
         echo "    [dev] ⚠ $1 agent exited $rc but ${3#file:} is on disk — continuing from the artifact"
         return 0
       fi ;;
-    commits:*)
-      if ! git -C "$WT" diff --quiet "${3#commits:}" -- 2>/dev/null; then
-        echo "    [dev] ⚠ $1 agent exited $rc but $BRANCH advanced past ${3#commits:} — continuing from its commits"
+    changes:*)
+      if branch_has_output "$WT" "${3#changes:}"; then
+        echo "    [dev] ⚠ $1 agent exited $rc but $BRANCH holds changes past ${3#changes:} — continuing from its work"
         return 0
       fi ;;
   esac
@@ -385,6 +402,21 @@ else
     || fail "could not create worktree $WT off $base: ${_wt_err:-unknown git error}"
   echo "    [dev] worktree $WT (off $base)"; echo 1 > "$STATE"
 fi
+
+# Pin the integration base as a SHA (GSAI-149): the no-commit gate and the build
+# pass's changes: proof diff against the base — and they must compare against the
+# base as it stood when this run's worktree state was settled, NOT against the ref
+# name resolved at gate time inside the worktree. Two traps the pin closes:
+#   • base="HEAD" (the integration branch exists remote-only, so there is no local
+#     ref) — resolved HERE in the main checkout, the same resolution `git worktree
+#     add` just used. A `git -C "$WT" diff HEAD …` at gate time would resolve HEAD
+#     INSIDE the worktree to the branch tip itself — a diff that is empty forever,
+#     failing every build on such repos.
+#   • a resume may have just rebased onto $base's NEW tip — the pin lands AFTER that
+#     rebase, so the diff is exactly the task's commits, never old-base noise.
+# $base the *name* keeps its other roles (resume detection, rebase, merge).
+BASE_SHA="$(git rev-parse --verify "$base" 2>/dev/null)" \
+  || fail "could not resolve the integration base '$base' to a commit — cannot gate the build"
 
 # ── 1b. Test-gate PREFLIGHT (GSAI-32) ──────────────────────────────────────────
 # The gate below runs only AFTER the coding agent, so a repo with no detectable test
@@ -489,10 +521,19 @@ else
     [[ -n "${1:-}" ]] && prompt="$prompt
 
 $1"
-    # The no-commit gate anchors at HEAD *now*: the architect pass commits the design,
-    # so diffing against $base would pass vacuously even if the build wrote nothing.
+    # GSAI-149: the gate's question is "does the branch hold anything to merge?" —
+    # a diff vs $BASE_SHA excluding the pass artifacts (branch_has_output) — NOT "did
+    # THIS attempt add commits?". A resume whose work is already complete correctly
+    # adds nothing, and the old per-attempt anchor failed such finished tasks forever
+    # (GSAI-144 attempt 4, BRD-88): the resume path reuses the worktree precisely
+    # because the branch is already ahead of the base. $anchor survives ONLY to
+    # distinguish "this attempt added nothing" for the resume info line below.
     anchor="$(git -C "$WT" rev-parse HEAD)"
-    run_model_pass build "$prompt" "commits:$anchor"
+    # The build pass's proof shares the gate's question (changes:$BASE_SHA — the same
+    # branch_has_output definition), so a non-timeout build flake on a resume is
+    # rescued by the prior work already on the branch where the per-attempt
+    # commits:$anchor proof killed the crew before the gate could judge.
+    run_model_pass build "$prompt" "changes:$BASE_SHA"
     # no-op if the agent (or link_deps) already provided node_modules
     install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
     resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
@@ -500,11 +541,25 @@ $1"
       (( TIMEBOX_HIT )) && fail "$(timed_out_msg "tests (\`$TEST_CMD\`)" "$T_TEST" test); not merging (worktree kept for resume)"
       fail "tests failed — not merging (worktree kept for resume)"
     fi
-    # `if !` not `&&`: build_once is CALLED as a plain command under set -e, so the
-    # function's exit status is its last command's — a bare `diff --quiet && fail`
-    # would return 1 (diff found the commits) and kill the crew right after a
-    # PASSING build. Inside `if`, the diff's status is exempt from set -e.
-    if git -C "$WT" diff --quiet "$anchor" -- 2>/dev/null; then
+    # The gate, restated (GSAI-149): pass when the branch holds anything to merge
+    # beyond the pass artifacts — the question above — so a resume with complete work
+    # proceeds to the merge it earned. A FIRST attempt whose only diff is the design
+    # file still fails (a design is not a deliverable), and the failure text stays
+    # byte-identical: it is still literally true when it fires — no commits, and no
+    # diff, beyond the artifacts. Tests already ran above, so a resume whose work is
+    # not green never reaches this gate.
+    # `if/else`, not `&&`/`||`: build_once is CALLED as a plain command under set -e,
+    # so the function's exit status is its last command's — a bare
+    # `diff --quiet && fail` would return 1 (diff found the commits) and kill the
+    # crew right after a PASSING build. Inside `if`, the diff's status is exempt.
+    if branch_has_output "$WT" "$BASE_SHA"; then
+      # The branch passes, but THIS attempt added nothing — say so in plain words
+      # (a resume whose work was already complete; also a rebuild after a FAILed
+      # review that judged nothing needs fixing).
+      if git -C "$WT" diff --quiet "$anchor" -- 2>/dev/null; then
+        echo "    [dev] build pass added nothing — branch already $(git -C "$WT" rev-list --count "$base..$BRANCH" 2>/dev/null) commits ahead of $base, continuing to test+merge"
+      fi
+    else
       fail "build agent produced no commits on $BRANCH"
     fi
   }
