@@ -143,15 +143,19 @@ engine_alive() {
 # reaper's problem, and counting it here would mask a real stall.
 #
 # $LOCK_DIR is shared with the DIRECTORS, whose awake passes take `director-<role>.lock`
-# as their own mutex (GSAI-76). Those are skipped BY NAME, not merely by the fact that
-# they carry no `owner` file today — the exclusion has to survive a Director lock that
-# grows one, because this count is what the stall gate below trusts.
+# as their own mutex (GSAI-76), stored as a bare `pid` file with no `owner` — so both a
+# name match AND an owner-file check exclude them today. GSAI-96 keeps BOTH guards
+# rather than swapping one for the other: the name match survives a Director lock that
+# someday grows an `owner` file (the case GSAI-76 originally worried about), and the
+# owner-file check survives any OTHER foreign mutex that isn't literally named
+# `director-*.lock`. This count is what the stall gate below trusts.
 live_crews() {
   if [ -n "${HB_ASSUME_CREWS:-}" ]; then printf '%s' "$HB_ASSUME_CREWS"; return 0; fi
   local n=0 lock pid
   for lock in "$LOCK_DIR"/*.lock; do
     [ -d "$lock" ] || continue
     case "${lock##*/}" in director-*.lock) continue ;; esac
+    [ -f "$lock/owner" ] || continue
     pid="$(field "$lock/owner" pid)"
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && n=$((n+1))
   done
