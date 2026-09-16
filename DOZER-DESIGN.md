@@ -33,7 +33,17 @@ of that, and the worse one was not the reported one:
 > develop (`f325eb0`) carried GSAI-76's overlapping work on
 > `inflight_count`/`live_crews`; the resolution is a **superset** of both
 > designs (name-skip *and* owner-file guard) and review of the merged code plus
-> a full `tests/reaper-test.sh` run (PASS) found nothing that must change.
+> a full `tests/reaper-test.sh` run (PASS on the reaper sweep) found nothing
+> that must change.
+>
+> **Correction (post-review):** the `doctor` clause above was written as design
+> intent, but `bd336a0` had not implemented it — the review pass (9cb0b49)
+> caught `doctor` aborting on a pid-less foreign lock for the same `set -e`
+> reason as failure #1. The fix landed in `7051b27`: `doctor` now tolerates
+> missing `pid` files and reports foreign locks in their own section without
+> dying, and `tests/reaper-test.sh` gained three assertions pinning it
+> (completes, reports the lock, keeps reporting past it). Full suite on this
+> branch: **PASS**.
 
 ---
 
@@ -105,9 +115,13 @@ the normal crew fixtures for the **whole run**, so every pre-existing
 requeue/reap assertion doubles as the failure-#1 regression (the sweep must
 reach its verdicts with foreign locks present). It asserts: rc=0 and a summary
 line (the pre-fix script exits 2 with no output), both foreign locks preserved,
-and the Director holder process still running. Run on this branch after the
+and the Director holder process still running. Since `7051b27` it also asserts
+`doctor` against a pid-less foreign lock: completes rc=0, reports the lock,
+and keeps reporting past it (the review pass found the pre-fix `doctor`
+aborting there). Run on this branch after the
 GSAI-76 merge: **PASS** — including "live Director lock preserved",
-"foreign lock never reaped", "Director process left running".
+"foreign lock never reaped", "Director process left running", and the three
+`doctor` assertions.
 
 Related suites that pin the same boundary elsewhere:
 `tests/heartbeat-test.sh` and `tests/heartbeat-check-test.sh` (GSAI-76) pin
