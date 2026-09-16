@@ -1,185 +1,95 @@
-# GSAI-60 — design: board reconcile must not auto-approve on an agent's own comment
+# GSAI-73 — design: the alarm NOTE in org/config.yaml is stale — the Buzz hop is live and speaks as Guzz
 
-**Task:** the board reconcile reads "any later comment with no marker is Vas" —
-but every *scripted* comment in the engine is posted unmarked. The Dozer's claim /
-blocked / merged lines (`dozers/dozer.sh:245,261,309,326,333`), the reaper's requeue
-note (`dozers/reaper.sh:82`), and `directors/run.sh`'s "Director approved" / `note`
-lines (`directors/run.sh:31,36`) all land after a pending `board-ask` with **no
-`<!-- … -->` marker**, so the next Director awake flips `board:to_review` →
-`board:responded` and "acts on" a machine status line as if Vas had answered. The
-Chief's 2026-09-08 sweep measured it live: **11 of 22 board issues** had unmarked
-agent comments sitting after the last ask (50 comments total) — an auto-approval
-path around the human gate that never fired only because Directors eyeballed the
-text. The Chief backfilled `<!-- board-note by:agent -->` onto all 50 (the board is
-safe *today*), and the fix decision is made: **invert to positive identification.**
+**Task:** `org/config.yaml`'s alarm-block NOTE (pre-fix lines 109-114) still described
+the **2026-09-03** state: `BUZZ_PRIVATE_KEY` deliberately cleared from `buzz.env`,
+the Buzz hop skipped, Linear carrying the alarm alone. That stopped being true on
+**2026-09-08**, when Guzz's key was recovered from the macOS login keychain back
+into the vault — `heartbeat-check.sh creds` has reported "Buzz hop: CAN DELIVER ✓"
+since. A config comment that tells an operator a live alarm channel is dead is worse
+than no comment: the operator who reads it will "fix" a working channel or, worse,
+stop trusting the config as a source of truth.
 
-**Repo:** dozers (main-only). **Files touched:** `tasks/_linear_api.py` (the fix),
-`dozers/dozer.sh` + `dozers/reaper.sh` + `directors/run.sh` (one identity line each),
-`directors/LINEAR.md` (the reconcile rule), `tests/board-reconcile-test.sh` (the
-regression). Nothing else.
+**Repo:** dozers (main-only). **Files touched:** `org/config.yaml` (the NOTE
+rewrite) and `dozers/heartbeat-check.sh` (one reporting line in `creds`).
+Nothing else — no behavior change, no new wiring.
+
+> **Provenance note:** the implementation for this task was already committed on
+> this branch (`d53b269`) by the prior session before this design was written.
+> This document records the design that commit embodies; review of the committed
+> diff found nothing that must change, so the code stands as-is.
 
 ---
 
-## Why the hole survived GSAI-41
+## What the NOTE must now say (the current truth)
 
-GSAI-41 already fixed the *read* side: `is_agent_comment()` treats **any** HTML
-comment as an agent's (`tasks/_linear_api.py:424-430`), and `board_answers()` returns
-only unmarked later comments as Vas's answers. The contract — "an agent comment MUST
-carry a marker; an unmarked comment is Vas" — is prose in LINEAR.md and all four
-Director templates, and `tests/board-reconcile-test.sh` pins both.
+Four facts, none of which the old NOTE carried:
 
-The hole is the *write* side: the contract is only enforced on LLM-authored
-comments. Every scripted `task_comment` call goes
-`dozer.sh/reaper.sh/run.sh` → `tasks/linear.sh:37 task_comment` →
-`_linear_api.py comment()` → `commentCreate` — **verbatim, no marker added**. The
-engine posts five distinct unmarked comment shapes on ordinary runs, so the moment a
-board issue also carries a pending ask (a re-greenlight while `board:to_review` is
-still on, or a Dozer claim racing the ask), the probe's exit 0 is guaranteed and the
-ask is auto-answered. As the Chief's data shows, it didn't need the race — it just
-needed any unmarked agent comment after the ask.
+1. **The hop is LIVE and delivers signed as Guzz** — the Dev-Director identity,
+   which is the Dozer's own voice. History stays in the comment, compressed to
+   two lines: key deliberately cleared 2026-09-03 (identity moved into Buzz
+   Desktop as a managed agent), recovered 2026-09-08 out of the login keychain
+   (service `buzz-desktop`, account `secrets`, stored as `agent:<pubkey> → nsec`)
+   back into `buzz.env`.
+2. **The relay is CLOSED, so the key alone is not enough.** Guzz is only a
+   channel member; publishing 403s `relay_membership_required`. `buzz.env` also
+   carries **`BUZZ_AUTH_TAG`** — a NIP-OA attestation signed by the *owner* key
+   delegating relay membership to Guzz. Events are still authored and signed
+   **by Guzz**; the tag only proves the owner authorized the agent. This was
+   never written down anywhere before — it is the part an operator cannot
+   rediscover from the code.
+3. **How the tag reaches the process:** the whole vault file is sourced under
+   `set -a` in `heartbeat-check.sh`, so the tag reaches the `buzz` child without
+   any code knowing about it. Consequence: **re-mint the tag if the owner key
+   rotates**, or the hop starts 403ing with no visible change in the key check.
+4. **The old rule survives unchanged:** do NOT repoint `alarm_env` at
+   `buzz-owner.env` — that is Vasanth's own key, and an alarm signed as him is a
+   lie about who is speaking. Guzz has his own identity precisely so the watchdog
+   can speak as itself.
 
-## Approach — stamp at the choke point, guard at the probe
+## The `creds` companion: print the auth tag
 
-Three layers, matching the Chief's numbered decision exactly:
+The NOTE is prose; `heartbeat-check.sh creds` is the command an operator actually
+runs before trusting the alarm. It already prints the vault path, channel,
+mention, `BUZZ_RELAY_URL`/`BUZZ_PRIVATE_KEY` export state, and the `buzz` CLI —
+but the load-bearing `BUZZ_AUTH_TAG` was invisible, so a closed relay could look
+fully armed and still 403 at the moment it was needed.
 
-### 1. Write-side fix (the important one): every scripted comment self-stamps
+`creds` gains one line after the key loop:
 
-`tasks/_linear_api.py comment()` is the single choke point every scripted Linear
-comment passes through (`_comment_url()` is the second — the watchdog's
-alarm path, whose callers pre-mark). A `_stamp_marker(body)` helper appends
+- tag present → `auth tag : present ✓ (NIP-OA — closed-relay membership via the owner)`
+- tag absent → `auth tag : not set — fine on an open relay; a CLOSED one 403s relay_membership_required`
 
-```
-<!-- board-note by:<DOZER_COMMENT_BY:-dozer-engine> -->
-```
-
-to any body that carries **no** `<!-- … -->` marker already (same `MARKER_RE`),
-and leaves an already-marked body **byte-identical** — so `alarm_raise`/
-`alarm_clear`/`board-mirror` comments (which pre-mark) are unchanged, and a
-Director using `run.sh note` with a marked mirror text never gets a double stamp.
-The marker name is the Chief's own backfill shape (`board-*`), so the read-side
-classifier already treats it as an agent's.
-
-The `DOZER_COMMENT_BY` identity is set at the three callers (one export line
-each): `dozer.sh` → `dozer-engine`, `reaper.sh` → `dozer-reaper`, `run.sh` →
-`director-cli`. This is provenance, not security — the default covers any future
-call site that forgets to set it. **New scripted posters cannot recur the bug**:
-forgetting the marker becomes impossible at the only door they all walk through.
-
-The `files` and `github-issues` backends are untouched — their comments never reach
-the Linear board reconcile (and the files backend's card files are local).
-
-### 2. Read-side guard at the probe: refuse known agent signatures
-
-The stamp protects the future; the **guard** protects against the residual — any
-unmarked comment that still looks machine-authored (an old pre-fix comment, an
-LLM-authored comment that forgot its marker, or a future poster bypassing
-`comment()`). A small, anchored signature list of the engine's own stable comment
-openers:
-
-```python
-AGENT_SIGNATURES = [
-    r"^Dozer (claimed|blocked|merged|staged)\b",   # dozer.sh:245,261,309,326,333
-    r"^Director approved\b",                        # run.sh:31
-    r"^♻️ Reaper requeued\b",                        # reaper.sh:82
-]
-```
-
-A shared `is_human_answer(body)` = unmarked **and** matches no signature replaces
-the bare `not is_agent_comment(...)` in **both** consumers:
-
-- `board_answers()` — the reconcile probe (`run.sh answer` / `board-answer`):
-  signature-matching unmarked comments are **refused** — excluded from the
-  answers, so the probe exits 3 (waiting) and the ask stays `board:to_review`.
-  The CLI prints each refusal loudly to stderr — `REFUSED: comment at <ts>
-  matches agent signature '<sig>' — not read as Vas's answer` — so the refusal is
-  *visible*, and the exit-3 message in `run.sh answer` names the case.
-- `alarm_clear()` (`_linear_api.py:533`) — same classifier, same refusal: an
-  unmarked "Dozer blocked…" line after the watchdog's ask must not hand the ball
-  to `board:responded`.
-
-This is deliberately a *guard*, not the primary mechanism: it cannot enumerate
-everything an agent might post, and it must **fail toward visible** (GSAI-41's
-asymmetry: over-refusing leaves a real answer un-swapped for one awake — the
-Director sees the stderr line and can swap manually after eyeballing; under-refusing
-loses the question for good). If Vas genuinely quotes a status line as his answer,
-the probe refuses, the Director reads the refusal, recognizes the answer, and swaps
-by hand — the exact human-judgment path the protocol wants anyway.
-
-### 3. The reconcile rule in LINEAR.md says all of this
-
-`directors/LINEAR.md` §"Every awake, reconcile FIRST" gains two sentences:
-scripted engine comments now self-stamp (a Director seeing `<!-- board-note … -->`
-knows it's the engine), and the probe **refuses known agent signatures** — exit 3
-with a stderr refusal line; if a refusal is genuinely Vas's answer, eyeball it and
-swap manually. The one-sentence contract itself ("an agent comment MUST carry a
-marker; an unmarked comment is Vas") is unchanged — the fix makes it *true*, not
-different.
-
-**Director templates need no edit** — all four already carry the every-comment-
-carries-a-marker rule (chief.md:37, dev-director.md:63, mktg-director.md:85,
-ops-director.md:47), and the existing test case 12 pins it.
+**It deliberately does NOT flip the verdict.** The hop's green/red is keyed on
+`BUZZ_PRIVATE_KEY` + relay URL + CLI, and that stays: an open relay needs no tag,
+so a missing tag must not mark a working hop red. The line exists so an
+unannounced 403 at alarm time — the exact failure `creds` exists to rule out —
+is visible before the outage, without breaking the open-relay case.
 
 ## Edge cases
 
 | Case | Behavior |
 |---|---|
-| Body already carries any `<!-- … -->` marker | Byte-identical, no double stamp (alarm/mirror paths unchanged) |
-| Empty / whitespace body from a scripted site | Stamped — an empty agent comment is still an agent comment |
-| Unmarked "Dozer claimed…" after an ask | Refused by the guard → exit 3, refusal logged, ask stays open |
-| Unmarked agent-signature line **and** a later genuine Vas comment | The signature line is refused, Vas's comment still answers → exit 0 with the right comment |
-| Vas quotes/repeats a status line as his real answer | Refused (fail toward visible) → Director eyeballs the refusal, swaps manually |
-| Pre-fix unmarked comments NOT matching a signature | Still auto-approve — residual, mitigated: the Chief backfilled all 50 on 2026-09-08 |
-| `alarm_clear` (heartbeat) path | Same classifier; a signature match → flag removed, never `board:responded` |
-| `DOZER_COMMENT_BY` unset | Default `dozer-engine` — the stamp never silently disappears |
-| files / github-issues backends | Untouched — their comments never reach the Linear reconcile |
-| Unicode openers (`♻️`, `→`) in signatures | Regex-anchored on the exact bytes the call sites emit |
+| Open relay, no `BUZZ_AUTH_TAG` | Verdict unchanged (CAN DELIVER ✓); line says "fine on an open relay" |
+| Closed relay, tag present | Line confirms ✓ — matches the live config today |
+| Closed relay, tag missing | Line names the 403 (`relay_membership_required`) but verdict stays green — the operator reads the line, not just the verdict |
+| Owner key rotates, tag goes stale | NOTE says re-mint it; `creds` shows the tag state but cannot verify freshness — the failure mode at publish time, out of scope here |
+| `buzz` CLI absent / key absent | Untouched — existing optional-hop logic (quiet skip, verdict "skipped (optional)") |
+| Secrets in output | None — the line prints presence/absence only, never the tag value |
 
 ## How it gets tested
 
-Extend `tests/board-reconcile-test.sh` — same protocol, same regression file,
-keeping its python-harness idiom (`LINEAR_API_KEY=test-not-used`, pure functions
-+ stubbed I/O, assertions in bash so a failure names itself):
-
-- **STAMP (the acceptance: "a fresh Dozer run leaves zero unmarked comments").**
-  Stub `lin.gql`/`lin.issue` to capture the `commentCreate` body; assert: an
-  unmarked body gains the `board-note by:dozer-engine` marker; `DOZER_COMMENT_BY`
-  is honored; an already-marked body round-trips **byte-identical** (no double
-  stamp); `_comment_url()` (alarm path) stamps the same way.
-- **GUARD (the incident).** `board_answers` with the exact GSAI-60 shapes — an
-  unmarked `Dozer claimed - lane:marketing` / `♻️ Reaper requeued` /
-  `Director approved → …` comment after an ask → NOT answered; the CLI probe exits
-  3 **with the refusal on stderr**; mixed case (signature line, then Vas's real
-  answer) → exit 0 returning Vas's line only. With the current code this FAILS
-  (the status line reads as the answer) — the test is the repro.
-- **ALARM.** `alarm_clear` with an unmarked signature line after the watchdog's
-  ask → flag removed, not `board:responded` (mirrors existing case 11).
-- **STRUCTURE PIN.** A bash grep asserting the only `commentCreate` sites in
-  `_linear_api.py` are `comment()` and `_comment_url()` and both route through
-  `_stamp_marker` — a future raw poster cannot slip in unnoticed.
-- **Existing cases 1-12 stay green** — the `answered()` helper unpacks the
-  extended `board_answers` return; no pinned behavior changes. No new file to
-  register (`run-all.sh` globs `tests/*-test.sh`; the GSAI-30 scrub keeps
-  `LINEAR_API_KEY` out).
-
-Full `tests/run-all.sh` must stay green — nothing else in the repo pins comment
-text (verified: no test asserts on the engine's comment bodies or the
-`comment()` mutation).
-
-## Post-merge verification (for the Dev-Director, not this pass)
-
-The acceptance "a reconcile dry-run over the current 22 board issues flips
-nothing": loop `directors/run.sh answer <id>` over every `board:to_review` issue
-in the Board view — every one must exit 2 or 3; any exit 0 must be a comment Vas
-actually wrote. Plus: the next natural Dozer run on any board issue leaves
-`<!-- board-note by:… -->` on its status comments — one glance at a fresh claim
-comment confirms the write side live.
+`tests/heartbeat-check-test.sh` already pins the alarm-hop logic; the committed
+change adds no behavior to pin — only an unconditional print of a presence
+check. The full suite was run on this branch after the fix: **PASS** (all cases
+green, including "creds reports the Buzz hop as live when its key is present"
+and "fails loudly when NEITHER channel can deliver"). No other test asserts on
+NOTE text or `creds` output shape (verified by grep — the only "Buzz hop"
+reference in tests is the pre-existing skip case, which is still true behavior).
 
 ## Risk
 
-Low and layered. The stamp changes only bodies that today are guaranteed unmarked
-(making them match the read-side rule that already exists), the guard only
-*removes* auto-approvals (never creates one), and both are pinned by a regression
-test that reproduces the measured incident. The one real behavioral risk — a
-refusal swallowing a genuine answer — is by design visible (stderr + the ask stays
-on the Board) and recoverable by hand, which is strictly safer than the status quo:
-a question Vas never saw being marked answered by a machine.
+Minimal. A comment rewrite cannot break runtime; the `creds` addition is a
+read-only `printf` on an env-var presence check placed *after* the verdict
+inputs are gathered, so it cannot alter any existing branch. The only real risk
+was leaving the stale NOTE in place — an operator debugging a silent alarm being
+sent down the wrong path by the config itself.
