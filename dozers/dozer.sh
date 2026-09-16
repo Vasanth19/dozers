@@ -42,32 +42,43 @@ HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-$POLL_SECONDS}"
 # Snapshot count of in-flight run-locks (tasks claimed across every Dozer on this host,
 # since LOCK_DIR is shared). Cheap directory scan, no backend call.
 #
-# CREW locks only — and that qualifier is the whole point (GSAI-76). $LOCK_DIR is shared
-# with the DIRECTORS: every awake pass takes a `director-<role>.lock` there as its own
-# single-pass mutex (~/ecosystem/scripts/director-awake.sh), and those dirs hold a bare
-# `pid` file, not an `owner`. Counting them made the beacon publish
-# `inflight = crews + live Director passes`, and the watchdog gates on that number.
-# Observed 2026-09-08 23:24Z: the beacon said `inflight=4` while exactly ONE crew was
-# running (BRD-82), and heartbeat-check alarmed on the fiction. The dangerous direction
-# is the mirror: three Director locks plus two stuck crews reach `fanout=5`, the
-# not-dispatching gate `inflight < FANOUT` goes false, and a REAL stall reports nothing.
+# CREW locks only (GSAI-76). $LOCK_DIR is shared with the DIRECTORS: every awake pass
+# takes a `director-<role>.lock` there as its own single-pass mutex
+# (~/ecosystem/scripts/director-awake.sh), storing a bare `pid` file, never an `owner`.
+# Counting them made the beacon publish `inflight = crews + live Director passes`, and
+# the watchdog gates on that number. Observed 2026-09-08 23:24Z: the beacon said
+# `inflight=4` while exactly ONE crew was running (BRD-82), and heartbeat-check alarmed
+# on the fiction. The dangerous direction is the mirror: three Director locks plus two
+# stuck crews reach `fanout=5`, the not-dispatching gate `inflight < FANOUT` goes false,
+# and a REAL stall reports nothing.
 #
-# So two exclusions, both at the source rather than at the reader:
-#   · `director-*.lock` — not a crew, never was.
-#   · a lock whose owner pid is dead — a crashed crew is the reaper's problem, not
+# GSAI-96 added a second, more general exclusion alongside the name match: skip any
+# lock with no `owner` file, not only ones literally named `director-*.lock`. That
+# survives a foreign mutex under a different name; keeping BOTH guards (rather than
+# swapping one for the other) also covers the case GSAI-76's original comment worried
+# about — a `director-*.lock` that someday grows an `owner` file — since the name match
+# still excludes it even then. It is also now SAFE to rely on the owner-file guard,
+# because run_one() no longer tolerates a failed `owner` write (it fails the run and
+# drops the lock instead); the old "owner-less lock could still be one of OURS, mid-race"
+# case this file used to hedge against cannot happen post-GSAI-96.
+#
+# So three exclusions, all at the source rather than at the reader:
+#   · `director-*.lock` by name — not a crew, never was.
+#   · no `owner` file at all — not a crew lock (a Director's, or any other holder's).
+#   · an `owner` file whose pid is dead — a crashed crew is the reaper's problem, not
 #     in-flight work; counting it holds the beacon high long after the work stopped.
 inflight_count() {
   local n=0 lock pid; shopt -s nullglob
   for lock in "$LOCK_DIR"/*.lock; do
     case "${lock##*/}" in director-*.lock) continue ;; esac
+    [[ -f "$lock/owner" ]] || continue
     # The || true is load-bearing (GSAI-76 review): this script runs under
-    # `set -euo pipefail`, so a no-match grep (owner-less lock — a tolerated
-    # owner-write failure, or a mkdir→write race window) would fail the whole
-    # pipeline through the trailing cut, fail the assignment, and abort the
-    # shell. Verified live: with an owner-less lock present, the unguarded line
-    # exits 2 with no output. In the ticker subshell that failure is SILENT
-    # (stderr discarded), the beacon freezes, and the watchdog false-alarms
-    # engine-stalled — the exact failure class this fix exists to kill.
+    # `set -euo pipefail`, so a no-match grep would fail the whole pipeline through
+    # the trailing cut, fail the assignment, and abort the shell. Verified live: with
+    # an owner-less lock present, the unguarded line exits 2 with no output. In the
+    # ticker subshell that failure is SILENT (stderr discarded), the beacon freezes,
+    # and the watchdog false-alarms engine-stalled — the exact failure class this fix
+    # exists to kill.
     pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then n=$((n+1)); fi
   done
@@ -260,9 +271,15 @@ run_one() { # <id> <lane> <title> [priority]
   trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
   # Liveness beacon: record the worker PID so the reaper can tell a live run from a
   # crashed one (dead PID => stale lock => the task gets requeued). See dozers/reaper.sh.
-  printf 'pid=%s\nhost=%s\ntask=%s\nlane=%s\nts=%s\n' \
+  # The write is NOT best-effort: LOCK_DIR is shared with other holders (the Directors'
+  # `director-<role>.lock`), and the reaper uses "has an owner file" to tell a run-lock
+  # of ours from someone else's mutex (GSAI-96). An owner-less lock here would be both
+  # invisible to the reaper and unreapable forever, so fail the run instead.
+  if ! printf 'pid=%s\nhost=%s\ntask=%s\nlane=%s\nts=%s\n' \
     "$BASHPID" "$(hostname -s 2>/dev/null || echo local)" "$id" "$lane" \
-    "$(date -u +%FT%TZ 2>/dev/null || date)" > "$lock/owner" 2>/dev/null || true
+    "$(date -u +%FT%TZ 2>/dev/null || date)" > "$lock/owner" 2>/dev/null; then
+    echo "  x could not write $lock/owner - releasing lock, skipping #$id" >&2; return 1
+  fi
 
   local lane_dir
   case "$lane" in dev) lane_dir="dev-lane";; marketing) lane_dir="mktg-lane";; *) lane_dir="$lane-lane";; esac
@@ -438,8 +455,11 @@ recover() { [[ "$REAPER_ENABLED" == 1 && -x "$ROOT/dozers/reaper.sh" ]] && "$ROO
 doctor() {
   echo "== dozer doctor =="
   echo "-- in-flight run-locks ($LOCK_DIR) --"
-  shopt -s nullglob; local any=0 lock id pid ts st
+  shopt -s nullglob; local any=0 foreign=() lock id pid ts st
   for lock in "$LOCK_DIR"/*.lock; do
+    # No owner file => someone else's mutex (a Director's), not a crew. Report it apart
+    # so `director-chief` stops showing up here as a DEAD/stale run-lock (GSAI-96).
+    if [[ ! -f "$lock/owner" ]]; then foreign+=("$lock"); continue; fi
     any=1
     id="$(grep -E '^task=' "$lock/owner" 2>/dev/null | cut -d= -f2)"; [[ -z "$id" ]] && id="$(basename "$lock" .lock)"
     pid="$(grep -E '^pid=' "$lock/owner" 2>/dev/null | cut -d= -f2)"
@@ -447,7 +467,22 @@ doctor() {
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then st="ALIVE pid=$pid"; else st="DEAD/stale pid=${pid:-?}"; fi
     printf '   %-14s %-22s since %s\n' "$id" "[$st]" "${ts:-?}"
   done
-  shopt -u nullglob; (( any )) || echo "   (none)"
+  (( any )) || echo "   (none)"
+  if (( ${#foreign[@]} )); then
+    echo "-- other holders' locks (not ours; never reaped) --"
+    for lock in "${foreign[@]}"; do
+      # `|| true` is not decoration: a foreign lock is defined as "no owner file" —
+      # nothing guarantees it has a `pid` file either (pre-GSAI-96 residue, the
+      # director-awake mkdir/pid race window, any future foreign holder). Without the
+      # guard `head` exits 1 on the missing file, pipefail propagates it, the
+      # assignment fails, and `set -e` kills `doctor` mid-report on exactly the
+      # legacy state you'd run it to inspect (same class as failure #1 / hevery= above).
+      pid="$( { head -1 "$lock/pid" 2>/dev/null || true; } | tr -dc '0-9')"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then st="ALIVE pid=$pid"; else st="not alive pid=${pid:-?}"; fi
+      printf '   %-24s %s\n' "$(basename "$lock" .lock)" "[$st]"
+    done
+  fi
+  shopt -u nullglob
   echo "-- engine heartbeat ($HEARTBEAT_FILE) --"
   if [[ -f "$HEARTBEAT_FILE" ]]; then
     local hpid hts hinf hpoll hevery hst hage

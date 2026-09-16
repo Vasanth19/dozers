@@ -1,75 +1,92 @@
 VERDICT: PASS
 
-Re-review after the FAIL (c7f0541). The branch now carries the build (47608f0),
-the architect's design (d37a012), that FAIL, and the fix commit (d0c8f69) —
-which closes every item the FAIL demanded, and nothing else. Verified the fix
-in the tree, probed the crash path directly, and re-ran the tests from this
-worktree.
+# GSAI-96 — review (re-review after the FAIL at 9cb0b49)
 
-## Prior FAIL — closed, item by item
+The branch now carries the build (`bd336a0`), the architect's design (`88c896b`
++ the post-review correction `907c3aa`), the FAIL review (`9cb0b49`), the fix
+(`7051b27`), and the build-pass verification (`1ce72e5`). The fix closes the
+one blocking item the FAIL demanded — nothing more, nothing else. Verified in
+the tree, probed live, and re-run from this worktree.
 
-1. **Required fix (the `set -euo pipefail` abort in `inflight_count`)** — done
-   (dozer.sh:71): `pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"`.
-   The guard is exactly the FAIL's suggested shape, and its in-code comment
-   documents *why* it is load-bearing (silent ticker death → frozen beacon →
-   watchdog false-alarm — the failure class this task exists to kill).
-2. **Required test row (non-director lock, no `owner`)** — added and green:
-   `heartbeat-test.sh` now creates `HBT-NO-OWNER.lock`, asserts the beat
-   SURVIVES and `inflight` stays 2. This was the exact coverage gap the FAIL
-   identified ("they pass because the crashing case is unexercised").
-3. **The companion suggestion (same guard on `heartbeat()`'s tick read,
-   dozer.sh:96)** — also done, so the beacon path is uniformly crash-proof
-   rather than crash-proof-by-accident, as the FAIL asked.
+## The FAIL's blocking item — closed
 
-The fix commit touches only `dozers/dozer.sh` (+16) and `tests/heartbeat-test.sh`
-(+22) — no scope creep, nothing else disturbed.
+**`doctor` aborting on a pid-less foreign lock** — fixed
+(`dozers/dozer.sh`, foreign-locks section):
 
-## Independent verification (not just trusting the diff)
+```bash
+pid="$( { head -1 "$lock/pid" 2>/dev/null || true; } | tr -dc '0-9')"
+```
 
-- **Re-probed the crash path live:** under `set -euo pipefail`, the unguarded
-  `grep | head | cut` on an owner-less lock still exits 2 (the FAIL's claim
-  reproduces), and the guarded form survives with `pid=""` — the fix is real,
-  not cosmetic.
-- **Reader immunity re-confirmed:** `heartbeat-check.sh` runs `set -uo pipefail`
-  without `-e` (line 64), so its identical `field()` pattern cannot abort it.
-- **Both directions of the Director-lock lie stay pinned** in the tree: emitter
-  (3 Director locks beside 2 crews → `inflight=2`; dead owner excluded;
-  owner-less lock survives; Director-only → 0) and reader (Director locks + 0
-  crews still alarms `crews=0`; Director locks pushing the beacon to `fanout`
-  do NOT silence a real stall `crews=2`; a stale beacon is not excused by
-  Director locks). The gate reads the local pid-verified `$crews`, and the alarm
-  carries `(beacon reports inflight=N)` beside the real count for drift
-  visibility — matching the design's Layer 1 / Layer 2 verbatim.
-- **No collateral exposure:** of the other suites, only `dozer-fanout-test.sh`
-  asserts on beacon `inflight` — with real live crews, which the pid-verified
-  count still counts. `reaper-test.sh`'s dead-pid locks are the reaper's own
-  fixture, untouched.
+This is exactly the FAIL's prescribed one-liner: the `|| true` sits inside the
+brace group, so `head`'s exit-1 on a missing `pid` file can't propagate through
+`pipefail`, and the in-code comment names the failure class and the three ways
+the state is reached (pre-GSAI-96 owner-less residue, the director-awake
+mkdir→pid race window, any future foreign holder). **Reproduced both sides
+live** from this worktree:
+
+- Post-fix `doctor`, staged with `director-chief.lock` (bare `pid`) plus
+  `legacy-crew.lock` (no `owner`, no `pid`): **rc=0**, both locks reported
+  (`[not alive pid=12345]`, `[not alive pid=?]`), and every later section —
+  heartbeat, worktrees, backend in-flight — intact.
+- The unguarded form, same state, under `set -euo pipefail`: still exits 2
+  with no output — the bug was real and the guard is what carries the fix,
+  not an accident of the test fixtures.
+
+**The missing test row — added and green.** `tests/reaper-test.sh` now stages
+`legacy-crew.lock` (pid-less foreign residue) alongside the Director locks and
+asserts three things the FAIL called for: `doctor` completes (rc=0), reports
+the lock by name, and keeps reporting past it (`-- engine heartbeat` still
+present) — plus a fourth pinning that the reaper leaves the residue alone.
 
 ## Test evidence — run by this review
 
-- `tests/heartbeat-test.sh`: **PASS** (20/20 rows, standalone re-run).
-- `tests/heartbeat-check-test.sh`: **PASS** (46/46 rows, standalone re-run).
-- `tests/run-all.sh`: **32/33 in 697s**. The single failure,
-  `dev-lane-timeout-per-repo-test.sh` ("grandchild sleep survived"), is a
-  kill-race flake in dev-lane timeout group-kill logic — zero code shared with
-  this diff — and **passes cleanly on immediate re-run** (all rows green,
-  including the one that failed). Not a branch defect; worth a flake-retry
-  discussion in the repo someday, not here.
+- `tests/reaper-test.sh`: **PASS** (14/14 rows, standalone re-run) — including
+  "sweep completed despite a foreign lock" (the failure-#1 regression),
+  "live Director lock preserved", "foreign lock never reaped", "Director
+  process left running", and all four doctor rows.
+- `tests/heartbeat-test.sh`: **PASS** — including its own `doctor` rows
+  (doctor must survive both beacon formats), so both suites that exercise
+  `doctor` are green.
+- `tests/heartbeat-check-test.sh`: **PASS** — the reader-side GSAI-76
+  superset guards (`director-*` name match + owner-file check in
+  `live_crews`) remain pinned.
+- Full suite: not re-run by this review (≈12 min; the build pass `1ce72e5`
+  ran `make test` 32/33 with the single failure a known dev-lane-migration
+  flake, zero code shared with this diff). The diff's blast radius since
+  that run is zero — `7051b27`/`907c3aa`/`1ce72e5` touched no runtime code
+  beyond the guarded read — and every suite that touches the changed paths
+  was re-run green above.
+
+## Scope and design conformance
+
+- `7051b27` touches only `dozers/dozer.sh` (+8, the guarded read + comment)
+  and `tests/reaper-test.sh` (+14, the doctor fixture + assertions). No
+  scope creep; the FAIL's "one-line fix plus a test row" exactly.
+- `907c3aa` corrects DOZER-DESIGN.md's provenance note to record that the
+  `doctor` hardening landed in `7051b27` *after* the review caught its
+  absence — the design document now matches the commit history, which is
+  what a review pass should demand of the architect pass. The correction is
+  accurate against the actual commits.
+- Everything the FAIL review held correct stands unchanged and re-verified:
+  the reaper lane boundary (`_lock_foreign`, `foreign` verdict,
+  `_reap_lock` refusing foreign locks, `_lock_pid` dual-layout read,
+  `_field` non-fatal, `foreign-skipped` counter), run_one's fatal-on-failure
+  `owner` write, and the `inflight_count`/`live_crews` dual guards from the
+  GSAI-76 merge superset.
 
 ## Notes (non-blocking)
 
-- **DOZER-DESIGN.md's mechanism sentence is now slightly stale:** it still says
-  the pid is "read through `grep | head | cut` … instead of tripping `set -e`"
-  (lines 44-45, and the matching edge-case row). Pre-fix, that claim was
-  empirically false — which is precisely why d0c8f69 added `|| true`. The
-  *behavior* the design promises (owner-less lock → `""`, no crash) now holds,
-  so this is a wording drift in a frozen process document, not a defect; the
-  in-code comment in dozer.sh records the true mechanism.
-- The emitter's own `mklock` fixtures now use live pids (`$$`) where they
-  previously used fake dead ones (111111/222222) — a correctness upgrade the
-  dead-owner exclusion forced, since a fixture with a dead pid would have
-  silently tested nothing under the new logic.
+- The `doctor` foreign-lock read now uses `head -1 pid` + `tr -dc '0-9'`
+  while the reaper's `_lock_pid` guards with `[[ -f "$lock/pid" ]]` before
+  reading — two idioms for the same "absence is data" rule. Both are correct;
+  if the lock layout ever changes, both need the same eye (the design's
+  stated residual risk, shared with GSAI-76's name/owner duality, and pinned
+  by tests on both).
+- Cosmetic only: the `7051b27` commit message says "14 rows" and the build
+  pass says "17 assertions" for the same reaper run — the suite prints 14 `✓`
+  rows; the 17 presumably counts sub-checks. No action needed.
 
-Everything the FAIL review held correct (exclusions, gate, alarm wording, test
-rows, incident comments) stands unchanged and verified. The one blocking defect
-is fixed at the source, pinned by the test row that was missing. Ship it.
+The reaper never touches a lock the Dozer didn't write, the health command no
+longer dies on the residue that rule creates, the design document tells the
+truth about how it got there, and every claim is pinned by a test that this
+review ran green. Ship it.
