@@ -255,13 +255,51 @@ resolve_test_cmd() {  # $1 = dir, $2 = stage label
 # (org/config.yaml) and default to Prisma; repos with no schema files → no-op.
 # Escape hatch: put [skip-migration] in a commit message for a legit schema edit
 # that genuinely needs no migration (e.g. a datasource/generator-only change).
+# GSAI-154: the gate's evidence reads must survive a transient blip and can NEVER
+# be silently mis-scored. The old `git log … 2>/dev/null | grep -qF` pipeline could
+# not tell "marker absent" from "the read failed" — a fork/exec blip under 5-crew
+# launchd load read as "no override" and false-blocked green GSAI-148/149 — and the
+# diff read's `|| true` could silently WAIVE the gate on a blip (fail-open). Both
+# reads now go through gate_read: captured to a temp file, retried, loud and
+# distinct on persistent failure (an infra flake, never an LL-31 violation).
+gate_read() {  # $1 = short label for retry lines, $2 = persistent-failure text, rest = git args.
+  # Prints the path of a temp file holding git's stdout (uses the caller's local
+  # $wt; 3 attempts 1s apart — bound and cheap: a blip is absorbed, persistent git
+  # breakage must fail fast). Retry applies to the READ only, never the verdict:
+  # a successful read with no marker blocks exactly as before. On persistent
+  # failure this calls fail; the caller captures with a plain $(…) — do NOT wrap
+  # it in `if`/`||`: set -e must propagate the death. That swallow is the exact
+  # bug this fixes.
+  local _label="$1" _text="$2"; shift 2
+  local _out _err _a _rc
+  _out="$(mktemp "${TMPDIR:-/tmp}/dozer-gate-read.XXXXXX")"
+  _err="$(mktemp "${TMPDIR:-/tmp}/dozer-gate-read-err.XXXXXX")"
+  for _a in 1 2 3; do
+    if git -C "$wt" "$@" >"$_out" 2>"$_err"; then
+      rm -f "$_err"
+      printf '%s\n' "$_out"
+      return 0
+    fi
+    _rc=$?
+    if [[ $_a -lt 3 ]]; then
+      echo "    [dev] ⚠ migration gate: $_label attempt $_a failed (exit $_rc) — retrying" >&2
+      sleep 1
+    fi
+  done
+  _text="$_text — stderr: $(tail -n 3 "$_err" | tr '\n' ' ')"
+  rm -f "$_out" "$_err"
+  fail "$_text"
+}
+
 migration_gate() {  # $1 = worktree dir, $2 = compare base (integration branch)
-  local wt="$1" cmp="$2" changed f g schema_hits="" mig=0 sg mg
+  local wt="$1" cmp="$2" changed f g schema_hits="" mig=0 sg mg _diff_file _log_file
   sg="${SCHEMA_GLOBS:-$(cfg schema_globs)}"; sg="${sg:-*.prisma}"
   mg="${MIGRATION_GLOBS:-$(cfg migration_globs)}"; mg="${mg:-*/migrations/* */migrate/*}"
   [[ "${MIGRATION_GATE:-on}" == "off" ]] && { echo "    [dev] migration gate: off"; return 0; }
   read -ra SG_ARR <<< "$sg"; read -ra MG_ARR <<< "$mg"
-  changed="$(git -C "$wt" diff --name-only "$cmp"..."$BRANCH" 2>/dev/null || true)"
+  # A gate that cannot see the diff must stop — never wave the change through.
+  _diff_file="$(gate_read "git diff" "migration gate could not diff $BRANCH against $cmp — git diff failed (worktree kept, sent back)" diff --name-only "$cmp"..."$BRANCH")"
+  changed="$(cat "$_diff_file")"; rm -f "$_diff_file"
   [[ -z "$changed" ]] && return 0
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
@@ -270,9 +308,14 @@ migration_gate() {  # $1 = worktree dir, $2 = compare base (integration branch)
   done <<< "$changed"
   [[ -z "$schema_hits" ]] && return 0                 # no schema touched → nothing to gate
   (( mig )) && { echo "    [dev] migration gate: schema change ships with a migration ✓"; return 0; }
-  if git -C "$wt" log --format=%B "$cmp".."$BRANCH" 2>/dev/null | grep -qF '[skip-migration]'; then
+  # grep only ever runs on a file from a SUCCESSFUL read, so "no match" now
+  # genuinely means "the marker is absent" — a failed read names itself instead.
+  _log_file="$(gate_read "git log" "migration gate could not read the commit messages on $BRANCH — git log failed; NOT scored as an LL-31 violation (worktree kept, sent back)" log --format=%B "$cmp".."$BRANCH")"
+  if grep -qF '[skip-migration]' "$_log_file"; then
+    rm -f "$_log_file"
     echo "    [dev] migration gate: schema change, no migration — overridden by [skip-migration]"; return 0
   fi
+  rm -f "$_log_file"
   fail "schema change with no matching migration (LL-31 guardrail) — add a migration (or [skip-migration] if none is needed); worktree kept, sent back
 $schema_hits"
 }

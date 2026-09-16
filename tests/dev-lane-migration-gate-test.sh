@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# tests/dev-lane-migration-gate-test.sh — regression test for GSAI-24 (LL-31 guardrail).
+# tests/dev-lane-migration-gate-test.sh — regression test for GSAI-24 (LL-31 guardrail)
+# and GSAI-154 (transient read failure must not masquerade as a gate verdict).
 #
 # The dev-lane migration gate runs BEFORE the merge: if a branch touches a DB
 # schema file (Prisma by default) but ships no matching migration, the merge is
 # blocked and the task sent back — a schema drift with no migration breaks
 # deploys (the LL-31 incident). This drives the real crew end-to-end against a
 # throwaway repo (no test runner — TEST_GATE=off waives the GSAI-27 test gate so the
-# migration gate is the only thing under test) and checks three scenarios:
+# migration gate is the only thing under test) and checks six scenarios:
 #   BLOCK   — schema edited, no migration            → crew fails, develop unchanged
 #   ALLOW   — schema edited + migration added         → crew succeeds, develop advances
 #   OVERRIDE— schema edited, no migration, [skip-migration] in commit → succeeds
 #   NO-OP   — only a normal file edited               → crew succeeds (no false positive)
+#   READ-FAIL — the gate's `git log` read fails persistently → crew fails LOUDLY with
+#               an infra reason, never the LL-31 text; develop unchanged (GSAI-154)
+#   TRANSIENT — the gate's `git log` read fails ONCE (fork/exec blip under load)
+#               → retried, absorbed, override lands, develop advances (GSAI-154)
+#
+# The last two pin the in-crew flake that false-blocked GSAI-148/149: a fault-
+# injecting `git` shim is prepended to PATH (per-scenario dir) and fails ONLY the
+# gate's `git … log … --format=%B …` read; every other invocation execs real git.
 #
 # Run:  bash tests/dev-lane-migration-gate-test.sh   (exits non-zero on any failure)
 set -euo pipefail
@@ -35,9 +44,10 @@ mkproj() {  # $1 = dest dir
 }
 
 # ── run the real crew with a given stub coding agent; echoes the exit code ─────
-run_crew() {  # $1 = proj dir, $2 = task id, $3 = stub script path
-  local proj="$1" id="$2" stub="$3" rc=0
-  REPO_ROOT="$TMP" WORKDIR="$proj" \
+run_crew() {  # $1 = proj dir, $2 = task id, $3 = stub script path, $4 = optional: dir prepended to PATH (fault-injection shims)
+  local proj="$1" id="$2" stub="$3" shimdir="${4:-}" rc=0 pathv="$PATH"
+  [[ -n "$shimdir" ]] && pathv="$shimdir:$PATH"
+  PATH="$pathv" REPO_ROOT="$TMP" WORKDIR="$proj" \
     WORKTREE_ROOT="$TMP/wt-$id" INTEGRATION_BRANCH="develop" \
     MODEL_CMD="bash $stub" PUSH="false" DOZER_PERSONA="test" TEST_GATE=off \
     bash "$CREW" "$id" "migration gate $id" >"$TMP/$id.log" 2>&1 || rc=$?
@@ -46,6 +56,37 @@ run_crew() {  # $1 = proj dir, $2 = task id, $3 = stub script path
 
 mkstub() {  # $1 = path, $2 = body
   printf '#!/usr/bin/env bash\nset -e\n%s\n' "$2" > "$1"; chmod +x "$1"
+}
+
+# ── build a fault-injecting `git` shim (GSAI-154): intercepts ONLY the migration
+# gate's `git … log … --format=%B …` read — scanning args, since the call is
+# `git -C <dir> log --format=%B <range>` — and execs real git for everything else,
+# so worktree add / commit / merge all run for real.
+#   mode fail-always: exit 128 on the matching read
+#   mode fail-once  : exit 128 on the FIRST matching read only (counter file)
+mkshim() {  # $1 = dest dir, $2 = mode (fail-always | fail-once)
+  local d="$1" mode="$2" realgit; mkdir -p "$d"
+  realgit="$(command -v git)"
+  cat > "$d/git" <<EOF
+#!/usr/bin/env bash
+# GSAI-154 test shim (mode=$mode) — fails only the migration gate's log read.
+has_log=0 has_fmt=0
+for a in "\$@"; do
+  [[ "\$a" == log ]] && has_log=1
+  [[ "\$a" == --format=%B* ]] && has_fmt=1
+done
+if [[ \$has_log -eq 1 && \$has_fmt -eq 1 ]]; then
+  if [[ "$mode" == fail-once ]]; then
+    n=0; [[ -f "$d/count" ]] && n="\$(cat "$d/count")"
+    printf '%s' "\$((n+1))" > "$d/count"
+    [[ \$n -ge 1 ]] && exec "$realgit" "\$@"
+  fi
+  echo "shim: injected git log failure" >&2
+  exit 128
+fi
+exec "$realgit" "\$@"
+EOF
+  chmod +x "$d/git"
 }
 
 # ── 1. BLOCK: schema edited, no migration → crew must fail, develop unchanged ──
@@ -89,5 +130,39 @@ git add -A && git commit -q -m "app-only change"'
 rc="$(run_crew "$P4" "GATE-NOOP" "$TMP/s4.sh")"
 [[ "$rc" -eq 0 ]] && ok "NO-OP: non-schema change is not gated" \
   || { no "NO-OP: crew exited $rc — false positive on a normal change"; sed 's/^/    | /' "$TMP/GATE-NOOP.log" >&2; }
+
+# ── 5. READ-FAIL: the override read fails persistently → LOUD, and NEVER the ────
+#    LL-31 text. GSAI-154: pre-fix the swallowed read was mis-scored as "no
+#    override" and an infra flake shipped as a spec violation. Same OVERRIDE
+#    fixture, but the shim fails every `git log --format=%B` call.
+P5="$TMP/readfail"; mkproj "$P5"
+RF_BEFORE="$(git -C "$P5" rev-parse develop)"
+mkshim "$TMP/shim-fail-always" fail-always
+rc="$(run_crew "$P5" "GATE-READFAIL" "$TMP/s3.sh" "$TMP/shim-fail-always")"
+[[ "$rc" -ne 0 ]] && ok "READ-FAIL: crew failed when the commit messages are unreadable" \
+  || { no "READ-FAIL: crew exited 0 despite a persistent git log failure"; sed 's/^/    | /' "$TMP/GATE-READFAIL.log" >&2; }
+grep -qF "could not read the commit messages" "$TMP/GATE-READFAIL.log" \
+  && ok "READ-FAIL: failure names the infra read failure" || no "READ-FAIL: missing the infra failure text"
+if grep -qF "no matching migration" "$TMP/GATE-READFAIL.log"; then
+  no "READ-FAIL: an infra flake masqueraded as an LL-31 violation"
+else
+  ok "READ-FAIL: NOT scored as an LL-31 block"
+fi
+[[ "$(git -C "$P5" rev-parse develop)" == "$RF_BEFORE" ]] \
+  && ok "READ-FAIL: develop was not advanced" || no "READ-FAIL: develop moved despite the failure"
+
+# ── 6. TRANSIENT: the override read fails ONCE → retried, absorbed, merge lands ─
+#    GSAI-154: the deterministic repro of the GSAI-148/149 in-crew false blocks —
+#    one fork/exec blip used to read as "no override" and block a green change.
+P6="$TMP/transient"; mkproj "$P6"
+mkshim "$TMP/shim-fail-once" fail-once
+rc="$(run_crew "$P6" "GATE-TRANSIENT" "$TMP/s3.sh" "$TMP/shim-fail-once")"
+[[ "$rc" -eq 0 ]] && ok "TRANSIENT: a single read blip is retried and the merge lands" \
+  || { no "TRANSIENT: crew exited $rc — one blip false-blocked a green change"; sed 's/^/    | /' "$TMP/GATE-TRANSIENT.log" >&2; }
+grep -qF "migration gate: git log attempt 1 failed" "$TMP/GATE-TRANSIENT.log" \
+  && ok "TRANSIENT: the retry was logged, not masked" || no "TRANSIENT: retry line missing from the log"
+[[ "$(git -C "$P6" log -1 --format=%s develop)" == merge*GATE-TRANSIENT* ]] \
+  && ok "TRANSIENT: merge commit landed on develop" \
+  || no "TRANSIENT: develop HEAD not the expected merge: '$(git -C "$P6" log -1 --format=%s develop)'"
 
 if [[ $fail == 0 ]]; then echo "dev-lane-migration-gate-test: PASS"; else echo "dev-lane-migration-gate-test: FAIL" >&2; exit 1; fi
