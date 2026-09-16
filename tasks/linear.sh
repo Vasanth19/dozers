@@ -47,6 +47,11 @@ task_block()         { python3 "$_LIN" block "$1"; }    # failure off-ramp (doze
 task_list_inflight() { python3 "$_LIN" list-inflight; }  # claimed (started), not needs-review/done
 task_requeue()       { python3 "$_LIN" requeue "$1"; }   # re-add ready + back to unstarted
 
+# audit verbs (used by dozers/audit-merged.sh, GSAI-119)
+task_list_merged_dev() { python3 "$_LIN" list-merged-dev; }  # every issue on dozer:merged-develop
+task_audit_requeue()   { python3 "$_LIN" audit-requeue "$1"; }  # phantom: strip label + back to ready
+task_audit_strip()     { python3 "$_LIN" audit-strip "$1"; }    # hygiene: strip label off a closed issue
+
 # board protocol (GSAI-41) — read-only reconcile probe: did Vas answer the newest board-ask?
 # exit 0 = answered (prints `<createdAt>\t<first line>` per answer), 3 = waiting, 2 = no ask.
 task_board_answer()  { python3 "$_LIN" board-answer "$1"; }

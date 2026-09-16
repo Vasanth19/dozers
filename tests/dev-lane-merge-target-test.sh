@@ -77,6 +77,13 @@ P1B="$TMP/p1b"; mkproj "$P1B" checkout-develop no-deps; L1B="$TMP/c1b.log"; rc=0
 DRY_RUN=1 crew TEST-MT1B "$P1B" "$TMP/wt1b" "$L1B" || rc=$?
 [[ $rc -eq 0 ]] && ok "DRY_RUN crew exited clean" || { no "DRY_RUN crew exited $rc"; dump "$L1B"; }
 [[ "$(git -C "$P1B" log -1 --format=%s develop)" == merge*TEST-MT1B* ]] && ok "DRY_RUN merge landed on develop" || no "DRY_RUN merge missing"
+# the three passes log in order architect → build → review (MODEL_CMD bypass shares one route)
+_a=$(grep -n "\[dev\] architect model:" "$L1B" | head -n1 | cut -d: -f1)
+_b=$(grep -n "\[dev\] build model:"     "$L1B" | head -n1 | cut -d: -f1)
+_r=$(grep -n "\[dev\] review model:"    "$L1B" | head -n1 | cut -d: -f1)
+if [[ -n "$_a" && -n "$_b" && -n "$_r" && "$_a" -lt "$_b" && "$_b" -lt "$_r" ]]; then
+  ok "DRY_RUN logs architect → build → review passes in order"
+else { no "DRY_RUN pass lines missing/out of order (a=$_a b=$_b r=$_r)"; dump "$L1B"; }; fi
 
 # ── case 2: develop checked out DIRTY → clear failure, nothing touched ─────────
 echo "case 2: develop checked out elsewhere (dirty) → clear failure"

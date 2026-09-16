@@ -86,6 +86,7 @@ dozers/dozer.sh loop
 # 2) a Director greenlights work (or run one as a Buzz/Codex/Claude agent — see below):
 directors/run.sh triage                       # see untriaged issues
 directors/run.sh ready ENG-42 dev             # greenlight #ENG-42 into the dev lane
+directors/promote.sh myrepo --summary ENG-42  # promote develop → main (always a --no-ff merge)
 ```
 
 The Dozer picks up `ENG-42` within one poll, builds it in your repo's worktree, runs
@@ -142,7 +143,7 @@ an OKR → no greenlight → no run.
         →  coding agent implements + tests + commits
         →  test gate (red = stop; NO tests = stop too)
         →  serial-merge to develop (green-gated)
-        →  Director promotes develop → main
+        →  Director promotes develop → main   (directors/promote.sh — always --no-ff)
 
   lane:marketing  ────────────────────────────────────────────────────────
      load brand voice  →  content agent produces the asset
@@ -174,10 +175,19 @@ The Dozer works *inside the target project's checkout*, resolved from your
 ```
    repo:<id> label   →  that repo's path (searched in projects: then infrastructure:)
    task's team/org    →  the org's default repo (projects: only — infra has no org)
-   workdir_default    →  fallback
+   workdir_default    →  explicit catch-all, only when the task named no repo
 ```
 
 Paths live in one registry, never hardcoded in a label or in config.
+
+**Routing fails loud** (GSAI-131). It is a preflight: a task that cannot be routed is
+`dozer:blocked` with the resolver's real error *before* any crew, worktree or branch
+exists. A task that carries an identity — a `repo:` label or a team — is routed by the
+registry or not at all: a `repo:<id>` that doesn't resolve is never demoted to the
+team's default repo, and never falls back into the Dozer's own repo. Guessing a repo is
+how a brand's code ends up being built inside the engine. `workdir_default` applies only
+to a task that names neither, which is what makes the self-hosted/files-backend mode
+(the Dozer working on the repo it ships in) still work.
 
 ---
 
@@ -252,6 +262,9 @@ Directors and the Dozer coordinate entirely through labels on the issue:
      ▼
  dozer:in-progress
      ├── dev  ──► dozer:merged-develop ──► (Director) director:merged-main ──► Done
+     │           ▲ git-verified first (GSAI-119): the merge receipt's SHA must be an
+     │           │ ancestor of the integration branch, else blocked — never labelled
+     │           │ (`dozers/verify-merge.sh`; repair pass: `dozers/audit-merged.sh`)
      ├── mktg ──► dozer:needs-review ─────► (human approves) ──────────────► Done
      └── fail ──► dozer:blocked   (Director fixes, re-greenlights)
 
@@ -353,8 +366,11 @@ from the vault only inside the resolver; it is never logged, echoed, or printed 
 | `dozers/reaper.sh` | Crash-recovery watchdog (stale locks, orphan requeue, runaway kill). |
 | `dozers/heartbeat-check.sh` | Liveness watchdog — reads the engine's beacon and alarms (Linear `board:to_review` on `alarm_issue`, Buzz optional) when it stops beating or stops dispatching (`check` / `status` / `creds` / `install` / `uninstall` / `plist`). |
 | `dozers/service.sh` | Run the loop as a supervised service — launchd `KeepAlive` (macOS) / systemd `Restart=always` (Linux) auto-restart (`install` / `status` / `logs` / `uninstall`). |
+| `dozers/verify-merge.sh` | The proof step behind `dozer:merged-develop` (GSAI-119): the dev crew's merge receipt SHA must be an ancestor of the integration branch in the task's own repo, or the issue blocks instead of labelling. |
+| `dozers/audit-merged.sh` | One-shot phantom-merge repair: walks every `dozer:merged-develop` issue, git-verifies the claimed merge, strips + requeues phantoms, strips the label off closed issues (`--dry-run` to preview). |
 | `dozers/dev-lane/` · `dozers/mktg-lane/` | Each lane's `crew.sh` + `dozer.md` persona. |
-| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`. |
+| `directors/` | The deciders: `chief.md` / `dev-director.md` / `mktg-director.md` / `ops-director.md` (infra + housekeeping, `lane:ops`), shared `STYLE.md` + `LINEAR.md`, `runtimes/`, `build-prompt.sh`, `org-canvas.template.md`, `run.sh`, `promote.sh`. |
+| `directors/promote.sh` | The **only** way develop→main moves: fetch → refuse a dirty checkout → `git merge --no-ff` → verify a 2-parent merge that adds nothing absent from develop → push. A hand-rolled *squash* promote once split cfw-social's branches (GSAI-104); an invariant that lives in prose is not an invariant. |
 | `directors/LINEAR.md` | The board contract every Director inherits — the exact label move per operation, plus the **board protocol**: `@Vas` + `board:to_review` → one `#now` ping → reconcile-first next wake → `board:responded`. |
 | `tasks/` | Pluggable backend: `adapter.sh` interface; `linear.sh` (default) / `github-issues.sh` / `files.sh`; `ecosystem_workdir.py`. |
 | `dozers/model.sh` · `tasks/model_route.py` | Per-role model routing — `show` / `env <role>` / `smoke <provider>`. |

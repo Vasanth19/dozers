@@ -7,7 +7,7 @@
 # such command runs under dozers/timebox.sh and a hang FAILS the task, naming the
 # timeout, with the hung process tree killed and nothing merged.
 #
-# Three hangs, each driving the REAL crew against a throwaway repo (bounds cut to 2s):
+# Three hangs, each driving the REAL crew against a throwaway repo (bounds cut to BOUND, below):
 #   TEST   — the repo's `npm test` hangs in the task worktree -> blocked, reason names
 #            the test timeout, develop untouched, the hung grandchild is dead
 #   MODEL  — the coding agent hangs -> blocked, reason names the model timeout, the
@@ -68,10 +68,20 @@ git add -A && git commit -q -m "stub agent change"
 EOS
 chmod +x "$STUB"
 
+# The cut-down bound every case runs under. It has to straddle two things at once: be
+# far below the 300s hang so a hang is caught quickly, and be comfortably ABOVE how long
+# a command that does NOT hang takes. That second half is the one that bit — at 2s the
+# bound was under `npm test`'s own startup (npm spawning bash, before t.sh runs at all),
+# so under the full suite's load the GATE case timed out in the TASK WORKTREE instead of
+# at the green gate, took the pre-merge off-ramp, and reported "not merging" where the
+# test wanted "reverted". Green alone, red in `make test` — a bound measuring machine
+# load, not behaviour. 10s keeps a hang cheap while leaving npm room to start.
+BOUND=10
+
 run_crew() {  # $1 = proj dir, $2 = task id, $3 = log, $4.. = extra KEY=VAL
   local proj="$1" id="$2" log="$3"; shift 3
   env GRANDCHILD_FILE="$TMP/$id.grandchild" TIMEBOX_KILL_GRACE=1 \
-      DOZER_TIMEOUT_TEST=2 DOZER_TIMEOUT_MODEL=2 DOZER_TIMEOUT_DEPS=2 \
+      DOZER_TIMEOUT_TEST="$BOUND" DOZER_TIMEOUT_MODEL="$BOUND" DOZER_TIMEOUT_DEPS="$BOUND" \
       REPO_ROOT="$TMP" WORKDIR="$proj" WORKTREE_ROOT="$TMP/wt-$id" INTEGRATION_BRANCH="develop" \
       MODEL_CMD="bash $STUB" PUSH="false" DOZER_PERSONA="test" "$@" \
       bash "$CREW" "$id" "timeout test" >"$log" 2>&1
@@ -90,9 +100,9 @@ LOG="$TMP/a.log"; start=$SECONDS; rc=0
 run_crew "$PA" "TEST-TO-A" "$LOG" HANG_WHERE="*-TEST-TO-A" || rc=$?
 took=$(( SECONDS - start ))
 [[ $rc -ne 0 ]] && ok "TEST: crew blocked (exit $rc) in ${took}s" || { no "TEST: crew exited 0 with a hung test command"; dump "$LOG"; }
-(( took <= 30 )) && ok "TEST: the bound bit (not a 300s wait)" || no "TEST: took ${took}s"
+(( took <= 60 )) && ok "TEST: the bound bit (not a 300s wait)" || no "TEST: took ${took}s"
 r="$(reason TEST-TO-A)"
-[[ "$r" == *"timed out after 2s"* && "$r" == *"DOZER_TIMEOUT_TEST"* ]] && ok "TEST: reason names the timeout and the knob" \
+[[ "$r" == *"timed out after ${BOUND}s"* && "$r" == *"DOZER_TIMEOUT_TEST"* ]] && ok "TEST: reason names the timeout and the knob" \
   || { no "TEST: reason does not name the timeout: '$r'"; dump "$LOG"; }
 [[ "$r" == *"npm test"* ]] && ok "TEST: reason names the command that hung" || no "TEST: reason lacks the command: '$r'"
 [[ "$(dev_head "$PA")" == "init" ]] && ok "TEST: develop untouched" || no "TEST: develop advanced to '$(dev_head "$PA")'"
@@ -105,7 +115,8 @@ run_crew "$PB" "TEST-TO-B" "$LOG" AGENT_HANG=1 || rc=$?
 took=$(( SECONDS - start ))
 [[ $rc -ne 0 ]] && ok "MODEL: crew blocked (exit $rc) in ${took}s" || { no "MODEL: crew exited 0 with a hung agent"; dump "$LOG"; }
 r="$(reason TEST-TO-B)"
-[[ "$r" == *"coding agent timed out after 2s"* && "$r" == *"DOZER_TIMEOUT_MODEL"* ]] && ok "MODEL: reason names the model timeout" \
+# per-role routing: the stub hangs on its FIRST invocation, which is the architect pass
+[[ "$r" == *"architect agent timed out after ${BOUND}s"* && "$r" == *"DOZER_TIMEOUT_MODEL"* ]] && ok "MODEL: reason names the model timeout" \
   || { no "MODEL: reason does not name the model timeout: '$r'"; dump "$LOG"; }
 [[ "$r" == *"kept for resume"* ]] && ok "MODEL: worktree kept for resume" || no "MODEL: reason does not mention resume: '$r'"
 [[ -d "$TMP/wt-TEST-TO-B/hang-model-TEST-TO-B" ]] && ok "MODEL: worktree actually kept" || no "MODEL: worktree removed"
@@ -119,7 +130,7 @@ run_crew "$PC" "TEST-TO-C" "$LOG" HANG_WHERE="*-merge" || rc=$?
 took=$(( SECONDS - start ))
 [[ $rc -ne 0 ]] && ok "GATE: crew blocked (exit $rc) in ${took}s" || { no "GATE: crew exited 0 with a hung green-gate"; dump "$LOG"; }
 r="$(reason TEST-TO-C)"
-[[ "$r" == *"green-gate"* && "$r" == *"timed out after 2s"* ]] && ok "GATE: reason names the green-gate timeout" \
+[[ "$r" == *"green-gate"* && "$r" == *"timed out after ${BOUND}s"* ]] && ok "GATE: reason names the green-gate timeout" \
   || { no "GATE: reason does not name the green-gate timeout: '$r'"; dump "$LOG"; }
 [[ "$r" != *"merge broke"* ]] && ok "GATE: a hang is reported as a timeout, not as 'merge broke develop'" \
   || no "GATE: a hang was misreported as a broken merge"

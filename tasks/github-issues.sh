@@ -28,13 +28,29 @@ task_list_untriaged() {
 }
 
 task_list_ready() {
+  # GSAI-105: the adapter contract (tasks/adapter.sh) wants the ready list in claim
+  # order — urgency first, then oldest — with a 4th priority column. GitHub Issues
+  # has no priority field, so there is nothing to sort by and nothing to print:
+  # gh's default (newest first) is what you get. Prioritised claiming is a Linear
+  # backend feature; this backend stays the zero-infra one.
   _gh issue list --state open --label ready --json number,title,labels \
     --jq '.[] | . as $i | (.labels|map(.name)|map(select(startswith("lane:")))[0] // "lane:none") as $lane | "\($i.number)\t\($lane|ltrimstr("lane:"))\t\($i.title)"'
 }
 
 task_mark_ready() { # <id> <lane>
+  # The greenlight is a RESET, not just an add (GSAI-75): task_list_ready only lists
+  # `--state open`, and task_done closes the issue, so re-greenlighting a finished task
+  # used to relabel a closed issue that no poll would ever see. Drop the stale execution
+  # labels and reopen, so ready always means queued. Same contract as the linear/files
+  # backends — see tasks/adapter.sh.
   local id="$1" lane="$2"
+  # The greenlight itself is not allowed to fail quietly — no `|| true` on this one.
   _gh issue edit "$id" --add-label "lane:$lane" --add-label "ready" >/dev/null
+  # Clearing the last run's state is best-effort: `--remove-label` errors when the label
+  # was never created in the repo, which is the normal case on a task's first greenlight.
+  _gh issue edit "$id" --remove-label "status:wip" >/dev/null 2>&1 || true
+  _gh issue edit "$id" --remove-label "status:done" >/dev/null 2>&1 || true
+  _gh issue reopen "$id" >/dev/null 2>&1 || true   # no-op when it is already open
 }
 
 task_claim() { # <id> — take it: drop `ready`, add `status:wip`.

@@ -3,7 +3,10 @@
 #
 # Proves the knob that decides WHICH BRAIN a role runs on behaves, and above all that
 # it FAILS FAST instead of quietly falling back to claude:
-#   DEFAULT   — shipped config routes the dev role to claude -p with an EXPLICIT model
+#   DEFAULT   — shipped config: dev is a NESTED lane (architect/build/review on
+#               ollama-cloud + a `small` flash model), marketing flat with small_model,
+#               default a pinned claude-opus-5 (per-role routing, 2026-09-15 — this
+#               case tracks whatever ships)
 #   UNPINNED  — a claude route with model:"" in config -> exit 2 (GSAI-83); env stays loose
 #   OVERRIDE  — DOZER_MODEL_<ROLE>=ollama-cloud:<model> emits the proven ANTHROPIC_* env
 #   VAULT     — the key is read from the configured env file, never printed by `show`
@@ -49,7 +52,8 @@ PY
 # test — MODEL_CMD leaking in even makes the "fails fast on a bad route" case pass
 # through the legacy-override branch and never fail. (GSAI-30)
 SCRUB_ENV=( -u OLLAMA_API_KEY -u MODEL_CMD
-            -u DOZER_MODEL_DEV -u DOZER_MODEL_MARKETING -u DOZER_MODEL_SMOKE
+            -u DOZER_MODEL_DEV -u DOZER_MODEL_DEV_ARCHITECT -u DOZER_MODEL_DEV_BUILD
+            -u DOZER_MODEL_DEV_REVIEW -u DOZER_MODEL_MARKETING -u DOZER_MODEL_SMOKE
             -u DOZER_MODEL_PROVIDER -u DOZER_MODEL_NAME -u DOZER_MODEL_SOURCE
             -u DOZER_ROLE -u DOZER_PERSONA
             -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_MODEL
@@ -65,17 +69,34 @@ route() {
 
 echo "== model routing =="
 
-# ── DEFAULT: shipped config = claude for every role ────────────────────────────
-out="$(route env dev)"
-if has "$out" "export MODEL_CMD='claude -p --model claude-opus-5'" && has "$out" "export DOZER_MODEL_PROVIDER=claude"; then
-  ok "DEFAULT dev -> claude -p with the model PINNED"; else no "DEFAULT dev should route to a pinned claude model; got: $out"; fi
+# ── DEFAULT: shipped config (2026-09-15): `dev` is a NESTED lane — dev.architect and
+# dev.review → ollama-cloud/glm-5.3:cloud, dev.build → ollama-cloud/kimi-k3:cloud, all
+# with small=glm-5.3-flash:cloud; marketing → ollama-cloud/glm-5.3:cloud with
+# small_model glm-5.3-flash:cloud; default (and a bare `dev`, which has no flat
+# meaning in a nested lane) → claude/claude-opus-5. This case tracks WHATEVER ships
+# in org/config.yaml; when the shipped route changes, change these expectations with it ──
+out="$(route env dev.build)"
+if has "$out" "export DOZER_MODEL_PROVIDER=ollama-cloud" \
+   && has "$out" "export ANTHROPIC_MODEL=kimi-k3:cloud" \
+   && has "$out" "export ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash:cloud" \
+   && has "$out" "export MODEL_CMD='claude -p'"; then
+  ok "DEFAULT dev.build -> ollama-cloud/kimi-k3:cloud (+ small flash) via claude -p"
+else no "DEFAULT dev.build should route to ollama-cloud/kimi-k3:cloud; got: $out"; fi
 out="$(route env marketing)"
-has "$out" "export MODEL_CMD='claude -p'" && ok "DEFAULT marketing -> claude -p" \
-  || no "DEFAULT marketing should route to claude -p; got: $out"
+if has "$out" "export ANTHROPIC_MODEL=glm-5.3:cloud" \
+   && has "$out" "export ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash:cloud" \
+   && has "$out" "export MODEL_CMD='claude -p'"; then
+  ok "DEFAULT marketing -> ollama-cloud/glm-5.3:cloud (+ small flash) via claude -p"
+else no "DEFAULT marketing should route to ollama-cloud/glm-5.3:cloud; got: $out"; fi
 # an unlisted role falls back to models.default
 out="$(route env sales)"
 has "$out" "config:models.default" && ok "DEFAULT unlisted role falls back to models.default" \
   || no "unlisted role should use models.default; got: $out"
+# a bare `dev` over a NESTED lane has no flat meaning — it too falls back to default
+out="$(route env dev)"
+has "$out" "config:models.default" && has "$out" "export DOZER_MODEL_NAME=claude-opus-5" \
+  && ok "DEFAULT bare dev (nested lane) falls back to models.default" \
+  || no "bare dev should use models.default; got: $out"
 
 # ── OVERRIDE: env wins, and emits the proven ollama-cloud recipe ───────────────
 out="$(route DOZER_MODEL_DEV=ollama-cloud:glm-5.2 env dev)"
@@ -104,14 +125,14 @@ has "$out" "export ANTHROPIC_MODEL=glm-5.2" && ok "OVERRIDE bare ollama-cloud us
 # A bare `claude -p` inherits the CLI's default, which drifted opus-4-8 -> fable-5-1 ->
 # opus-5 in one week and spent 37% of the Dozer's budget on a 2x-price model nobody
 # chose. Config must name the model; an env override stays loose on purpose.
+# (Bespoke minimal config: the shipped one nests `dev`, so no regex rewrite would do.)
 UNPIN="$TMP/unpinned.yaml"
-python3 - "$CFG" "$UNPIN" <<'PY'
-import re, sys
-s = open(sys.argv[1]).read()
-s, n = re.subn(r'(?m)^(\s*dev:\s*)\{[^}]*\}', r'\1{ provider: claude, model: "" }', s)
-assert n == 1, "fixture did not blank models.dev (found %d matches)" % n
-open(sys.argv[2], 'w').write(s)
-PY
+cat > "$UNPIN" <<YAML
+models:
+  default: { provider: ollama-cloud, model: "glm-5.2" }
+  dev:     { provider: claude, model: "" }
+ollama_env: "$VAULT"
+YAML
 set +e
 out="$(env "${SCRUB_ENV[@]}" DOZER_CONFIG="$UNPIN" bash "$ROOT/dozers/model.sh" env dev 2>&1)"; rc=$?
 set -e
@@ -128,17 +149,16 @@ if (( rc == 0 )) && has "$out" "export MODEL_CMD='claude -p'"; then
 else no "env override should still resolve; rc=$rc out=$out"; fi
 
 # ── VAULT: `show` must never leak the token ────────────────────────────────────
-python3 - "$CFG" <<'PY'
-import re, sys
-# Line-anchored, not a byte-for-byte literal: this fixture broke silently once when
-# org/config.yaml pinned the model (GSAI-83), and a fixture that no-ops on drift makes
-# the two assertions below test the shipped config instead of the route under test.
-p = sys.argv[1]; s = open(p).read()
-s, n = re.subn(r'(?m)^(\s*dev:\s*)\{[^}]*\}',
-               r'\1{ provider: ollama-cloud, model: "glm-5.2" }', s)
-assert n == 1, "fixture did not rewrite models.dev (found %d matches)" % n
-open(p, 'w').write(s)
-PY
+# Bespoke minimal config: the shipped one nests `dev` (2026-09-15), so the old regex
+# rewrite of a flat `dev:` line would no-op and the assertions would test the wrong
+# route. Keep this FLAT (one provider/model shared by every dev pass) on purpose —
+# it proves a nested-lane config is not required for routing to work.
+cat > "$CFG" <<YAML
+models:
+  default: { provider: claude, model: "claude-opus-5" }
+  dev:     { provider: ollama-cloud, model: "glm-5.2" }
+ollama_env: "$VAULT"
+YAML
 out="$(route show)"
 if has "$out" "ollama-cloud" && ! grep -qF "$FAKE_KEY" <<<"$out"; then
   ok "SHOW lists the route and prints no secret"
@@ -150,9 +170,12 @@ has "$out" "config:models.dev" && has "$out" "export ANTHROPIC_MODEL=glm-5.2" \
   && ok "CONFIG models.dev route resolves" || no "config route failed; got: $out"
 
 # ── NOKEY: ollama-cloud with no key anywhere -> exit 2, clear message ──────────
+# Query dev.build, not bare dev: bare `dev` over a nested lane falls back to
+# models.default (claude) and never touches the ollama key. dev.build is the role
+# that actually resolves into the nested ollama-cloud route.
 rm -f "$VAULT"
 set +e
-out="$(route env dev 2>&1)"; rc=$?
+out="$(route env dev.build 2>&1)"; rc=$?
 set -e
 if (( rc == 2 )) && has "$out" "OLLAMA_API_KEY"; then
   ok "NOKEY fails fast (exit 2) naming OLLAMA_API_KEY"
