@@ -1,159 +1,180 @@
-# GSAI-144 — design: `--no-push` must not require an `origin`
+# GSAI-150 — design: the double eval executes the diff as shell — every review
 
-**Task:** promote.sh refuses a local-only promote — `--no-push` still requires an
-origin, stranding GSAI-142 (`~/ecosystem`, no remote) and BRD-4
-(`~/initiatives/brands/mr-growth-guide`, no remote).
+**Task:** the dev lane's `run_model_pass` builds the model command by `eval`-ing a
+string the prompt (with the branch diff) was already substituted into. The second
+`eval` re-parses the prompt as shell code, so every `$( … )` and backtick in the
+review diff — and any metacharacter in a task title — is EXECUTED by the crew, and
+quotes in the diff silently mangle the prompt the model actually receives. This
+happens on every review pass of every task.
 
-**Repo:** dozers (main-only). **Files touched:** `directors/promote.sh`,
-`tests/promote-test.sh`. Nothing else.
+**Repo:** dozers (main-only). **Files touched:** `dozers/dev-lane/crew.sh` (one
+cmd-string, line ~304) + a new `tests/dev-lane-model-prompt-test.sh`, registered in
+`tests/run-all.sh`. Nothing else.
 
 ---
 
 ## The bug, precisely
 
-`directors/promote.sh` enforces invariant 3 ("origin is the truth") *before* it ever
-considers the `PUSH` flag:
+`dozers/dev-lane/crew.sh:303-304` hands timebox this cmd-string:
 
-- `directors/promote.sh:81` — dies when there is no `origin` remote, even under
-  `--no-push`.
-- `directors/promote.sh:89-91` — dies when `origin/$FROM` or `origin/$TO` is missing
-  after fetch, even under `--no-push`.
-
-So the one mode that provably needs no origin (merge local develop → local main,
-publish nothing) is the one being refused. Every later stage of the script already
-works fine on local refs — the refusal is purely at the front door.
-
-## Approach — a `LOCAL_ONLY` mode, gated on BOTH "no origin" and "--no-push"
-
-After args parsing and repo resolution (which stay untouched), replace the
-unconditional origin block with:
-
-```
-HAS_ORIGIN: does `git remote get-url origin` succeed?
-if no origin:
-    PUSH  → die (the existing refusal, message updated to mention --no-push as the
-             local-only escape hatch) — "Done when" #4, unchanged behavior
-    !PUSH → LOCAL_ONLY=1; say "local-only promote — measured against LOCAL <TO>,
-             never published" — and SKIP fetch + the origin-ref existence loop
-else:
-    fetch + origin-ref existence checks exactly as today (a repo WITH an origin
-    behaves exactly as it does today — "Done when" #3)
+```bash
+_PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" timebox "$T_MODEL" "$1 agent" "$WT" \
+    'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"$_PASS_PROMPT\""' || rc=$?
 ```
 
-`LOCAL_ONLY` is **only** reachable when the repo has no origin remote at all. It is
-NOT a "skip the remote checks" flag: with an origin present, `--no-push` keeps the
-current semantics (fetch still happens, `origin/$ref` must exist, `_effective` still
-picks between local and origin tips). This keeps the spec's "no behaviour change for
-repos with an origin" exactly true.
+`timebox` (timebox.sh:68/76) runs `( cd <dir> && eval <cmd-string> )`. Trace the two
+evals:
 
-Then every remaining use of `origin/<branch>` is guarded so local-only mode never
-touches a remote ref:
+1. **eval #1** parses `eval "$MODEL_CMD \"$_PASS_PROMPT\""`. `\"` yields a literal
+   quote character, but `$_PASS_PROMPT` is **expanded here** — its full text (the
+   review prompt, with `$(git diff "$base")`'s output embedded by the heredoc at
+   crew.sh:571-584) is substituted INTO the string. The argument handed to eval #2
+   is therefore the *concatenated text* `<MODEL_CMD> "<entire prompt>"`.
+2. **eval #2** parses that text **as shell code**. Inside double quotes bash still
+   executes `` ` … ` `` and `$( … )`. A diff line like
+   `+echo "sha $(git rev-parse --short HEAD)"` — routine in this very repo — runs
+   `git rev-parse` as a side effect of *building the command line*. A malicious or
+   merely unfortunate diff (`` `curl …` ``, `$(rm -rf …)`) executes with the crew's
+   permissions, from the worktree, inside the timebox.
 
-1. **`_effective()` (line 110)** — in local-only mode:
-   - `refs/heads/$br` missing → `die "no local branch '$br' and no origin to fall
-     back on — nothing to promote"` (a fresh clone with neither local develop nor a
-     remote gets a clear refusal, not a confusing rev-parse error).
-   - otherwise echo `"$br"` — local is the ONLY truth in this mode. No `_rel`
-     comparison, no divergence adjudication (there is nothing to diverge from).
+So "double eval executes the diff as shell — every review" is literal: the review
+prompt is untrusted, model-authored text (the diff comes from whatever the BUILD pass
+wrote, which itself came from a model), and it is re-parsed by a shell on every
+review — initial review, rebuild re-review, all of them. The architect and build
+prompts ride the same line; their payload is the Linear task title (Director-written,
+but still outside the crew's trust boundary), so a title containing `$( … )` executes
+too, and a title with a stray `"` corrupts the prompt.
 
-   Existing with-origin path byte-identical.
+Secondary defect, same line: **prompt mangling.** A diff containing a `"` (most diffs
+do — JSON, `"test"` in package.json, quoted strings everywhere) toggles eval #2's
+quote state; argument boundaries shift and the model receives a different prompt than
+the crew assembled. This is silent — no non-zero exit, just a judge reading corrupted
+evidence.
 
-2. **UNPUSHED_SRC block (lines 125-130)** — guarded by `! LOCAL_ONLY`. In local-only
-   mode every commit on develop is trivially "unpushed"; the informational lines and
-   the internal sanity check at line 131 (`origin/$FROM ⊆ $SRC`) are skipped.
+**Why the marketing lane is NOT affected:** `dozers/mktg-lane/crew.sh:173` passes
+`"$MODEL_CMD \"\$PROMPT\""` — the `$` is escaped, so `$PROMPT` expands once, inside
+double quotes, at the single eval's parse; an expansion result inside quotes is never
+re-parsed. That lane is safe and untouched. `dozers/model.sh:45` (smoke) has the same
+escaped-dollar shape with a fixed prompt — safe, untouched.
 
-3. **No-op path (lines 174-181)** — the "origin is behind this machine, publishing
-   the earlier promote" follow-up is guarded by `! LOCAL_ONLY`; local-only exits 0
-   with "nothing to promote" and moves nothing. (In a no-origin repo there IS no
-   earlier unpublished promote to finish — that concept doesn't exist.)
+## Approach — escape the prompt's `$` in the cmd-string (the mktg-lane shape)
 
-4. **`_publish()` (line 153)** — already returns early when `PUSH=0`; extend the
-   early-return message to say, in local-only mode, that `<TO>` exists only on this
-   machine and a future run after a remote exists is the publishing path. In
-   with-origin `--no-push` mode the existing "push skipped (--no-push) — origin still
-   lacks this promote" wording is kept.
+One-line change to the cmd-string in `run_model_pass`:
 
-5. **Header comment** — add invariant 6: "A repo with no `origin` can still promote
-   under `--no-push`: local `<TO>` is both the base and the truth, and nothing is
-   published. Without `--no-push` a missing origin stays fatal." Update the usage
-   line's flag comment likewise.
+```bash
+'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"\$_PASS_PROMPT\""'
+```
 
-**What is deliberately NOT changed:**
+Trace after the fix: eval #1 now yields eval #2 the *code*
+`<MODEL_CMD> "$_PASS_PROMPT"` (the `$` is a literal character, not expanded). Eval #2
+parses that code: `$MODEL_CMD`'s value was already expanded by eval #1 **after**
+`eval "$_PASS_BLOCK"` ran in the same shell, so the per-pass route's `MODEL_CMD` is
+what's on the line (route isolation, GSAI comment at crew.sh:241-248, unchanged).
+`$_PASS_PROMPT` then expands **inside double quotes at parse time** — bash hands it to
+the model CLI as ONE argument and never re-parses the value. Command substitutions,
+backticks, quotes, `$` signs in the diff become inert bytes of the argument.
 
-- The merge itself (line 226): still `git merge --no-ff` on a clean checkout or a
-  throwaway worktree; 2-parent post-check, no-squash, no-rebase, never fast-forward.
-- Dirty-tree refusal (line 201) — fires identically in local-only mode.
-- The stray-commit check (line 138): in local-only mode `$DST`/`$SRC` are the local
-  branches, so a hand-rolled hotfix or squash on local main is still refused as
-  divergence. Invariant 2 survives the mode.
-- Exit codes and idempotency (AHEAD==0 → clean no-op, exit 0).
+What the fix deliberately keeps:
+
+- The per-pass route-block dance (`eval "$_PASS_BLOCK"` first, so ANTHROPIC_*/token
+  exports live exactly as long as the pass) — untouched, byte-identical.
+- The `MODEL_CMD` bypass branch (`resolve_pass` sets `_PASS_BLOCK=":"` when MODEL_CMD
+  is already in the env) — the same cmd-string serves it; the `:` is a no-op and the
+  prompt is still single-expanded.
+- timebox's process-group kill, `TIMEBOX_HIT`, the proof/rescue logic (GSAI-147) — all
+  downstream of the timebox call, untouched.
+- The heredoc that builds the review prompt (crew.sh:571-584) — `$(git diff …)` is
+  *supposed* to execute there, once, by the crew itself; that is the deliberate,
+  trusted data-gathering step. The vulnerability was only the round-trip through two
+  evals. Unchanged.
+
+A hardening comment (3-5 lines) goes on the cmd-string so the next reader knows why
+the `\$` is load-bearing: "the prompt is untrusted text (a diff / a title); it must
+expand exactly once, inside double quotes, or its shell metacharacters execute."
+
+**Considered and rejected:** passing the prompt via a temp file + a `$(cat file)`
+inside the cmd-string (same one-eval property, but adds a file lifecycle the crew's
+fail-fast paths would have to clean up, and `claude -p` takes the prompt as argv —
+the file buys nothing); `printf %q`-quoting the prompt into the string (works, but
+bloats the cmd-string by the whole prompt and is harder to read than one backslash);
+dropping the second `eval` entirely (`$MODEL_CMD` would expand at eval #1 parse time,
+*before* the route block ran — it must stay split exactly as it is).
 
 ## Edge cases
 
-| Case | Behavior |
+| Case | Behavior after the fix |
 |---|---|
-| No origin + no `--no-push` | Hard refusal (unchanged, message now points at `--no-push`) |
-| No origin + `--no-push` + no local `develop` | Refused: "no local branch 'develop' and no origin to fall back on" |
-| No origin + `--no-push` + no local `main` | Refused, same shape — there is nothing to merge into |
-| No origin + `--no-push` + dirty `main` checkout | Refused by the existing dirty guard |
-| No origin + `--no-push` + stray commit on local `main` | Refused by invariant 2 (local main vs local develop) |
-| No origin + `--check` / `--dry-run` | Report the real gap, touch nothing |
-| Second run after a local-only promote | Clean no-op ("nothing to promote", exit 0) |
-| Origin present, any flags | Byte-identical to today (mode never engages) |
-| Origin present but missing `origin/main` or `origin/develop`, `--no-push` | Unchanged: still fatal after fetch — fixing that is not in this spec |
-
-One real-world nuance the fixture must honor: a plain clone of a bare origin only
-has a local `main` — so whatever fixture shape is used, it must end up with a local
-`develop` carrying real commits, mirroring `~/ecosystem` where the crew's merge left
-a real local `develop` behind. The cleanest shape is a `fixture_localonly()` that
-builds the repo **directly** — `git init`, commit base on `main`, branch `develop`,
-commit local work, back to `main` — with **no bare origin, no clone, and no remote
-ever existing**. That is the purest form of the "no origin" precondition (it matches
-`~/ecosystem` and `mr-growth-guide`, where no remote ever existed rather than one
-having been removed) and skips the cost of a clone on a slow disk. Do NOT build it
-as a clone + `git remote remove origin` — that re-adds clone cost to say nothing the
-pure form doesn't already say.
+| Diff contains `$(cmd)`, `` `cmd` `` | Passed verbatim as prompt text; nothing executes |
+| Diff contains `"`, `'`, `\` | Prompt arrives byte-identical; no quote-state shift, no mangled review input |
+| Task TITLE contains shell metacharacters | Same — architect/build prompts safe (title is also untrusted) |
+| Prompt is empty | `""` empty argument, same as today; the pass artifact checks catch it |
+| MODEL_CMD env bypass | Same cmd-string; `_PASS_BLOCK=":"` no-op, prompt still single-expanded |
+| Multi-line prompt with newlines | One argv, newlines intact (expansion inside quotes preserves them) |
+| Very large diffs (argv size limit, ~256KB macOS) | Same exposure as today — the diff already rides one argv; out of scope |
+| mktg lane, model.sh smoke | Untouched (already safe — escaped `$`, single expansion) |
 
 ## How it gets tested
 
-`tests/promote-test.sh` gains local-only cases next to the existing no-origin refusal
-(test 11). The new cases use the pure `fixture_localonly()` described above — built
-directly, never a clone with the remote removed:
+New `tests/dev-lane-model-prompt-test.sh`, in the idiom of
+`dev-lane-model-exit-test.sh` (throwaway repo + stub agent through the MODEL_CMD
+bypass, plus one case on the routed path). It proves the property, not the incident:
 
-- **11b — no origin + `--no-push --check`**: exit 0, "promotable", origin untouched
-  (n/a), and — the "Done when" #1 shape — the run reports the commit gap rather than
-  refusing.
-- **11c — no origin + `--no-push`**: exit 0; local `main` in the clone gains the
-  2-parent merge; `git rev-list --count main..develop` == 0; output contains the
-  local-only/"not published" line (the "Done when" #2 shape).
-- **11d — no origin + `--no-push`, dirty `main` checkout**: exit 1, "dirty" in
-  output, local `main` unmoved — the dirty guard is proven intact in the new mode.
-- **11e — second run**: exit 0, "nothing to promote", no further movement
-  (idempotency holds with no origin).
-- **Test 11 (existing) tightened**: no origin without `--no-push` still exit 1 and
-  now also asserts the message mentions `--no-push`.
+- **INJECTION — the headline.** A stub build pass commits a source file whose diff
+  contains `$(touch pwned-by-review)` and a backtick form `` `touch pwned-too` ``.
+  The stub review pass writes its `$1` (the prompt it actually received) to a file
+  instead of reviewing. Run the crew. Assert:
+  1. **neither marker file exists** in the worktree or the repo — with the current
+     code this test FAILS (both files appear; that is the bug's mechanical proof);
+  2. the prompt the review stub received contains the `$(touch …)` line **verbatim**
+     (round-trips as data) — this also catches the quote-mangling defect;
+  3. the crew still completes and merges (the fix changes no gate).
+- **ROUND-TRIP — the mangled-prompt half.** A diff line with an odd number of `"`
+  (e.g. `+"test"` … a line with a lone `"`), and a title with a `$(echo hi)` in it
+  (passed via the crew's `$2`). Assert the captured architect prompt contains the
+  title's `$(` characters literally, and the captured review prompt contains the
+  quote line literally. Under the current code the review prompt arrives shifted.
+- **ROUTED PATH.** One INJECTION run on the routed branch (scrubbed MODEL_CMD, stub
+  `claude` on PATH — same `SCRUB_ROUTE` discipline as dev-lane-model-exit-test.sh) so
+  the fix is proven on the route-block path (`eval "$_PASS_BLOCK"`) too, not only the
+  bypass.
+- **REGISTRATION.** Add the file to `tests/run-all.sh` next to
+  `dev-lane-model-exit-test.sh`, honoring its GSAI-30 scrub contract (the suite runs
+  inside a real crew where MODEL_CMD is exported).
 
-All existing tests must keep passing untouched — they are the proof that
-with-origin behavior is unchanged. The suite runs offline against throwaway fixtures
-(bare origin + clone), consistent with the file's existing style; no new helpers
-beyond a small `fixture_localonly()`-style block, reusing `run`, `parents`, and the
-established ok/bad pattern.
+The build pass should first write the INJECTION case, run it against the unpatched
+crew, and observe it fail with both marker files present (the mechanical proof of the
+bug), then apply the one-line fix and watch it pass — the test is the repro.
+
+All existing suites must keep passing untouched; `dev-lane-model-exit-test.sh` is the
+canary that the rescue/proof machinery still works through the changed cmd-string.
 
 ## Risk
 
-Low. The change is a guarded front-door + four `! LOCAL_ONLY` guards; the merge
-machinery and every post-merge invariant are untouched. The main hazard is
-accidentally engaging the mode for repos that DO have an origin — prevented by
-gating on `HAS_ORIGIN=0` explicitly rather than on `--no-push` alone. Second hazard:
-a silent `_rel`/`origin/…` rev-parse inside local-only mode would produce a
-misleading "does not exist" refusal — mitigated by the dedicated missing-local-branch
-die in `_effective`, which is the ONLY branch-tip resolution in that mode.
+Low and contained. One cmd-string character-class change inside a function whose
+callers and downstream logic are untouched; the trace above is mechanical, and the
+regression test asserts both the security property (no execution) and the fidelity
+property (byte-identical prompt). The one behavioral difference a fix could hide —
+prompt expansion moving from eval #1 to eval #2 — is the entire point, and it happens
+in the same subshell with the same env, so route resolution and timebox semantics are
+invariant.
+
+The trace above was confirmed with a live repro of the exact invocation shape (the
+two-eval line driven against a stub `_PASS_BLOCK`/`_PASS_PROMPT` containing a diff
+with `$(touch …)` and a backtick form):
+
+- **current cmd-string:** both substitutions EXECUTED (both marker files appeared)
+  — and notably they executed even though the stub model command itself failed with
+  "command not found": the substitutions run while *constructing* the command line,
+  before the CLI is ever consulted.
+- **fixed cmd-string (`\$`):** the stub model CLI received `argc=1` — the prompt as
+  ONE byte-identical argument, markers untouched, quote line intact.
+
+So the two-eval claim is proven, not inferred. The regression test below is that
+repro, productized.
 
 ## Post-merge verification (for the Dev-Director, not this pass)
 
-- `promote.sh ~/ecosystem --no-push --check` → reports the 2-commit GSAI-142 gap.
-- `promote.sh ~/ecosystem --no-push --summary "GSAI-142"` → 2-parent merge on local
-  `main` of `~/ecosystem`, explicit not-published line.
-- Same for BRD-4 in `~/initiatives/brands/mr-growth-guide` (5 commits).
-- Whether `~/ecosystem` should gain a remote at all stays a human board decision —
-  this task unblocks the promote either way.
+- `bash tests/dev-lane-model-prompt-test.sh` green; full `tests/run-all.sh` green.
+- Grep that no other crew site substitutes an untrusted payload into an eval'd
+  string un-escaped (the two-lane audit above found none; model.sh smoke and the
+  mktg lane are the safe shapes to pattern-match against).

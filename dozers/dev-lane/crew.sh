@@ -300,8 +300,15 @@ run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artif
   echo "    [dev] $1 model: $_PASS_DESC"
   PASS_ROWS+=("$1: $_PASS_DESC")
   local rc=0
+  # GSAI-150: the `\$` on _PASS_PROMPT is load-bearing. The prompt is untrusted text —
+  # the review prompt embeds the branch's diff, every prompt embeds the task title —
+  # and it must expand EXACTLY ONCE, inside double quotes, at the second eval's parse.
+  # The old `\"$_PASS_PROMPT\"` expanded it during the FIRST eval, so the second eval
+  # re-parsed the diff as shell code: every $( … ) and backtick in the diff EXECUTED,
+  # and a stray " silently mangled the prompt the model received. As written, the
+  # second eval hands the CLI one byte-identical argv; metacharacters stay inert bytes.
   _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" timebox "$T_MODEL" "$1 agent" "$WT" \
-    'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"$_PASS_PROMPT\""' || rc=$?
+    'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"\$_PASS_PROMPT\""' || rc=$?
   # if/then, not `&& return`/`&& fail`: a false `(( … ))` short-circuits the list to
   # status 1, and run_model_pass runs as a plain command under set -e — that would
   # kill the crew silently before either branch below could speak.
