@@ -1,68 +1,90 @@
 VERDICT: PASS
 
-**Issue:** GSAI-60 — board reconcile can auto-approve on an agent's own comment.
-**Reviewed:** develop..HEAD (`5d2248b`), against DOZER-DESIGN.md (GSAI-60 architect pass).
+Reviewed the develop..HEAD diff (commit 6c9faab) against the spec (GSAI-151) and the
+architect pass's DOZER-DESIGN.md, then ran the repo's own full suite from this worktree.
 
-## The build follows the design, layer by layer
+## Spec, item by item
 
-1. **Write-side stamp (the primary fix)** — `_stamp_marker()` in
-   `tasks/_linear_api.py` appends `<!-- board-note by:<DOZER_COMMENT_BY:-dozer-engine> -->`
-   to any body with no `<!-- … -->` marker; `comment()` and `_comment_url()` are
-   confirmed the **only two** `commentCreate` doors and both route through it
-   (grep-verified; pinned by the new structure test, section 16). `os` was already
-   imported. The three callers each export one identity line (`dozer.sh` →
-   `dozer-engine`, `reaper.sh` → `dozer-reaper`, `run.sh` → `director-cli`) exactly
-   as specified. Pre-marked paths (`alarm_raise`/`alarm_clear`/`board-mirror`) carry
-   markers already, so they round-trip byte-identical — no double stamp, verified by
-   `stamp_marked_byteidentical`.
-2. **Read-side guard** — `AGENT_SIGNATURES` was checked against the **actual emitted
-   openers at the real call sites**, not just the design's transcription: `Dozer
-   claimed` (dozer.sh:248), `Dozer blocked BEFORE/AFTER/in lane` (:264,312,336),
-   `Dozer merged to develop` / `Dozer staged for review` (verb printf :329 — both
-   verbs match the anchored regex), `Director approved →` (run.sh:34), `♻️ Reaper
-   requeued` (reaper.sh:85). All match. `board_answers()` returns a refused list,
-   the CLI probe names each refusal on stderr and exits 3; `alarm_clear()` uses the
-   same classifier. The mixed case (refused status line + Vas's later real answer →
-   exit 0 with his line only) is pinned — a refusal cannot swallow a genuine answer.
-3. **Docs** — LINEAR.md gains the self-stamp + refusal sentences; run.sh's exit-3
-   message now names the refusal path. Director templates untouched, matching the
-   design (the marker rule was already in all four; existing test case 12 pins it).
-4. **Backends** — `files.sh` / `github-issues.sh` untouched, as specified.
+**1. Per-repo `timeout_test` in ecosystem.yaml — done, precedence correct.**
+`run_tests()` re-resolves the bound on every call: `DOZER_TIMEOUT_TEST` > the repo's
+`timeout_test:` registry entry (via `tasks/ecosystem_workdir.py --flag`, next to
+`no_test_gate`) > org/config.yaml > 900. Lazy resolution is the right call and the
+design's bootstrap argument holds: the crew that ADDS a repo's entry must not be locked
+to the old bound for its own gates — verified live, the `dozers` entry at
+`~/ecosystem/ecosystem.yaml:284` now carries `timeout_test: 1800` and this crew's own
+green-gate picks it up. Only the `dozers` entry was touched; every other repo keeps
+900. Garbage values fail loud BOTH upfront (before any model spend — the GARBAGE case
+proves the stub never ran and no worktree was even built) and at run time.
 
-## Tests — the repro is real
+**2. Gate stays enforced — confirmed.** No `TEST_GATE` logic, no waiver path, no
+`.dozers-no-test-gate` anywhere in the diff; the only gate-adjacent changes are bound
+resolution and failure text. The green-gate still runs both test passes (the GATE case
+in dev-lane-timeout-test still passes as-is).
 
-`tests/board-reconcile-test.sh` grew sections 13–16 exactly per the design (STAMP,
-GUARD, ALARM, STRUCTURE PIN) in the file's existing python-harness idiom:
-**50/50 green**, including all 12 pre-existing cases (the `answered()` helper was
-correctly extended for the 3-tuple return). The `REFUSED:` line appears on stderr
-in the guard_cli case, proving the refusal is visible, not silent. Full
-`tests/run-all.sh`: **32/32 PASS** — nothing else in the repo pins comment bodies,
-and no new test registration was needed (run-all.sh globs `tests/*-test.sh`).
+**3. Elapsed on the failure line — done, and slightly better than asked.** Both the red
+line (`tests failed after Ns — not merging …`) and the timeout line (`timed out after Ns
+— ran Ns before the kill (…source…)`) carry the elapsed; the timeout text also names the
+effective source of the bound, so the knob actually in force is visible in
+`.artifacts/dev/<id>.fail`. The one test that pinned the old red text byte-exactly was
+widened to semantics, as designed.
 
-## Minor notes (non-blocking, cosmetic)
+**4. The 4-8x investigation — root cause found, named, and corroborated live.**
+`dozers/service.sh` emits `ProcessType: Background` → darwinbg QoS pins the entire
+engine tree (crews, model passes, both make-test runs) to E-core scheduling. The fix
+(Background → Standard, kept explicit, with the reasoning in an XML comment) matches
+the design; the crew correctly does NOT self-install (that would bootout its own parent
+tree mid-task) — the live plist still says Background, as designed, until a post-merge
+`service.sh install`. Independent corroboration from this review: the full suite took
+**644s here — in-crew, as a child of the still-Background-banded engine — vs the ~155s
+standalone baseline**, i.e. the ~4x environmental multiplier is real and the suite is
+not retrying or waiting on anything. 1800s is ~2.8x the measured in-crew ceiling:
+headroom without waiving anything.
 
-- `is_human_answer()` is defined but never called — `board_answers()` and
-  `alarm_clear()` inline the equivalent (marker check + signature check) instead.
-  The design said the helper "replaces the bare check in both consumers"; the
-  behavior is identical and test-pinned, but the exported helper is dead code and
-  a future reader might assume it's load-bearing.
-- The `alarm_clear` test case prints its `REFUSED:` stderr line to the terminal
-  (not captured like the probe cases) — harmless noise in test output.
-- Edge case handled implicitly rather than by test: a merged/staged comment whose
-  crew summary embeds an HTML comment skips the stamp (marker present), but the
-  signature guard still refuses that opener — the residual is covered by design's
-  layering.
+## Test evidence
 
-## Security judgment
+`make test` from this worktree: **run-all: PASS — 33/33 in 644s**, including:
+- `dev-lane-timeout-per-repo-test.sh` (new, 52s): PER-REPO beats org-config, ENV beats
+  per-repo, FALLBACK to org-config when the repo is absent, ELAPSED on red,
+  GARBAGE fails before spend — all green, plus the family's standing checks (develop
+  untouched, process group actually killed). The fixture bounds (8/10/12s) sit above
+  npm's startup envelope, applying dev-lane-timeout-test's flake lesson rather than
+  repeating it.
+- `dev-lane-timeout-test.sh` (55s) and `dev-lane-model-exit-test.sh` pass unchanged —
+  their substring assertions survive the new message shapes, as the design predicted.
+- `dev-lane-no-commit-gate-test.sh` (41s) green with the widened assertion.
+- `service-test.sh` green: ProcessType Standard present, `Background` absent,
+  `plutil -lint` still clean (the XML comment is legal plist).
+- `run-all.sh` prints the suite total (`in 644s`) — report-only, as designed.
 
-The asymmetry is preserved and strengthened: over-refusing is visible (stderr +
-the ask stays `board:to_review`) and recoverable by hand; under-refusing is what
-GSAI-60 measured live (11/22 issues). The stamp makes new unmarked scripted
-comments impossible at the only door they walk through; the guard catches the
-residual (pre-fix comments, LLM-authored slips, bypassing posters). The
-post-merge verification plan (reconcile dry-run over the 22 board issues) is
-correctly left to the Dev-Director.
+Design fidelity is exact on files: `dozers/dev-lane/crew.sh`, `dozers/service.sh`,
+`tests/run-all.sh`, one assertion widened in no-commit-gate, the new regression, and
+nothing else in the repo.
 
-**Recommendation:** merge to develop. Suggest the Dev-Director, in a cleanup pass
-or the next touch of this file, either wire `is_human_answer()` into the two
-consumers or drop it, and wrap the alarm test's stderr.
+## Residuals (noted, none blocking)
+
+1. **Green-gate `fail` window (narrow).** `run_tests` can now `fail` mid-green-gate if
+   the per-repo value turns garbage between the task-worktree run and the gate — after
+   the merge, before the revert. Static garbage is caught upfront; the trigger requires
+   a concurrent malformed registry edit inside a minutes-wide window, and the damage is
+   contained: no merge receipt is written, so the issue blocks and is never labeled
+   merged-develop (the GSAI-119 guard holds), and develop is recoverable by a hand
+   reset. Fail-loud here is still the right trade vs silently demoting the bound.
+2. **Reader errors degrade quietly.** `ecosystem_flag` suppresses all stderr and exit
+   codes, so a missing `yaml` module or unreadable registry reads as "not set" → the
+   global 900. This matches both the pre-existing `no_test_gate` idiom it was extracted
+   from and the design's documented edge case 3 — consistent, but worth remembering if
+   a per-repo bound ever silently fails to apply.
+3. **Cosmetic.** The new test's header (lines 19, 53) says the fixture org-config
+   carries `timeout_test: 5`; the actual value is 10. Comment drift only — the
+   assertions and fixture agree with each other.
+4. **The "~155s standalone" baseline is GSAI-73's measurement, not re-derived here** —
+   no standalone opportunity in an in-crew pass. The 644s in-crew figure above is this
+   review's own data point and lands inside the design's predicted window.
+
+## Post-merge (for the Dev-Director, not this pass)
+
+Re-run `dozers/service.sh install` from the main checkout to activate the Standard band
+(KeepAlive relaunches the loop immediately), then confirm with
+`launchctl print gui/$(id -u)/com.dozers.loop` and watch the next dozers-repo crew's
+suite total collapse toward ~155s. Until then (and on any machine with an old plist),
+the per-repo 1800s bound is the protection in force.
