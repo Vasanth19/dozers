@@ -49,7 +49,15 @@ brand:
 #   1) the task's repo:<id> hint  -> ecosystem.yaml project.id == id   (multi-repo orgs)
 #   2) the task's Linear team key -> the org whose linear_team == KEY, its default repo
 #      → a LearnLoop (LL) task lands in the learnloop repo automatically, no label
-#   3) workdir_default            (last-resort fallback only if the registry misses)
+#   3) workdir_default            (last resort, and ONLY when the task named no repo)
+#
+# Routing FAILS LOUD (GSAI-131). A task that carries an identity — a repo: label or a
+# team — is routed by the registry or it is not routed at all: an unresolvable
+# repo:<id> BLOCKS with the resolver's real error, is never demoted into the team's
+# default repo, and never lands in ~/Code/dozers. Step 3 below therefore applies to
+# exactly one kind of task: one that names NEITHER a repo nor a team. For those, "."
+# means "the repo the Dozer ships in" — the zero-config/files-backend mode where the
+# Dozer works on itself. Set an absolute path here for a different catch-all.
 #
 # The old hardcoded `workdirs:` map was REMOVED 2026-08-31 — ecosystem.yaml is the
 # single source of truth. Register new repos there (id, org, local), not here.
@@ -116,8 +124,18 @@ alarm_interval: 300                                     # how often the launchd 
 
 # ── Model routing — which brain each ROLE runs on. Swap a role's provider any time. ──
 # provider: claude | ollama-cloud | ollama-local | codex     model: provider-specific id ("" = provider default)
-# Env override wins:  DOZER_MODEL_<ROLE>="<provider>[:<model>]"  e.g. DOZER_MODEL_DEV=ollama-cloud:glm-5.2
-# Role = the lane name today (dev, marketing); `default` covers any role not listed.
+# A role is a lane name (`dev`, `marketing`) or a DOTTED per-pass role: the dev lane
+# runs three passes — dev.architect (plan -> DOZER-DESIGN.md), dev.build (implement),
+# dev.review (verdict -> DOZER-REVIEW.md) — each with its own route below. A nested
+# lane entry maps role -> {provider, model}; a FLAT entry (one carrying `provider`)
+# is shared by every role of that lane. `default` covers anything unlisted.
+# Env override wins:  DOZER_MODEL_<LANE>[_<ROLE>]="<provider>[:<model>]"  (dots fold to `_`)
+#   e.g. DOZER_MODEL_DEV=ollama-cloud:glm-5.2  ·  DOZER_MODEL_DEV_BUILD=ollama-cloud:kimi-k3:cloud
+# `small` (string on a nested lane) / `small_model:` (on a flat entry) pins
+# ANTHROPIC_SMALL_FAST_MODEL for ollama routes — auto-compact and title-gen then run on
+# the cheap model instead of the main one. Unset: small = main (the old behaviour).
+# Note: Claude versions that don't know `:cloud` model ids emit a benign "unrecognized
+# model" warning (auto-compact then assumes a 200k window) — the route still works.
 # Inspect with `dozers/model.sh show`; test a provider with `dozers/model.sh smoke <provider> [model]`.
 # PIN THE MODEL. An empty `model` on a claude route means no `--model` flag, which
 # hands the choice to whatever the Claude Code CLI defaults to that day. That default
@@ -126,7 +144,11 @@ alarm_interval: 300                                     # how often the launchd 
 # model_route.py now REFUSES an empty claude model from config; this is the fix, not
 # the workaround. (GSAI-83)
 models:
-  default:   { provider: claude, model: "claude-opus-5" }
-  dev:       { provider: claude, model: "claude-opus-5" }
-  marketing: { provider: ollama-cloud, model: "glm-5.2" }   # flipped 2026-09-07 (Vas): first role off Claude; smoke + crew e2e PASS. Revert: provider: claude, model: "claude-opus-5"
+  default: { provider: claude, model: "claude-opus-5" }
+  dev:
+    architect: { provider: ollama-cloud, model: "glm-5.3:cloud" }
+    build:     { provider: ollama-cloud, model: "kimi-k3:cloud" }
+    review:    { provider: ollama-cloud, model: "glm-5.3:cloud" }
+    small:     "glm-5.3-flash:cloud"
+  marketing: { provider: ollama-cloud, model: "glm-5.3:cloud", small_model: "glm-5.3-flash:cloud" }
 ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY
