@@ -374,6 +374,13 @@ creds() {
     if [ -n "${!v:-}" ]; then printf '   %-9s: exported into this environment ✓\n' "$v"
     else printf '   %-9s: NOT SET — optional hop skipped\n' "$v"; buzz_ok=no; fi
   done
+  # BUZZ_AUTH_TAG is load-bearing on a CLOSED relay: it is the NIP-OA attestation that
+  # delegates the owner's relay membership to Guzz, whose own pubkey is only a channel
+  # member. Missing it does NOT flip the verdict — an open relay needs no tag — but it is
+  # printed here because the alternative is a 403 nobody sees until the outage it was
+  # meant to announce.
+  if [ -n "${BUZZ_AUTH_TAG:-}" ]; then printf '   auth tag : present ✓ (NIP-OA — closed-relay membership via the owner)\n'
+  else printf '   auth tag : not set — fine on an open relay; a CLOSED one 403s relay_membership_required\n'; fi
   printf '   buzz cli : %s\n' "$(command -v buzz 2>/dev/null || { echo '(not on PATH)'; buzz_ok=no; })"
 
   printf -- '-- verdict --\n'
