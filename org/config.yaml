@@ -134,8 +134,9 @@ alarm_interval: 300                                     # how often the launchd 
 # ── Model routing — which brain each ROLE runs on. Swap a role's provider any time. ──
 # provider: claude | ollama-cloud | ollama-local | codex     model: provider-specific id ("" = provider default)
 # A role is a lane name (`dev`, `marketing`) or a DOTTED per-pass role: the dev lane
-# runs three passes — dev.architect (plan -> DOZER-DESIGN.md), dev.build (implement),
-# dev.review (verdict -> DOZER-REVIEW.md) — each with its own route below. A nested
+# runs three passes — dev.architect (plan -> DOZER-DESIGN-<id>.md, per-issue since
+# GSAI-148), dev.build (implement), dev.review (verdict -> DOZER-REVIEW-<id>.md) —
+# each with its own route below. A nested
 # lane entry maps role -> {provider, model}; a FLAT entry (one carrying `provider`)
 # is shared by every role of that lane. `default` covers anything unlisted.
 # Env override wins:  DOZER_MODEL_<LANE>[_<ROLE>]="<provider>[:<model>]"  (dots fold to `_`)

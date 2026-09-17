@@ -56,7 +56,9 @@ mkproj() {  # $1 = dir
 }
 
 # Stub coding agent. Counts invocations in $COUNT_FILE; invocation 1 is the architect
-# pass, then build/review alternate (2=build, 3=review, …). Each pass CAPTURES the
+# pass, then build/review alternate (2=build, 3=review, …). The pass artifacts are the
+# PER-ISSUE names (GSAI-148): $TASK_ID is the task id the runner exports, so the stub
+# writes DOZER-DESIGN-$TASK_ID.md / DOZER-REVIEW-$TASK_ID.md. Each pass CAPTURES the
 # prompt it actually received (the last argv element — `claude -p "<prompt>"` on the
 # routed path, bare `"<prompt>"` on the bypass) into $CAP_DIR/<pass>.txt. The build
 # pass commits injected.sh whose payload lines are what the REVIEW prompt's embedded
@@ -75,7 +77,7 @@ last=""; for a in "$@"; do last="$a"; done
 printf '%s' "$last" > "$CAP_DIR/$pass.txt"
 case "$pass" in
   architect)
-    printf '# design\n' > DOZER-DESIGN.md
+    printf '# design\n' > "DOZER-DESIGN-$TASK_ID.md"
     git add -A && git commit -q -m design ;;
   build)
     # Unquoted heredoc: \$ and \` stay literal, $MARKER_DIR bakes the abs path in —
@@ -87,7 +89,7 @@ INNER
     [[ "${QUOTE_LINE:-0}" == 1 ]] && printf 'echo "never closed quote on this line\n' >> injected.sh
     git add -A && git commit -q -m "add injected.sh" ;;
   review)
-    printf 'VERDICT: PASS\nok\n' > DOZER-REVIEW.md
+    printf 'VERDICT: PASS\nok\n' > "DOZER-REVIEW-$TASK_ID.md"
     git add -A && git commit -q -m review || true ;;
 esac
 exit 0
@@ -103,7 +105,7 @@ run_crew() {  # $1 = proj dir, $2 = task id, $3 = log, $4 = title, $5.. = extra 
   env COUNT_FILE="$TMP/$id.count" CAP_DIR="$TMP/cap-$id" MARKER_DIR="$TMP/mark-$id" TIMEBOX_KILL_GRACE=1 \
       DOZER_TIMEOUT_TEST="$BOUND" DOZER_TIMEOUT_MODEL="$BOUND" DOZER_TIMEOUT_DEPS="$BOUND" \
       REPO_ROOT="$TMP" WORKDIR="$proj" WORKTREE_ROOT="$TMP/wt-$id" INTEGRATION_BRANCH="develop" \
-      MODEL_CMD="bash $STUB" PUSH="false" DOZER_PERSONA="test" "$@" \
+      TASK_ID="$id" MODEL_CMD="bash $STUB" PUSH="false" DOZER_PERSONA="test" "$@" \
       bash "$CREW" "$id" "$title" >"$log" 2>&1
 }
 
@@ -124,6 +126,7 @@ run_crew_routed() {  # same args as run_crew
       COUNT_FILE="$TMP/$id.count" CAP_DIR="$TMP/cap-$id" MARKER_DIR="$TMP/mark-$id" TIMEBOX_KILL_GRACE=1 \
       DOZER_TIMEOUT_TEST="$BOUND" DOZER_TIMEOUT_MODEL="$BOUND" DOZER_TIMEOUT_DEPS="$BOUND" \
       REPO_ROOT="$ROOT" WORKDIR="$proj" WORKTREE_ROOT="$TMP/wt-$id" INTEGRATION_BRANCH="develop" \
+      TASK_ID="$id" \
       DOZER_MODEL_DEV_ARCHITECT="claude:claude-opus-5" \
       DOZER_MODEL_DEV_BUILD="claude:claude-opus-5" \
       DOZER_MODEL_DEV_REVIEW="claude:claude-opus-5" \
@@ -156,6 +159,15 @@ grep -Fq "$n2" "$TMP/cap-$MID/review.txt" 2>/dev/null \
 [[ $rc -eq 0 && "$(dev_head "$PA")" == merge*"$MID"* ]] \
   && ok "INJECTION: crew still completes and merges (the fix changes no gate)" \
   || { no "INJECTION: crew exited $rc; develop HEAD '$(dev_head "$PA")'"; dump "$LOG"; }
+# GSAI-148 contract pin: the prompts name the PER-ISSUE artifacts the passes must
+# write — the crew prompt is the contract; the routed suites prove the backstops.
+grep -qF "DOZER-DESIGN-$MID.md" "$TMP/cap-$MID/architect.txt" 2>/dev/null \
+  && ok "PER-ISSUE-NAMES: the architect prompt names DOZER-DESIGN-$MID.md" \
+  || { no "PER-ISSUE-NAMES: architect prompt still names the fixed DOZER-DESIGN.md"; dump "$TMP/cap-$MID/architect.txt" 2>/dev/null || true; }
+grep -qE "DOZER-REVIEW-$MID\.md" "$TMP/cap-$MID/review.txt" 2>/dev/null \
+  && ! grep -qE 'DOZER-(DESIGN|REVIEW)\.md' "$TMP/cap-$MID/review.txt" \
+  && ok "PER-ISSUE-NAMES: the review prompt names DOZER-REVIEW-$MID.md (and no legacy fixed names)" \
+  || { no "PER-ISSUE-NAMES: review prompt missing the per-issue name or still carries a legacy one"; dump "$TMP/cap-$MID/review.txt" 2>/dev/null || true; }
 
 # ── ROUND-TRIP: title metacharacters + a lone quote arrive byte-identical ─────
 PB="$TMP/roundtrip"; mkproj "$PB"; RID="TEST-MP-B"; LOG="$TMP/b.log"; rc=0
