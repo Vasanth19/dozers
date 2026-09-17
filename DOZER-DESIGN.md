@@ -1,198 +1,156 @@
-# GSAI-154 — design: the migration gate reads "my check failed" as "no override" — a transient read failure blocks a green change
+# GSAI-148 — design: per-issue pass artifacts — two tasks in one repo must not collide on DOZER-DESIGN.md
 
-**The bug.** `dozers/dev-lane/crew.sh` (`migration_gate`, ~lines 258–278) is fail-closed
-by design: a schema change with no matching migration blocks the merge. Its one escape
-hatch — `[skip-migration]` in a commit message — is checked like this:
+**The bug.** Every dev-lane crew tells its ARCHITECT pass to "write DOZER-DESIGN.md at
+the worktree root" and its REVIEW pass to "write DOZER-REVIEW.md at the worktree root"
+(`dozers/dev-lane/crew.sh`, the three heredoc prompts), and the crew's backstops commit
+those exact paths. The path is FIXED — it does not name the task — so any two tasks in
+the same repo write the same two files. The moment one lands on the integration branch,
+every other in-flight task in that repo holds a branch whose rebase (resume, GSAI-70)
+or merge replays an add/add conflict on those paths:
 
-```bash
-if git -C "$wt" log --format=%B "$cmp".."$BRANCH" 2>/dev/null | grep -qF '[skip-migration]'; then
-```
+- **resume:** `git rebase "$base"` replays the task's "design (architect pass)" commit
+  onto a base that now contains another task's DOZER-DESIGN.md → add/add → rebase
+  aborted → "stale base: … CONFLICTS" → blocked, worktree parked.
+- **merge:** `git merge --no-ff` conflicts the same way; the fallback `git rebase
+  "$INTEG"` in the task worktree conflicts again → "merge conflict — sent back".
 
-The pipeline cannot distinguish **"checked and the marker is absent"** from **"the check
-itself failed"**. Any non-zero exit — `git log` erroring under transient system pressure,
-`grep` dying, a fork/exec blip — is silenced by `2>/dev/null` and scored as *no
-override*, so the LL-31 guardrail blocks a change that legitimately shipped the escape
-hatch. There is a twin hole one line up: the diff read is
-`changed="$(git -C "$wt" diff --name-only "$cmp"..."$BRANCH" 2>/dev/null || true)"` —
-a transient diff failure there reads as *no changed files* and **waives the gate
-silently** (fail-open). Both are silent-fallback bugs wearing a guardrail's clothes.
+This repo is the live proof: the root `DOZER-DESIGN.md` this pass was told to overwrite
+is GSAI-154's design, and root `DOZER-REVIEW.md` is GSAI-154's review — each task
+silently destroys the previous one's record, and GSAI-148/149 could not both land.
 
-**Evidence — two in-crew false blocks on green changes** (`.artifacts/dev/GSAI-14{8,9}.fail`,
-`~/.dozers/logs/loop.err.log` 27354/27706):
+The twist that makes it pure waste: these files are **not deliverables**. The no-commit
+gate's `branch_has_output` already excludes them (`':(exclude)DOZER-DESIGN.md'
+':(exclude)DOZER-REVIEW.md'`) — a branch whose only diff is the design file FAILS. So
+the collision blocks real, gated, test-green work on files the lane itself declares
+worthless as merge content.
 
-| run | result |
-|---|---|
-| GSAI-149 gate run, in-crew | `run-all: FAIL — 30/31; failures: dev-lane-migration-gate-test.sh` — only OVERRIDE ✗ |
-| GSAI-148 gate run, in-crew | `run-all: FAIL — 33/34 in 623s; failures: dev-lane-migration-gate-test.sh` — only OVERRIDE ✗ |
-| standalone (6+ runs, incl. 2 verified for this design) | 3/3 scenarios + OVERRIDE ✓ |
-
-Both tasks were green (each task's build agent had already run the same suite green in
-the same worktree minutes earlier) and neither touched the migration gate. The gate
-code itself is unchanged since GSAI-24 (`git log -S "skip-migration"` → only 5da9065),
-so the in-flight diffs are not the cause — this is a load-dependent flake in the base
-code, and it can hit any real LL-31-gated task in production exactly the same way.
-
-**Root cause by elimination.** In the OVERRIDE scenario the stub
-(`tests/dev-lane-migration-gate-test.sh:79-80`) runs on **all three** model passes and
-commits every time — verified for this design: `sed 's/prisma-client-js/prisma-client-js2/'`
-re-matches the substring inside `prisma-client-js2`, so pass 2/3 produce `js22`/`js222`
-and each pass's `git commit -m "tweak generator [skip-migration]"` succeeds. The stub
-is the *only* committer on the fixture branch (every crew backstop is skipped under the
-`MODEL_CMD` bypass), so a clean run always holds ≥3 commits carrying the marker — a
-successful `git log` cannot legitimately miss it. The failing logs show the crew ran
-cleanly through all three passes (no rescue `⚠` lines — byte-matched against a green
-run captured for this design) and then the gate fired. Everything else is ruled out by
-the log content itself: env leakage would print `migration gate: off` or a different
-waiver reason (it prints the expected `TEST_GATE=off` line); shared temp state is
-impossible (each scenario gets its own `mktemp` repo, `WORKTREE_ROOT`, and merge lock);
-there is no sleep/async code between the diff and the log to race. What remains is the
-one path that fits: **the override read pipeline exited non-zero — empty or partial
-output swallowed by `2>/dev/null` — and the fail-closed branch read it as "no override".**
-The exact transient trigger is unobservable post-hoc (the fixture `$TMP` is deleted and
-stderr discarded), but "only in-crew, only under the launchd QoS throttle with 5 parallel
-crews and disk at 93%" (GSAI-68) is the signature of a momentary fork/exec/EMFILE-class
-failure — a blip that a gate must survive or name, never misdiagnose.
-
-**The invariants to keep.**
-
-- A schema change with no migration and no marker **still blocks**, with the failure
-  text **byte-identical** to today's (the test greps `no matching migration`, and the
-  text feeds the Director's block comment).
-- `[skip-migration]` remains the only escape hatch, still matched strictly (`grep -qF`).
-- Fail-fast doctrine: a check that cannot run is **never** silently scored either way —
-  it is retried briefly, then fails **loudly with its own reason**, distinguishable from
-  an LL-31 violation so a Director sees "infra flake", not "spec violation".
+**The fix — name the artifacts after the issue.** One change of shape, applied
+everywhere: the artifact paths become per-issue —
+`DOZER-DESIGN-$ID.md` and `DOZER-REVIEW-$ID.md` (e.g. `DOZER-DESIGN-GSAI-148.md`).
+Two tasks in one repo then never touch the same path, so neither the resume rebase nor
+the merge can conflict on them. Rounds *within* one issue (rebuild after a FAILed
+review, resume attempts) keep writing the same file — same branch, sequential
+commits, which rebase and merge handle as ordinary same-path edits.
 
 ## Approach
 
-Rework `migration_gate` so every evidence read is **captured, retried, and
-failure-discriminating** — no pipelines, no `2>/dev/null`, no `|| true`:
+1. **Single source of truth in `crew.sh`.** Right after `ID="$1"` is validated,
+   derive a filename-safe id and the two artifact names:
 
-1. **Diff read — no silent waiver.** Replace
-   `changed="$(git diff --name-only … 2>/dev/null || true)"` with a captured read
-   (`if ! changed="$(git -C "$wt" diff --name-only "$cmp"..."$BRANCH" 2>"$gerr")"; then …`).
-   On failure: 3 attempts (1s apart), then
-   `fail "migration gate could not diff $BRANCH against $cmp — git diff failed: <tail of $gerr> (worktree kept, sent back)"`.
-   A gate that cannot see the diff must stop, not wave the change through.
-2. **Override read — capture, retry, then verdict.** Replace the `git log | grep -qF`
-   pipe with the same captured-read shape: `git -C "$wt" log --format=%B "$cmp".."$BRANCH"`
-   into a temp file, 3 attempts 1s apart, each failed attempt logging a visible
-   `⚠ migration gate: git log attempt N failed — retrying` line (reported, never
-   masked — same discipline as the `run_model_pass` rescues). Persistent failure →
-   `fail "migration gate could not read the commit messages on $BRANCH — git log failed: <tail> ; NOT scored as an LL-31 violation (worktree kept, sent back)"`.
-   The marker check becomes `grep -qF '[skip-migration]' "$msgs"` on the captured file —
-   **grep only ever runs on a successful read**, so "no match" now genuinely means
-   "the marker is absent".
-3. **No pipes left in the gate.** Both reads use if-captured command substitution;
-   `set -e`/pipefail safety comes from `if/else`, the same convention the crew's own
-   GSAI-155 comment documents for code that runs as a plain command.
-4. **Retry is bound and cheap:** 3 attempts ≈ 2s worst case, hard-coded with a comment
-   (a knob here buys nothing; a persistent git breakage must fail fast). Retry applies
-   to the *read* only — never to the verdict: a successful read with no marker blocks
-   exactly as before.
+   ```bash
+   ART_ID="$(printf '%s' "$ID" | sed -E 's/[^A-Za-z0-9._-]/-/g')"   # GSAI-148 → GSAI-148
+   DESIGN_FILE="DOZER-DESIGN-$ART_ID.md"
+   REVIEW_FILE="DOZER-REVIEW-$ART_ID.md"
+   ```
 
-Shared shape (one small local helper inside the gate section, used by both reads):
+   Every other reference uses the variables. No second place spells the names out —
+   that is the whole bug class closed by construction.
 
-```
-gate_read <label> <git args…>   → stdout captured by the caller; 3 attempts;
-                                persistent failure → fail "<label> — git failed: <stderr tail>"
-```
+2. **Replace every literal, site by site in `dozers/dev-lane/crew.sh`:**
+   - `ARCH_PROMPT` heredoc — "write `$DESIGN_FILE` at the worktree root"; the resume
+     preamble's "If DOZER-DESIGN.md is already committed" → "If `$DESIGN_FILE` is
+     already committed".
+   - `BUILD_PROMPT` — "Implement the design in `$DESIGN_FILE`".
+   - REVIEW-prompt heredoc in `review_once` — "write `$REVIEW_FILE` … whose FIRST
+     LINE…", and "DOZER-DESIGN.md is the architect pass's plan" → `$DESIGN_FILE`.
+   - `run_model_pass` proof arguments: `file:DOZER-DESIGN.md` → `file:"$DESIGN_FILE"`,
+     `file:DOZER-REVIEW.md` → `file:"$REVIEW_FILE"` (the proof parser `${3#file:}` is
+     already name-agnostic; the "is on disk" rescue line prints the real name).
+   - architect backstop: `-s "$WT/DOZER-DESIGN.md"` → `"$WT/$DESIGN_FILE"`;
+     `git add DOZER-DESIGN.md` → `git add "$DESIGN_FILE"`; the "architect produced
+     no DOZER-DESIGN.md" fail text names `$DESIGN_FILE`.
+   - review backstop in `review_once`: `git add "$REVIEW_FILE"`, the awk verdict scan
+     reads `"$WT/$REVIEW_FILE"`, and both `_notes="$(cat …)"` reads (rebuild prompt +
+     double-FAIL fail text) read `$REVIEW_FILE`.
+   - `branch_has_output` excludes **both schemes**:
+     `':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md'
+     ':(exclude)'"$DESIGN_FILE" ':(exclude)'"$REVIEW_FILE"`. The legacy pair stays so a
+     pre-fix resumed branch (whose committed artifacts carry the old names) is still
+     correctly scored "design is not a deliverable" — dropping the legacy exclusions
+     would let such a branch pass the gate on a design file alone.
+   - `DRY_RUN` stub block: `printf … > "$WT/$DESIGN_FILE"` / `"$WT/$REVIEW_FILE"`
+     (`git add -A` downstream already commits whatever the names are).
 
-Temp files via `mktemp` under `$TMPDIR`, `rm -f`'d on every exit path (the gate either
-returns or `fail`s, both plain exits of the crew process).
+3. **Docs/comment touch-up (no behavior):** the `models:` comment in `org/config.yaml`
+   (lines ~137–138, "dev.architect (plan -> DOZER-DESIGN.md)") names the per-issue
+   scheme. `dozers/dev-lane/dozer.md` needs no change — it says "a short design note"
+   without naming a file; the crew prompt is the contract.
 
-**Why retry at all:** the observed failures are transient under load; absorbing a
-one-shot blip is what actually meets "the suite passes in-crew across several
-consecutive runs". Loud-fail alone would keep the suite red on a repeat — just with a
-better message. Retry-then-loud gets both: blips absorbed, real breakage named.
+4. **No migration of in-flight branches.** A pre-fix branch carrying a committed
+   legacy-path design that genuinely conflicts on rebase still fails loudly as
+   "stale base" — a one-time residue the Director resolves by re-greenlighting a
+   fresh attempt; the new code does not (and should not) silently rewrite old
+   commits. The legacy *exclusions* (point 2) are the only look backwards.
 
-**Not touched:**
+## This task's own artifacts — the transition, one time only
 
-- The genuine-block failure text and the `schema_hits` listing (byte-identical).
-- Glob resolution (`SCHEMA_GLOBS` / `MIGRATION_GLOBS`), the `[skip-migration]` match
-  string, `MIGRATION_GATE=off` early exit, and the gate's call site (~line 695).
-- The other `2>/dev/null || true` sites elsewhere in the crew — same pattern class,
-  different owners; out of scope (follow-up issue if the Directors want a sweep).
-- `tests/run-all.sh` and its scrub list — the fix introduces no new env vars.
+The crew running THIS task predates the fix, so this design and this task's review
+land at the legacy root paths — the old backstops and verdict scan require it, and
+the merge stays clean because develop has not touched those files since this
+branch's base (our side simply wins). From the next task onward no crew ever writes
+those paths, and the two root files freeze on `develop` as inert history (git
+history keeps every past overwrite; a future ops task may prune them — not this one,
+mid-run, where the gates still read those names).
 
 ## Files to touch
 
 | File | Change |
 |---|---|
-| `dozers/dev-lane/crew.sh` | `migration_gate` (~258–278): captured+retried diff and log reads, `gate_read` helper, loud distinct failure texts, no pipes/`2>/dev/null`/`|| true`; comment updated to name the GSAI-154 false-block |
-| `tests/dev-lane-migration-gate-test.sh` | `run_crew` gains an optional 4th arg (PATH prepend); new `mkshim` builds a fault-injecting `git` wrapper; two new scenarios (5 READ-FAIL, 6 TRANSIENT — below); header comment updated |
+| `dozers/dev-lane/crew.sh` | `ART_ID`/`DESIGN_FILE`/`REVIEW_FILE` + every literal listed above |
+| `org/config.yaml` | comment-only: name the per-issue artifact scheme |
+| `tests/dev-lane-model-prompt-test.sh` | stub writes `"$DESIGN_FILE"`/`"$REVIEW_FILE"` (derive from a `TASK_ID` the runner already knows — export it in `run_crew`/`run_crew_routed` env) |
+| `tests/dev-lane-model-exit-test.sh` | same stub change + the asserted rescue lines (`⚠ architect agent exited 3 but DOZER-DESIGN-<id>.md is on disk`, review ditto, ×2/×1 counts) |
+| `tests/dev-lane-no-commit-gate-test.sh` | stub writes the per-ID design; the design-only-must-fail cases keep failing via the exclusion; add one case proving a **legacy-named** design-only diff is also excluded (pre-fix resume honesty) |
+| `tests/dev-lane-artifact-collision-test.sh` (**new**) | the regression test below |
 
-## How it gets tested — the flake made deterministic
-
-The environmental blip can't be summoned on demand, so the test **injects it** with a
-`git` shim prepended to `PATH` for the crew under test. The shim matches ONLY the
-gate's read (`git … log … --format=%B …` — scanning args, since the call is
-`git -C <dir> log --format=%B <range>`), delegates everything else to `/usr/bin/git`
-via `exec`, so worktree add / commit / merge all run real git. Modes:
-
-- `fail-always`: exit 128 with `shim: injected git log failure` on stderr.
-- `fail-once`: a counter file next to the shim fails the first matching call only.
-
-Both modes only ever fire in the gate's read — in a fresh crew the `%B` log call
-happens exactly there (resume checks use `--oneline`; the review-prompt diff is not a
-log).
-
-**Scenario 5 — READ-FAIL (the loud-discrimination contract):** OVERRIDE fixture +
-stub + `fail-always` shim → crew must fail with the new "could not read the commit
-messages" reason and must **not** contain `no matching migration` (the LL-31 block
-text) — proving an infra failure can no longer masquerade as a spec violation.
-Develop unchanged. Pre-fix this fails the scenario *wrongly*: the crew blocks with
-the LL-31 message.
-
-**Scenario 6 — TRANSIENT (the GSAI-148/149 repro, deterministic):** OVERRIDE fixture +
-stub + `fail-once` shim → the gate's first read fails, the retry succeeds, the crew
-must **exit 0** and land the merge on develop. Pre-fix (no retry) this is exactly the
-false block: the single read fails → "escape hatch ignored" → crew exits 1. This is
-the assertion that would have caught the flake — per the build discipline
-(GSAI-155's), the build pass runs both new scenarios against the **unpatched** crew
-first and must observe scenario 5 fail-with-wrong-message and scenario 6 false-block,
-then apply the fix and watch both turn green.
-
-**Unchanged guards:** BLOCK / ALLOW / OVERRIDE / NO-OP stay byte-for-byte as they are —
-they pin the gate's verdicts; the new scenarios pin its *failure discrimination*.
-
-**Commands:**
-
-```bash
-bash tests/dev-lane-migration-gate-test.sh          # 6 scenarios, ~20s standalone
-bash tests/run-all.sh dev-lane-migration-gate-test.sh
-make test                                          # full suite (34 files, the repo's own gate)
-```
-
-**In-crew verification** (the brief's "done when"): this task's own crew runs the
-suite in-crew at both gates (task worktree + green-gate) — several consecutive green
-runs *are* the in-crew evidence; the Director can additionally watch the next
-dozers-repo tasks' gate runs. No loop/stress harness is added to the suite: the shim
-scenarios make the rare blip deterministic, and a 20× loop would cost ~80s of suite
-time for no extra contract.
+`tests/run-all.sh` globs `tests/*-test.sh` — the new test is picked up with no
+registration. `Makefile` untouched.
 
 ## Edge cases
 
-1. **Transient read failure (the bug)** → retried, absorbed, correct verdict — scenario 6.
-2. **Persistent read failure** → loud, distinct "could not read" failure; worktree kept
-   (same sent-back flow); never scored as LL-31 — scenario 5.
-3. **Genuine no-marker schema change** → byte-identical LL-31 block — BLOCK stays green.
-4. **Marker present** → allowed — OVERRIDE stays green.
-5. **Diff read fails** → loud "could not diff" failure — closes the silent
-   fail-open twin (a waived gate is worse than a false block).
-6. **`git log` exits 0 with empty output** (branch fully merged into base) → grep
-   finds nothing → blocks, same as today; unreachable with a non-empty three-dot diff,
-   and fail-closed is the correct reading if it ever happens.
-7. **MIGRATION_GATE=off** → unchanged early exit before any read.
-8. **set -e / pipefail** → no pipelines remain in the gate; every read is
-   `if !`-captured; `fail` calls sit in `else` branches, never as bare lists.
-9. **Temp-file hygiene** → `mktemp` files `rm -f`'d on both the success and failure
-   paths; nothing left in `$TMPDIR` beyond the crew's own lifetime.
-10. **Large histories** → the log read goes to a file, not a bash variable or a live
-    pipe, so a big branch can neither bloat memory nor resurrect the SIGPIPE-under-
-    pipefail class (impossible at 3 commits, possible on a real repo).
+- **ID sanitization** — Linear keys (`GSAI-148`) are already filename-safe; the `sed`
+  guard exists for any exotic key, and both files derive from the same `ART_ID`, so a
+  weird id degrades to an ugly-but-consistent name, never a split brain.
+- **Same issue, multiple attempts** — same `$DESIGN_FILE` across resumes/rebuilds;
+  rebase replays same-path commits cleanly; the resume preamble wording still works.
+- **Two concurrent crews, same repo, different issues** (the actual incident) —
+  disjoint artifact paths; the resume rebase and the serial merge both land. The
+  per-project merge lock already serializes the merges; this removes the *content*
+  collision the lock cannot.
+- **`MODEL_CMD` bypass** — the `file:` proof and "is on disk" lines print `$DESIGN_FILE`
+  verbatim; tests assert the new names, so the bypass path is covered by the same
+  suite.
+- **`DRY_RUN`** — stub writes the per-ID files; nothing else in that path names them.
+- **Review verdict scan (GSAI-155)** — awk logic unchanged, only the file it reads.
+- **`.artifacts/dev/` summaries and the merge receipt** — already per-ID (`$ID.md`,
+  `$ID.merge`); untouched.
 
-**Provenance note:** the `DOZER-DESIGN.md` / `DOZER-REVIEW.md` at the worktree root
-are the previous task's pass artifacts (GSAI-155, merged into develop and inherited by
-this branch); this design overwrites the design file per the crew convention
-(`branch_has_output` excludes both from the merge gate).
+## How it gets tested
+
+1. **New regression test `tests/dev-lane-artifact-collision-test.sh`** (idiom of
+   `dev-lane-model-prompt-test.sh` — throwaway repo on `main`+`develop`, stub agent,
+   `MODEL_CMD` bypass):
+   - Run crew for task **A** (id `TEST-AC-A`): stub architect writes
+     `DOZER-DESIGN-TEST-AC-A.md`, build commits a real change, review writes
+     `VERDICT: PASS` into `DOZER-REVIEW-TEST-AC-A.md`. Assert exit 0 and A merged.
+   - **Stage the collision:** while `develop` still sits at its pre-A tip, hand-create
+     B's worktree at `$WORKTREE_ROOT/<slug>-TEST-AC-B` on branch `dozer/TEST-AC-B`
+     with a committed `DOZER-DESIGN-TEST-AC-B.md` plus a small code change (exactly
+     the interleaving that produced the incident: B branched before A merged).
+   - Run crew for task **B**: it takes the RESUME path, sees `develop` moved, and
+     rebases. Assert, in the log: the "base moved — rebased" line, **no** "CONFLICTS"
+     and **no** "merge conflict"; assert exit 0; assert `develop` now holds **both**
+     design files (`DOZER-DESIGN-TEST-AC-A.md` AND `DOZER-DESIGN-TEST-AC-B.md`).
+     On the unpatched crew this scenario dies at the rebase with `DOZER-DESIGN.md`
+     named in the conflict list — that is the mechanical repro of the task title.
+2. **Updated suites** — prompt-test, exit-test, no-commit-gate-test rewritten to the
+   per-ID names (their stubs receive the task id via env), plus the new legacy-name
+   exclusion case. The INJECTION/ROUND-TRIP/ROUTED payload assertions in
+   prompt-test are filename-agnostic and must keep passing byte-identical.
+3. **Full gate** — `make test` (run-all.sh, scrubbed env) green end-to-end, in-crew
+   included: the suite is the repo's own test command, so the green-gate proves it.
+
+**Out of scope, deliberately:** moving artifacts into a per-issue directory (same
+collision fix, more path churn, no added safety); not committing the artifacts at all
+(breaks the resume "already committed" contract and the audit trail the review pass
+reads); pruning the frozen legacy root docs (ops follow-up, not a mid-run edit).

@@ -12,14 +12,16 @@
 # the crew before the gate could judge, leaving a finished branch unrescuable.
 #
 # The gate now asks "does the branch hold anything to merge?" — a diff vs the pinned
-# base SHA EXCLUDING the pass artifacts (DOZER-DESIGN.md / DOZER-REVIEW.md), the one
-# definition shared by the gate and the build pass's changes: proof. Excluding the
-# artifacts is what keeps a FIRST attempt whose only commit is the architect's design
-# file from passing (the crew's design backstop commits it before the build runs, so
-# a naive `git log $base..$BRANCH` gate would wave a no-op first build through — the
-# design-commit hole this suite pins shut).
+# base SHA EXCLUDING the pass artifacts (the PER-ISSUE DOZER-DESIGN-<id>.md /
+# DOZER-REVIEW-<id>.md, GSAI-148 — and the LEGACY root names, so a pre-fix resumed
+# branch whose committed design sits at the old fixed path is still scored
+# "design is not a deliverable"), the one definition shared by the gate and the build
+# pass's changes: proof. Excluding the artifacts is what keeps a FIRST attempt whose
+# only commit is the architect's design file from passing (the crew's design backstop
+# commits it before the build runs, so a naive `git log $base..$BRANCH` gate would
+# wave a no-op first build through — the design-commit hole this suite pins shut).
 #
-# Three cases against the REAL crew, in the idiom of dev-lane-model-exit-test.sh,
+# Four cases against the REAL crew, in the idiom of dev-lane-model-exit-test.sh,
 # each on a throwaway repo (main + develop) driven through the ROUTED path (a stub
 # `claude` on PATH, no MODEL_CMD bypass — the garbled-review trick and the verdict
 # parse need the non-bypass branch, and the design backstop commit only exists
@@ -44,6 +46,10 @@
 #               after Ns — not merging (worktree kept for resume)" (GSAI-151 added
 #               the elapsed), develop untouched. The gate
 #               runs AFTER the tests by construction, so it never rescues red work.
+#   LEGACY-EXCLUDED (GSAI-148) — the architect ALSO commits the pre-fix root
+#               DOZER-DESIGN.md and the build adds nothing → still blocked with the
+#               byte-identical message: the legacy scheme stays excluded, so a pre-fix
+#               resumed branch is still scored "design is not a deliverable".
 #
 # Run:  bash tests/dev-lane-no-commit-gate-test.sh   (exits non-zero on failure)
 set -euo pipefail
@@ -77,9 +83,13 @@ mkproj() {  # $1 = dir
 
 # Stub coding agent. Counts invocations in $COUNT_FILE (a FRESH file per run, so the
 # resume runs re-count from 1: architect again). Invocation 1 is the architect pass,
-# then build/review alternate. Modes:
+# then build/review alternate. Artifacts are the PER-ISSUE names (GSAI-148), built from
+# the TASK_ID the runner exports. Modes:
 #   BUILD_MODE  work (default) | nothing    — "nothing" adds NO change to the branch
 #   REVIEW_MODE pass (default) | garbled    — "garbled" writes a review with no verdict
+#   ARCH_LEGACY 1                          — ALSO commits the legacy root
+#                                            DOZER-DESIGN.md (the pre-fix name), for the
+#                                            LEGACY-EXCLUDED case
 STUB="$TMP/stub-agent.sh"
 cat > "$STUB" <<'EOS'
 #!/usr/bin/env bash
@@ -89,7 +99,8 @@ elif (( n % 2 == 0 )); then pass=build
 else pass=review; fi
 case "$pass" in
   architect)
-    printf '# design\n' > DOZER-DESIGN.md
+    printf '# design\n' > "DOZER-DESIGN-$TASK_ID.md"
+    [[ "${ARCH_LEGACY:-0}" == 1 ]] && printf '# legacy design\n' > DOZER-DESIGN.md
     git add -A && git commit -q -m design || true ;;   # resume: identical content → no new commit
   build)
     case "${BUILD_MODE:-work}" in
@@ -99,9 +110,9 @@ case "$pass" in
     esac ;;
   review)
     if [[ "${REVIEW_MODE:-pass}" == garbled ]]; then
-      printf 'Reviewing the diff, but the write was truncated before any verdict line\n' > DOZER-REVIEW.md
+      printf 'Reviewing the diff, but the write was truncated before any verdict line\n' > "DOZER-REVIEW-$TASK_ID.md"
     else
-      printf 'VERDICT: PASS\nall good\n' > DOZER-REVIEW.md
+      printf 'VERDICT: PASS\nall good\n' > "DOZER-REVIEW-$TASK_ID.md"
     fi
     git add -A && git commit -q -m "review $n" || true ;;
 esac
@@ -123,6 +134,7 @@ run_crew() {  # $1 = proj dir, $2 = task id, $3 = log, $4.. = extra KEY=VAL (COU
   local proj="$1" id="$2" log="$3"; shift 3
   env "${SCRUB_ROUTE[@]}" PATH="$BINDIR:$PATH" \
       REPO_ROOT="$ROOT" WORKDIR="$proj" WORKTREE_ROOT="$WT_ROOT" INTEGRATION_BRANCH="develop" \
+      TASK_ID="$id" \
       DOZER_MODEL_DEV_ARCHITECT="claude:claude-opus-5" \
       DOZER_MODEL_DEV_BUILD="claude:claude-opus-5" \
       DOZER_MODEL_DEV_REVIEW="claude:claude-opus-5" \
@@ -222,6 +234,29 @@ grep -qF 'build agent produced no commits' "$LOG" \
   || ok "RESUME-TESTS-FAIL: the no-commit gate passed on the existing feature diff (the tests did the judging)"
 [[ "$(dev_head "$PC")" == "init" ]] && ok "RESUME-TESTS-FAIL: develop untouched" \
   || no "RESUME-TESTS-FAIL: develop advanced to '$(dev_head "$PC")'"
+
+# ── LEGACY-EXCLUDED (GSAI-148): a legacy-named design-only diff is ALSO not output ──
+# Pre-fix branches carry their committed design at the FIXED root DOZER-DESIGN.md — a
+# resume of such a branch must still be scored "a design file is not a deliverable".
+# The exclusion list keeps BOTH schemes, so a branch whose only diff is design files
+# (legacy + per-issue) still fails the gate. ARCH_LEGACY=1 makes the stub commit the
+# legacy design alongside the per-issue one; BUILD_MODE=nothing adds nothing else.
+echo "── LEGACY-EXCLUDED: the pre-fix design path is also not a deliverable"
+PD="$TMP/legacy-excluded"; mkproj "$PD"; ID_D="TEST-NG-D"
+
+LOG="$TMP/d.log"; rc=0
+run_crew "$PD" "$ID_D" "$LOG" COUNT_FILE="$TMP/d.count" BUILD_MODE=nothing ARCH_LEGACY=1 || rc=$?
+[[ $rc -ne 0 ]] && ok "LEGACY-EXCLUDED: crew blocked (exit $rc)" \
+  || { no "LEGACY-EXCLUDED: a legacy-design-only diff PASSED the gate"; dump "$LOG"; }
+r="$(reason "$ID_D")"
+[[ "$r" == "build agent produced no commits on dozer/$ID_D" ]] \
+  && ok "LEGACY-EXCLUDED: blocked by the gate — the legacy design file counted as nothing" \
+  || { no "LEGACY-EXCLUDED: wrong reason: '$r'"; dump "$LOG"; }
+git -C "$PD" cat-file -e "dozer/$ID_D:DOZER-DESIGN.md" 2>/dev/null \
+  && ok "LEGACY-EXCLUDED: the legacy-named design really was committed on the branch (the pin is exercised)" \
+  || no "LEGACY-EXCLUDED: stub never committed DOZER-DESIGN.md — the case proves nothing"
+[[ "$(dev_head "$PD")" == "init" ]] && ok "LEGACY-EXCLUDED: develop untouched" \
+  || no "LEGACY-EXCLUDED: develop advanced to '$(dev_head "$PD")'"
 
 if [[ $fail == 0 ]]; then echo "dev-lane-no-commit-gate-test: PASS"
 else echo "dev-lane-no-commit-gate-test: FAIL" >&2; exit 1; fi

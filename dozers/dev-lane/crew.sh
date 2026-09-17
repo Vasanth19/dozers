@@ -38,9 +38,10 @@
 #   knowable from the checkout, so don't pay for a run that can never merge), again on
 #   the task worktree after the agent, and once more at the green-gate.
 #
-# Model routing: THREE passes, each on its OWN brain — ARCHITECT (spec → DOZER-DESIGN.md),
-#   BUILD (implement the design), REVIEW (verdict → DOZER-REVIEW.md). Each resolves its
-#   dotted role via dozers/model.sh: models.dev.<pass> → flat models.dev → models.default.
+# Model routing: THREE passes, each on its OWN brain — ARCHITECT (spec → the per-issue
+#   DOZER-DESIGN-$ART_ID.md), BUILD (implement the design), REVIEW (verdict →
+#   DOZER-REVIEW-$ART_ID.md). Each resolves its dotted role via dozers/model.sh:
+#   models.dev.<pass> → flat models.dev → models.default.
 #   Override per-run with DOZER_MODEL_DEV[_<PASS>]="<provider>[:<model>]", or bypass
 #   routing entirely by exporting MODEL_CMD (all three passes then share it). A route
 #   that can't be satisfied FAILS the crew — no silent fallback.
@@ -57,6 +58,18 @@ ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 WORKDIR="${WORKDIR:-.}"; DOZER_PERSONA="${DOZER_PERSONA:-}"
 OUT="$REPO_ROOT/.artifacts/dev"; mkdir -p "$OUT"
+
+# Per-issue pass artifacts (GSAI-148): the ARCHITECT pass writes $DESIGN_FILE and the
+# REVIEW pass writes $REVIEW_FILE — named AFTER the issue, not at fixed root paths.
+# Two tasks in one repo then never touch the same path, so neither a resume rebase
+# nor the serial merge can add/add-collide on files the lane itself declares
+# not-a-deliverable (branch_has_output excludes them either way). Rounds WITHIN one
+# issue share the same names — same branch, sequential commits, ordinary same-path
+# edits. The sed guard makes any exotic id filename-safe, and both names derive from
+# the same ART_ID so a weird id degrades to ugly-but-consistent, never split-brain.
+ART_ID="$(printf '%s' "$ID" | sed -E 's/[^A-Za-z0-9._-]/-/g')"
+DESIGN_FILE="DOZER-DESIGN-$ART_ID.md"
+REVIEW_FILE="DOZER-REVIEW-$ART_ID.md"
 
 cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
 # fail: print the reason AND record it in $OUT/<id>.fail so the engine can put it
@@ -359,20 +372,25 @@ resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK + _P
 
 # branch_has_output <dir> <sha> — the gate's question (GSAI-149): "does the branch
 # hold anything to merge?" — is there ANY diff vs the pinned base SHA beyond the pass
-# artifacts (DOZER-DESIGN.md / DOZER-REVIEW.md — committed by the crew's backstops,
-# and a design file is not a deliverable to merge). The ONE definition of "the build
-# did something", shared by build_once's no-commit gate and run_model_pass's
-# changes: proof — no two versions of it (spec point 5). Uncommitted working-tree
-# changes count as output, exactly as they did against the old per-attempt anchor.
+# artifacts ($DESIGN_FILE / $REVIEW_FILE — committed by the crew's backstops, and a
+# design file is not a deliverable to merge). The ONE definition of "the build did
+# something", shared by build_once's no-commit gate and run_model_pass's changes:
+# proof — no two versions of it (spec point 5). Uncommitted working-tree changes
+# count as output, exactly as they did against the old per-attempt anchor.
+# The LEGACY root names stay excluded too (GSAI-148): a pre-fix resumed branch carries
+# its committed design at the old fixed path, and scoring that as output would let
+# such a branch pass the gate on a design file alone.
 branch_has_output() {  # $1 = dir, $2 = pinned base sha
-  ! git -C "$1" diff --quiet "$2" -- . ':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md' 2>/dev/null
+  ! git -C "$1" diff --quiet "$2" -- . \
+    ':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md' \
+    ':(exclude)'"$DESIGN_FILE" ':(exclude)'"$REVIEW_FILE" 2>/dev/null
 }
 
 # run_model_pass <pass> <prompt> [proof] — one agent run under its own route, its own
 # timebox. <proof> (GSAI-147, build form GSAI-149) names the pass's deliverable and
 # is consulted ONLY when the session exits non-zero AND it was not a timeout: the exit
 # code is a side-channel, not the deliverable — a model CLI can finish its work (write
-# DOZER-DESIGN.md, commit the build, write the verdict in DOZER-REVIEW.md) and still
+# $DESIGN_FILE, commit the build, write the verdict in $REVIEW_FILE) and still
 # die on teardown (a final-turn API error, a crash at exit). Before this, one such
 # flake discarded a PASSING review and re-ran the whole task from resume — three model
 # runs of spend for an exit code. Forms:
@@ -551,17 +569,17 @@ link_deps "$WT"
 [[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
 
 # ── 2. three model passes: ARCHITECT → BUILD → REVIEW (each on its own route) ────
-# ARCHITECT turns the spec into DOZER-DESIGN.md; BUILD implements that design (and must
+# ARCHITECT turns the spec into $DESIGN_FILE; BUILD implements that design (and must
 # still clear every existing gate: deps, tests, no-commit); REVIEW judges spec-vs-diff
-# and writes DOZER-REVIEW.md whose first line is the verdict. A FAIL verdict buys ONE
+# and writes $REVIEW_FILE whose first line is the verdict. A FAIL verdict buys ONE
 # rebuild with the review notes; a second FAIL blocks the task.
 
 # -- prompts ----------------------------------------------------------------------
 read -r -d '' ARCH_PROMPT <<EOF || true
 You are the ARCHITECT pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
 Rules (from $DOZER_PERSONA): read the task spec, then DESIGN the implementation — write
-DOZER-DESIGN.md at the worktree root (approach, files to touch, edge cases, how it gets
-tested) and commit it. Write and commit ONLY DOZER-DESIGN.md: no code, no other edits.
+$DESIGN_FILE at the worktree root (approach, files to touch, edge cases, how it gets
+tested) and commit it. Write and commit ONLY $DESIGN_FILE: no code, no other edits.
 Do NOT merge, push, switch branches, or remove this worktree.
 
 TASK #$ID: $TITLE
@@ -569,7 +587,7 @@ EOF
 
 read -r -d '' BUILD_PROMPT <<EOF || true
 You are the BUILD pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
-Implement the design in DOZER-DESIGN.md (the architect pass's plan — follow it).
+Implement the design in $DESIGN_FILE (the architect pass's plan — follow it).
 Rules (from $DOZER_PERSONA): do ALL work here; run the project's
 tests until green; commit. Do NOT merge, push, switch branches, or remove this worktree.
 
@@ -581,7 +599,7 @@ if (( RESUMING )); then
 $(git -C "$WT" log --oneline "$base..$BRANCH")
 Continue from there — do NOT redo committed work; finish the pass and commit."
   ARCH_PROMPT="$_resume_note
-If DOZER-DESIGN.md is already committed on this branch, review it and amend ONLY if the
+If $DESIGN_FILE is already committed on this branch, review it and amend ONLY if the
 design must change (then commit it again); otherwise commit nothing new.
 
 $ARCH_PROMPT"
@@ -599,19 +617,19 @@ if [[ "${DRY_RUN:-}" == "1" ]]; then
   done
   unset _p
   echo "    [dev] DRY_RUN — skipping models$([[ $RESUMING == 1 ]] && echo ' (resume)')"
-  printf '# DOZER-DESIGN (dry-run stub)\n' > "$WT/DOZER-DESIGN.md"
+  printf '# DOZER-DESIGN (dry-run stub)\n' > "$WT/$DESIGN_FILE"
   printf 'dozer #%s attempt %s: %s\n' "$ID" "$attempt" "$TITLE" >> "$WT/.dozer-log"
-  printf 'VERDICT: PASS\n(dry-run stub review)\n' > "$WT/DOZER-REVIEW.md"
+  printf 'VERDICT: PASS\n(dry-run stub review)\n' > "$WT/$REVIEW_FILE"
   git -C "$WT" add -A && git -C "$WT" commit -q -m "dozer #$ID: $TITLE (dry-run stub, attempt $attempt)" || true
 else
-  # -- 2a. ARCHITECT: spec -> DOZER-DESIGN.md -------------------------------------
-  run_model_pass architect "$ARCH_PROMPT" file:DOZER-DESIGN.md
+  # -- 2a. ARCHITECT: spec -> $DESIGN_FILE (per-issue, GSAI-148) --------------------
+  run_model_pass architect "$ARCH_PROMPT" "file:$DESIGN_FILE"
   if [[ -z "${MODEL_CMD:-}" ]]; then
     # The pass was told to write AND commit the design; backstop the commit so the
     # build diff/merge never lose it (still fail-fast on NO design at all).
-    [[ -s "$WT/DOZER-DESIGN.md" ]] \
-      || fail "architect produced no DOZER-DESIGN.md (worktree kept for resume)"
-    git -C "$WT" add DOZER-DESIGN.md 2>/dev/null \
+    [[ -s "$WT/$DESIGN_FILE" ]] \
+      || fail "architect produced no $DESIGN_FILE (worktree kept for resume)"
+    git -C "$WT" add "$DESIGN_FILE" 2>/dev/null \
       && git -C "$WT" commit -q -m "dozer #$ID: design (architect pass)" 2>/dev/null || true
   fi
 
@@ -665,7 +683,7 @@ $1"
     fi
   }
 
-  # -- 2c. REVIEW: spec + diff -> DOZER-REVIEW.md, verdict line (tolerant scan, GSAI-155) --
+  # -- 2c. REVIEW: spec + diff -> $REVIEW_FILE, verdict line (tolerant scan, GSAI-155) --
   REVIEW_VERDICT=""
   review_once() {
     local vline
@@ -673,8 +691,8 @@ $1"
 You are the REVIEW pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
 Judge, don't build: change NOTHING except the review file. Given the spec and the diff
 of this branch below, decide whether the implementation satisfies the spec and is sound
-(DOZER-DESIGN.md is the architect pass's plan — check the build followed it). Then write
-DOZER-REVIEW.md at the worktree root whose FIRST LINE is exactly "VERDICT: PASS" or
+($DESIGN_FILE is the architect pass's plan — check the build followed it). Then write
+$REVIEW_FILE at the worktree root whose FIRST LINE is exactly "VERDICT: PASS" or
 "VERDICT: FAIL", followed by your reasons, and commit ONLY that file.
 Do NOT merge, push, switch branches, or remove this worktree.
 
@@ -683,10 +701,10 @@ TASK #$ID: $TITLE
 DIFF ($base..HEAD):
 $(git -C "$WT" diff "$base" 2>/dev/null)
 EOF
-    run_model_pass review "$_rev_prompt" file:DOZER-REVIEW.md
+    run_model_pass review "$_rev_prompt" "file:$REVIEW_FILE"
     unset _rev_prompt
     if [[ -z "${MODEL_CMD:-}" ]]; then
-      git -C "$WT" add DOZER-REVIEW.md 2>/dev/null \
+      git -C "$WT" add "$REVIEW_FILE" 2>/dev/null \
         && git -C "$WT" commit -q -m "dozer #$ID: review (review pass)" 2>/dev/null || true
       # A missing or garbled verdict IS a fail — no free pass to merge. But the verdict
       # need not be the literal first line: a markdown title above it is cosmetic, not a
@@ -702,7 +720,7 @@ EOF
         f { next }                                          # inside a fence: quoted text
         toupper($0) ~ /^[ \t]*VERDICT:[ \t]*PASS[ \t]*$/ { print "PASS"; exit }
         toupper($0) ~ /^[ \t]*VERDICT:[ \t]*FAIL[ \t]*$/ { print "FAIL"; exit }
-      ' "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+      ' "$WT/$REVIEW_FILE" 2>/dev/null || true)"
       case "$vline" in
         PASS) REVIEW_VERDICT="PASS" ;;
         FAIL) REVIEW_VERDICT="FAIL" ;;
@@ -717,16 +735,16 @@ EOF
   build_once ""
   review_once
   if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
-    _notes="$(cat "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+    _notes="$(cat "$WT/$REVIEW_FILE" 2>/dev/null || true)"
     echo "    [dev] review failed — one rebuild with the review notes"
-    build_once "The REVIEW pass FAILED the previous build. Its notes (DOZER-REVIEW.md):
+    build_once "The REVIEW pass FAILED the previous build. Its notes ($REVIEW_FILE):
 
 $_notes
 
 Fix what it names, then run the tests and commit."
     review_once
     if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
-      _notes="$(cat "$WT/DOZER-REVIEW.md" 2>/dev/null || true)"
+      _notes="$(cat "$WT/$REVIEW_FILE" 2>/dev/null || true)"
       fail "review failed TWICE — not merging (worktree kept, sent back). Review notes:
 $(printf '%s\n' "$_notes" | head -n 40 | sed 's/^/      /')"
     fi
