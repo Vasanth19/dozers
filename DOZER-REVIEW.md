@@ -1,62 +1,62 @@
 VERDICT: PASS
 
-# GSAI-154 — review: the migration gate can no longer mis-score a failed read
+# GSAI-148 — review: per-issue pass artifacts verified end-to-end
 
-## What I verified
+**The build followed the design.** Every point of the architect's plan is in the diff,
+and I re-verified the load-bearing claims against the working tree and by re-running
+the affected suites — not just by reading the commit message.
 
-**Build follows the design.** Every element of DOZER-DESIGN.md is present and faithful:
+## Design conformance (checked site by site)
 
-- `gate_read` (crew.sh:265–292) — captured read to a `mktemp` file under `$TMPDIR`, 3
-  attempts 1s apart, visible `⚠ … attempt N failed — retrying` lines (same discipline
-  as the `run_model_pass` rescues), persistent failure → loud `fail` with the distinct
-  "could not read/diff" text and a stderr tail appended.
-- The diff read no longer carries `|| true` (the silent fail-open twin is closed) and
-  the override read no longer pipes through `grep -qF` — `grep` now only ever runs on
-  a file from a *successful* read, so "no match" genuinely means "marker absent".
-- No pipelines, `2>/dev/null`, or `|| true` remain in the gate; temp files `rm -f`'d
-  on every path (success, marker, no-marker, persistent-failure).
-- Not-touched list honored: genuine-block failure text byte-identical (BLOCK stays
-  green on it), `[skip-migration]` still `grep -qF` strict, `MIGRATION_GATE=off` early
-  exit and the call site (crew.sh:738) unchanged, scenarios 1–4 untouched.
+1. **Single source of truth** — `ART_ID` / `DESIGN_FILE` / `REVIEW_FILE` derived once
+   right after `ID="$1"` (crew.sh:56 → :70–72; ordering verified — no empty-ID bug).
+   `grep` over crew.sh finds ZERO remaining artifact-name literals outside comments,
+   the variable definitions, the *intentional* legacy exclusions, and the DRY_RUN
+   printf content. Every prompt, backstop, proof arg, and scan flows through the
+   variables — the bug class is closed by construction, as designed.
+2. **Every site converted:** ARCH_PROMPT + resume preamble, BUILD_PROMPT, REVIEW
+   prompt in `review_once`, `file:"$DESIGN_FILE"` / `file:"$REVIEW_FILE"` proofs
+   (parser `${3#file:}` confirmed name-agnostic; the ⚠ rescue line prints the real
+   name), architect backstop (`-s` check, `git add`, fail text), review backstop
+   (`git add`, awk verdict scan, both `_notes` reads), DRY_RUN stub — all per-issue.
+3. **`branch_has_output` excludes BOTH schemes** — legacy root names kept so a
+   pre-fix resumed branch is still scored "design is not a deliverable" (design
+   point 2's only look backwards), plus the per-issue names.
+4. **`org/config.yaml`** — comment-only change naming the per-issue scheme; no
+   behavior touched.
+5. **No in-flight-branch migration** — nothing rewrites old commits; correct per
+   design point 4.
 
-**Subtle mechanics checked, not assumed:**
+## Tests — re-run by this review, all green
 
-- `fail` (crew.sh:64) writes to **stderr** — so the loud message escapes the `$(…)`
-  capture in the callers, and the `.fail` artifact is still written from inside the
-  subshell. Plain assignment + `set -e` (crew.sh:55) propagates the death; the call
-  site is a bare command, so the crew dies with the distinct reason, as designed.
-- `gate_read` reads the caller's `$wt` via bash dynamic scoping — it works (and is
-  commented), though it would break if `migration_gate` ever renamed the local.
-- `_rc=$?` after the failed `if` condition correctly captures git's exit code.
+| Suite | Result |
+|---|---|
+| `dev-lane-artifact-collision-test.sh` (new) | PASS — 11/11 ✓ |
+| `dev-lane-model-prompt-test.sh` | PASS — incl. new PER-ISSUE-NAMES pins |
+| `dev-lane-model-exit-test.sh` | PASS — rescue lines assert per-issue names, ×2/×1 counts |
+| `dev-lane-no-commit-gate-test.sh` | PASS — incl. new LEGACY-EXCLUDED case |
 
-**The flake made deterministic — and it really pins the bug.** I independently staged
-the **pre-fix** crew (`git show develop:dozers/dev-lane/crew.sh`) plus the **new**
-test in a scratch dir outside this worktree and ran it:
+The collision regression is the mechanical repro of the task title: task A merges,
+B (branched pre-A with a committed design + disjoint code change) takes the RESUME
+path, the "base moved — rebased" arm fires, no CONFLICTS / no merge-conflict lines,
+and develop ends holding BOTH per-issue designs plus B's review and staged code. Good
+test hygiene: B's code change lives in its own file (`b-code.txt`) so a feature.txt
+overlap can't mask the artifact-collision signal. The LEGACY-EXCLUDED case also pins
+that the legacy design file really was committed before asserting the gate still
+blocks on it — the pin is exercised, not assumed.
 
-- READ-FAIL pre-fix: crew fails but with the **LL-31 text** — "an infra flake
-  masqueraded as an LL-31 violation", exactly the false diagnosis the design names.
-- TRANSIENT pre-fix: one blip → false block, crew exits 1, develop untouched —
-  the deterministic repro of the GSAI-148/149 in-crew false blocks.
+## Soundness notes
 
-Both turn green against the fix. The shim is surgical: the gate's `git … log …
---format=%B` is the only `%B` log call in the crew (all others use `--oneline`,
-crew.sh:467/498/581), so worktree add/commit/merge and resume checks all run real
-git — the design's claim holds under inspection, not just in the passing run.
+- Rounds within one issue share one name → same-path sequential commits, which
+  rebase/merge handle as ordinary edits; only *cross-task* paths are disjoint. Correct.
+- The transition artifact placement is self-consistent: this crew ran the pre-fix
+  code from memory, so THIS design and review land at the legacy root paths the
+  running backstop and verdict scan still read — exactly the design's "transition,
+  one time only" prediction, and the merge stays clean (develop hasn't moved those
+  files since this branch's base; our side wins trivially).
+- Out-of-scope items (per-issue directories, pruning frozen legacy root docs) were
+  deliberately not done — matching the design, not omissions.
 
-**Evidence, rerun by me in this worktree:**
-
-- `tests/dev-lane-migration-gate-test.sh` — 6 scenarios, 14/14 assertions ✓.
-- `make test` — **run-all: PASS — 33/33** (independently rerun, 1611s).
-
-## Minor observations (non-blocking)
-
-- `gate_read`'s contract ("do NOT wrap the caller's `$(…)` in `if`/`||`") is load-
-  bearing and easy to break in a future edit; the comment says so, which is the
-  right mitigation short of a larger refactor.
-- The design's `gate_read <label> <git args…>` signature ended up with an extra
-  `<persistent-failure text>` param — a benign deviation, and it keeps the failure
-  texts at the call sites where they read in context.
-
-The invariants hold: a real schema change with no marker still blocks byte-identically,
-the escape hatch still matches strictly, and a read that cannot run is now retried
-briefly then named loudly as an infra failure — never silently scored either way.
+No spec violations, no silent fallbacks introduced, no gate weakened. The fix is
+minimal in shape (rename-by-variable, everywhere at once) and pinned by a regression
+test that fails on the pre-fix crew. PASS.

@@ -3,8 +3,9 @@
 #
 # run_model_pass used to treat ANY non-zero status out of the timeboxed model session
 # as a dead pass — but the session's exit code is a side-channel, not the deliverable.
-# A model CLI can write DOZER-DESIGN.md, commit the build, or write "VERDICT: PASS"
-# into DOZER-REVIEW.md and still exit non-zero (crash on teardown, a final-turn API
+# A model CLI can write the per-issue DOZER-DESIGN-<id>.md (GSAI-148), commit the
+# build, or write "VERDICT: PASS"
+# into DOZER-REVIEW-<id>.md and still exit non-zero (crash on teardown, a final-turn API
 # error). The crew then failed and discarded the artifact that was already on disk;
 # a passing review died and the task re-ran from resume (three more model runs of
 # spend). Now the pass's ARTIFACT is the contract and the exit code only decides
@@ -20,7 +21,7 @@
 #   NO-ARTIFACT — the architect exits non-zero having written NOTHING -> blocked with
 #               "architect agent failed (worktree kept for resume)", develop untouched:
 #               the rescue is earned by a deliverable, not by exit-code generosity
-#   TIMEOUT-PRECEDENCE — the architect writes DOZER-DESIGN.md then HANGS -> still
+#   TIMEOUT-PRECEDENCE — the architect writes its DOZER-DESIGN-<id>.md then HANGS -> still
 #               blocked with the model-timeout reason (GSAI-37): an artifact must
 #               never rescue a timeout (a killed process may leave a truncated file)
 #   GARBLED-VERDICT — the review writes a review with NO "VERDICT:" line and exits 1
@@ -77,7 +78,8 @@ cat > "$STUB" <<'EOS'
 #!/usr/bin/env bash
 n=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" > "$COUNT_FILE"
 # 1=architect; then build/review alternate (2,4,… are builds — the even one after a
-# FAILed review is the rebuild; 3,5,… are reviews).
+# FAILed review is the rebuild; 3,5,… are reviews). Artifacts are the PER-ISSUE names
+# (GSAI-148): the runner exports TASK_ID=<task id> for the stub to build them from.
 if   (( n == 1 )); then pass=architect
 elif (( n % 2 == 0 )); then pass=build
 else pass=review; fi
@@ -87,11 +89,11 @@ case "$pass" in
     case "${ARCH_MODE:-ok}" in
       hang)
         # deliver the artifact FIRST, then hang — the timeout test of an artifact
-        printf '# design\n' > DOZER-DESIGN.md
+        printf '# design\n' > "DOZER-DESIGN-$TASK_ID.md"
         git add -A && git commit -q -m design
         sleep 120 ;;
       nothing) ;;
-      *) printf '# design\n' > DOZER-DESIGN.md
+      *) printf '# design\n' > "DOZER-DESIGN-$TASK_ID.md"
          git add -A && git commit -q -m design ;;
     esac
     rc="${ARCH_EXIT:-0}" ;;
@@ -101,10 +103,10 @@ case "$pass" in
     rc="${BUILD_EXIT:-0}" ;;
   review)
     case "${REVIEW_MODE:-pass}" in
-      garbled)    printf 'Reviewing the diff, but the write was truncated before any verdict line\n' > DOZER-REVIEW.md ;;
-      titled)     printf '# Review — verdict behind a title\r\n\r\nVERDICT: PASS\r\nall good\r\n' > DOZER-REVIEW.md ;;
-      titled-fail) printf '# Review — verdict behind a title\r\n\r\nVERDICT: FAIL\r\nnot good\r\n' > DOZER-REVIEW.md ;;
-      *)          printf 'VERDICT: PASS\nall good\n' > DOZER-REVIEW.md ;;
+      garbled)    printf 'Reviewing the diff, but the write was truncated before any verdict line\n' > "DOZER-REVIEW-$TASK_ID.md" ;;
+      titled)     printf '# Review — verdict behind a title\r\n\r\nVERDICT: PASS\r\nall good\r\n' > "DOZER-REVIEW-$TASK_ID.md" ;;
+      titled-fail) printf '# Review — verdict behind a title\r\n\r\nVERDICT: FAIL\r\nnot good\r\n' > "DOZER-REVIEW-$TASK_ID.md" ;;
+      *)          printf 'VERDICT: PASS\nall good\n' > "DOZER-REVIEW-$TASK_ID.md" ;;
     esac
     git add -A && git commit -q -m "review $n" || true
     rc="${REVIEW_EXIT:-0}" ;;
@@ -122,7 +124,7 @@ run_crew() {  # $1 = proj dir, $2 = task id, $3 = log, $4.. = extra KEY=VAL
   env COUNT_FILE="$TMP/$id.count" TIMEBOX_KILL_GRACE=1 \
       DOZER_TIMEOUT_TEST="$BOUND" DOZER_TIMEOUT_MODEL="$BOUND" DOZER_TIMEOUT_DEPS="$BOUND" \
       REPO_ROOT="$TMP" WORKDIR="$proj" WORKTREE_ROOT="$TMP/wt-$id" INTEGRATION_BRANCH="develop" \
-      MODEL_CMD="bash $STUB" PUSH="false" DOZER_PERSONA="test" "$@" \
+      TASK_ID="$id" MODEL_CMD="bash $STUB" PUSH="false" DOZER_PERSONA="test" "$@" \
       bash "$CREW" "$id" "model exit test" >"$log" 2>&1
 }
 
@@ -143,6 +145,7 @@ run_crew_routed() {  # same args as run_crew
   env "${SCRUB_ROUTE[@]}" PATH="$BINDIR:$PATH" COUNT_FILE="$TMP/$id.count" TIMEBOX_KILL_GRACE=1 \
       DOZER_TIMEOUT_TEST="$BOUND" DOZER_TIMEOUT_MODEL="$BOUND" DOZER_TIMEOUT_DEPS="$BOUND" \
       REPO_ROOT="$ROOT" WORKDIR="$proj" WORKTREE_ROOT="$TMP/wt-$id" INTEGRATION_BRANCH="develop" \
+      TASK_ID="$id" \
       DOZER_MODEL_DEV_ARCHITECT="claude:claude-opus-5" \
       DOZER_MODEL_DEV_BUILD="claude:claude-opus-5" \
       DOZER_MODEL_DEV_REVIEW="claude:claude-opus-5" \
@@ -168,14 +171,14 @@ if [[ -f "$mrcpt" ]] && grep -q '^branch=develop$' "$mrcpt" \
    && [[ -n "$msha" ]] && git -C "$PA" merge-base --is-ancestor "$msha" develop 2>/dev/null; then
   ok "RESCUE: GSAI-119 merge receipt written and verifiable"
 else no "RESCUE: merge receipt missing or unverifiable: $(cat "$mrcpt" 2>/dev/null)"; fi
-grep -q '⚠ architect agent exited 3 but DOZER-DESIGN.md is on disk' "$LOG" \
-  && ok "RESCUE: ⚠ line names the architect pass + exit code + artifact" \
+grep -q '⚠ architect agent exited 3 but DOZER-DESIGN-TEST-ME-A.md is on disk' "$LOG" \
+  && ok "RESCUE: ⚠ line names the architect pass + exit code + the per-issue artifact (GSAI-148)" \
   || { no "RESCUE: no architect rescue line"; dump "$LOG"; }
 grep -q '⚠ build agent exited 3 but' "$LOG" \
   && ok "RESCUE: ⚠ line names the build rescue (commits proof)" \
   || { no "RESCUE: no build rescue line"; dump "$LOG"; }
-grep -q '⚠ review agent exited 1 but DOZER-REVIEW.md is on disk' "$LOG" \
-  && ok "RESCUE: ⚠ line names the review pass + exit code + artifact (the headline)" \
+grep -q '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-A.md is on disk' "$LOG" \
+  && ok "RESCUE: ⚠ line names the review pass + exit code + the per-issue artifact (the headline)" \
   || { no "RESCUE: no review rescue line"; dump "$LOG"; }
 
 # ── NO-ARTIFACT: non-zero exit with NOTHING delivered -> fails exactly as before ──
@@ -206,7 +209,7 @@ r="$(reason "$TMP" TEST-ME-C)"
   && ok "TIMEOUT-PRECEDENCE: reason names the model timeout, not a rescue" \
   || { no "TIMEOUT-PRECEDENCE: wrong reason: '$r'"; dump "$LOG"; }
 grep -q '⚠ architect' "$LOG" && no "TIMEOUT-PRECEDENCE: the artifact rescued a timeout" \
-  || ok "TIMEOUT-PRECEDENCE: the on-disk DOZER-DESIGN.md did NOT rescue the timeout"
+  || ok "TIMEOUT-PRECEDENCE: the on-disk DOZER-DESIGN-TEST-ME-C.md did NOT rescue the timeout"
 [[ "$(dev_head "$PC")" == "init" ]] && ok "TIMEOUT-PRECEDENCE: develop untouched" \
   || no "TIMEOUT-PRECEDENCE: develop advanced to '$(dev_head "$PC")'"
 
@@ -221,7 +224,7 @@ r="$(reason "$ROOT" TEST-ME-D)"
   || { no "GARBLED-VERDICT: wrong reason: '$r'"; dump "$LOG"; }
 [[ "$(count TEST-ME-D)" == 5 ]] && ok "GARBLED-VERDICT: the one rebuild ran (5 passes: arch,build,rev,rebuild,re-review)" \
   || { no "GARBLED-VERDICT: stub ran $(count TEST-ME-D) times, expected 5"; dump "$LOG"; }
-[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW.md is on disk' "$LOG")" == 2 ]] \
+[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-D.md is on disk' "$LOG")" == 2 ]] \
   && ok "GARBLED-VERDICT: both garbled reviews were rescued, then gated by the verdict parse" \
   || { no "GARBLED-VERDICT: expected 2 review rescue lines"; dump "$LOG"; }
 [[ "$(dev_head "$PD")" == "init" ]] && ok "GARBLED-VERDICT: develop untouched — no merge from a truncated PASS" \
@@ -240,7 +243,7 @@ run_crew_routed "$PE" "TEST-ME-E" "$LOG" REVIEW_MODE=titled REVIEW_EXIT=1 || rc=
 grep -q 'review verdict: PASS' "$LOG" \
   && ok "TITLED-VERDICT: log shows the parse scored PASS (not the bypass)" \
   || { no "TITLED-VERDICT: no 'review verdict: PASS' line"; dump "$LOG"; }
-[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW.md is on disk' "$LOG")" == 1 ]] \
+[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-E.md is on disk' "$LOG")" == 1 ]] \
   && ok "TITLED-VERDICT: exactly one rescued review — no rebuild round-trip" \
   || { no "TITLED-VERDICT: expected 1 review rescue line"; dump "$LOG"; }
 [[ "$(count TEST-ME-E)" == 3 ]] && ok "TITLED-VERDICT: stub ran 3 times (arch,build,review — no rebuild)" \
