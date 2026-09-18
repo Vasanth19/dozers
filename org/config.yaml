@@ -153,6 +153,20 @@ alarm_interval: 300                                     # how often the launchd 
 # spend ($527) through Fable 5.1 at $10/$50 per MTok — 2x Opus 5 — chosen by nobody.
 # model_route.py now REFUSES an empty claude model from config; this is the fix, not
 # the workaround. (GSAI-83)
+# ⚠ BLOCKED 2026-09-18 — ollama-cloud has NO CAPACITY. Every model below returns
+# HTTP 429 "you (goofy_hugle_463) have reached your monthly usage limit". Verified
+# against BOTH vault keys (vault/ollama.env and vault/ollama-cloud.env — different
+# keys, SAME account) and against every id: glm-5.3, glm-5.3-flash, kimi-k3, glm-5.2,
+# kimi-k2.7-code. The model IDS ARE VALID and present in ollama.com's catalogue — the
+# "unrecognized model" line in the logs is the benign CLI warning noted below, NOT the
+# failure. Renaming models here fixes NOTHING; only capacity does.
+# Unblock with ONE of (both cost money — OWNER'S DECISION, GSAI-160):
+#   a) add usage credits at https://ollama.com/settings for goofy_hugle_463, or
+#   b) move `dev:` and `marketing:` to `{ provider: claude, model: "claude-opus-5" }`
+#      — works today, but is metered Anthropic spend and is exactly the cost these
+#      ollama routes were introduced (2026-09-15) to avoid.
+# Until then the dev/marketing crews FAIL FAST and merge nothing: see GSAI-160's
+# fail-closed guards in dozers/dev-lane/crew.sh (run_model_pass).
 models:
   default: { provider: claude, model: "claude-opus-5" }
   dev:

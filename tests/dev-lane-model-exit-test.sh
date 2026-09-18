@@ -171,13 +171,13 @@ if [[ -f "$mrcpt" ]] && grep -q '^branch=develop$' "$mrcpt" \
    && [[ -n "$msha" ]] && git -C "$PA" merge-base --is-ancestor "$msha" develop 2>/dev/null; then
   ok "RESCUE: GSAI-119 merge receipt written and verifiable"
 else no "RESCUE: merge receipt missing or unverifiable: $(cat "$mrcpt" 2>/dev/null)"; fi
-grep -q '⚠ architect agent exited 3 but DOZER-DESIGN-TEST-ME-A.md is on disk' "$LOG" \
+grep -q '⚠ architect agent exited 3 but DOZER-DESIGN-TEST-ME-A.md was written by this attempt' "$LOG" \
   && ok "RESCUE: ⚠ line names the architect pass + exit code + the per-issue artifact (GSAI-148)" \
   || { no "RESCUE: no architect rescue line"; dump "$LOG"; }
 grep -q '⚠ build agent exited 3 but' "$LOG" \
   && ok "RESCUE: ⚠ line names the build rescue (commits proof)" \
   || { no "RESCUE: no build rescue line"; dump "$LOG"; }
-grep -q '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-A.md is on disk' "$LOG" \
+grep -q '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-A.md was written by this attempt' "$LOG" \
   && ok "RESCUE: ⚠ line names the review pass + exit code + the per-issue artifact (the headline)" \
   || { no "RESCUE: no review rescue line"; dump "$LOG"; }
 
@@ -224,7 +224,7 @@ r="$(reason "$ROOT" TEST-ME-D)"
   || { no "GARBLED-VERDICT: wrong reason: '$r'"; dump "$LOG"; }
 [[ "$(count TEST-ME-D)" == 5 ]] && ok "GARBLED-VERDICT: the one rebuild ran (5 passes: arch,build,rev,rebuild,re-review)" \
   || { no "GARBLED-VERDICT: stub ran $(count TEST-ME-D) times, expected 5"; dump "$LOG"; }
-[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-D.md is on disk' "$LOG")" == 2 ]] \
+[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-D.md was written by this attempt' "$LOG")" == 2 ]] \
   && ok "GARBLED-VERDICT: both garbled reviews were rescued, then gated by the verdict parse" \
   || { no "GARBLED-VERDICT: expected 2 review rescue lines"; dump "$LOG"; }
 [[ "$(dev_head "$PD")" == "init" ]] && ok "GARBLED-VERDICT: develop untouched — no merge from a truncated PASS" \
@@ -243,7 +243,7 @@ run_crew_routed "$PE" "TEST-ME-E" "$LOG" REVIEW_MODE=titled REVIEW_EXIT=1 || rc=
 grep -q 'review verdict: PASS' "$LOG" \
   && ok "TITLED-VERDICT: log shows the parse scored PASS (not the bypass)" \
   || { no "TITLED-VERDICT: no 'review verdict: PASS' line"; dump "$LOG"; }
-[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-E.md is on disk' "$LOG")" == 1 ]] \
+[[ "$(grep -c '⚠ review agent exited 1 but DOZER-REVIEW-TEST-ME-E.md was written by this attempt' "$LOG")" == 1 ]] \
   && ok "TITLED-VERDICT: exactly one rescued review — no rebuild round-trip" \
   || { no "TITLED-VERDICT: expected 1 review rescue line"; dump "$LOG"; }
 [[ "$(count TEST-ME-E)" == 3 ]] && ok "TITLED-VERDICT: stub ran 3 times (arch,build,review — no rebuild)" \
