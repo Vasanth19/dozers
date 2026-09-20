@@ -24,6 +24,29 @@ source "$ROOT/tasks/adapter.sh"
 export DOZER_COMMENT_BY="dozer-engine"
 
 cfg() { grep -E "^$1:" "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
+
+# GSAI-173: spend-visibility fields, appended to every claim/finish line in run_one so
+# scripts/spend-by-kr.sh can roll the loop log up by Key Result without a Linear call.
+# ONE definition of the format (not inlined at each echo) — a backend without
+# task_milestone/task_project (files, github) just gets empty strings, never an error.
+#   start/claim line:  team=<KEY> milestone="<name>" project="<name>" profile=<full|lite> ts=<epoch>
+#   finish line:       ...same...  duration_s=<n> requests=<n-or-empty>
+# profile is per-LANE, not per-run: the dev lane always runs its 3-pass pipeline
+# (architect/build/review — see dev-lane/crew.sh PASS_ROWS) so it is the "full" spend
+# shape; every other lane (marketing today) is a single content-model pass — "lite".
+# ts is an epoch second, not in the original spec's field list — added so
+# spend-by-kr.sh's --days window means something: the log's existing timestamps are
+# HH:MM:SS-only (`[dozer] poll` lines), no date, so a claim/finish line on its own
+# carries no day at all without this. Lines written before this change have no ts
+# either way and fall back to "always included" in the aggregator (documented there).
+run_log_profile() { case "$1" in dev) echo full ;; *) echo lite ;; esac; }
+run_log_fields() {  # <team> <milestone> <project> <profile>
+  printf 'team=%s milestone="%s" project="%s" profile=%s ts=%s' "$1" "$2" "$3" "$4" "$(date +%s)"
+}
+run_log_requests() {  # <requests-file> -> the crew's own count, or "" if it never wrote one
+  [[ -s "$1" ]] && tr -d '[:space:]' < "$1" 2>/dev/null
+  return 0
+}
 POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
@@ -293,23 +316,33 @@ run_one() { # <id> <lane> <title> [priority]
 
   if ! task_claim "$id"; then echo "  ~ #$id already claimed, skipping" >&2; return 0; fi
   task_comment "$id" "Dozer claimed - lane:$lane. Starting now; will post a summary on finish."
+
+  # GSAI-173: spend-visibility metadata for this run, fetched once so the claim line
+  # and the finish line agree. task_milestone/task_project are Linear-only (see
+  # tasks/linear.sh) — a backend without them (files, github) just logs them empty,
+  # same fail-open contract as task_description above.
+  local rl_team rl_milestone="" rl_project="" rl_profile rl_t0=$SECONDS
+  rl_team="$(task_team "$id" 2>/dev/null || true)"
+  if declare -F task_milestone >/dev/null 2>&1; then rl_milestone="$(task_milestone "$id" 2>/dev/null || true)"; fi
+  if declare -F task_project >/dev/null 2>&1; then rl_project="$(task_project "$id" 2>/dev/null || true)"; fi
+  rl_profile="$(run_log_profile "$lane")"
+
   # GSAI-105: log the priority the pick was ordered by, so a drain log reads as a plan,
   # not a lottery. Empty when the backend/issue carries no priority.
-  echo "  -> #$id [$lane]${prio:+ p$prio} $title"
+  echo "  -> #$id [$lane]${prio:+ p$prio} $title  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile")"
 
   # Routing is a PREFLIGHT (GSAI-131): a task that cannot be routed to a repo is
   # blocked here, with the resolver's real error, before a crew — and therefore before
   # a worktree, a branch or a commit — exists anywhere. The engine never guesses.
-  local hint team workdir wd_err wd_errf
+  local hint team="$rl_team" workdir wd_err wd_errf
   hint="$(task_repo "$id" 2>/dev/null || true)"
-  team="$(task_team "$id" 2>/dev/null || true)"
   wd_errf="$(mktemp "${TMPDIR:-/tmp}/dozer-route.XXXXXX" 2>/dev/null)" || wd_errf="/tmp/dozer-route.$BASHPID"
   if ! workdir="$(resolve_workdir "$hint" "$team" 2>"$wd_errf")"; then
     wd_err="$(head -c 2000 "$wd_errf" 2>/dev/null || true)"; rm -f "$wd_errf" 2>/dev/null || true
     [[ -n "$wd_err" ]] || wd_err="workdir resolution failed without a reason"
     task_block "$id"
     task_comment "$id" "$(printf 'Dozer blocked BEFORE any work - could not resolve a working directory, so no crew ran, no worktree was created and no branch was cut.\n  repo hint: %s\n  team: %s\nReason: %s' "${hint:-<none>}" "${team:-<none>}" "$wd_err")"
-    echo "  x #$id unroutable: $wd_err" >&2
+    echo "  x #$id unroutable: $wd_err  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=0" >&2
     return 0
   fi
   rm -f "$wd_errf" 2>/dev/null || true
@@ -324,7 +357,12 @@ run_one() { # <id> <lane> <title> [priority]
   # The merge receipt (GSAI-119) rides with the other artifacts: a STALE receipt from a
   # previous run must never vouch for this one, so it is deleted up front like the rest.
   local merge_file="$art/$id.merge"
-  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" 2>/dev/null || true
+  # GSAI-173: the crew's own count of model invocations (dev-lane: PASS_ROWS length;
+  # mktg-lane: 0 or 1) — the finish line's requests=N. A crew that never writes this
+  # file (an older crew, or a lane that added none of this) logs requests= empty; see
+  # run_log_requests below.
+  local requests_file="$art/$id.requests"
+  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" "$requests_file" 2>/dev/null || true
 
   # The brief (GSAI-7): the task's description, handed to the crew as a FILE so a lane
   # can route on what the Director wrote — the marketing lane treats a `production:`
@@ -357,7 +395,7 @@ run_one() { # <id> <lane> <title> [priority]
       if (( vrc != 0 )); then
         task_block "$id"
         task_comment "$id" "$(printf 'Dozer blocked AFTER the crew reported success — the claimed merge could NOT be verified against %s, so the issue is NOT labeled dozer:merged-develop (GSAI-119).\n\nReason: %s' "$workdir" "$vout")"
-        echo "  x #$id crew succeeded but the merge did not verify — blocked: ${vout%%$'\n'*}" >&2
+        echo "  x #$id crew succeeded but the merge did not verify — blocked: ${vout%%$'\n'*}  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
         return 0
       fi
       echo "    verify-merge: $vout"
@@ -374,14 +412,14 @@ run_one() { # <id> <lane> <title> [priority]
     # the handoff note rides the same comment (capped so a runaway note can't flood it)
     if [[ -s "$handoff_file" ]]; then body="$(printf '%s\n\nHandoff note from the crew:\n%s' "$body" "$(head -c 4000 "$handoff_file")")"; fi
     task_comment "$id" "$(printf 'Dozer %s - lane:%s\n%s' "$verb" "$lane" "$body")"
-    echo "  ok #$id $verb"
+    echo "  ok #$id $verb  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")"
   else
     local reason
     if [[ -s "$fail_file" ]]; then reason="$(head -c 2000 "$fail_file")"
     else reason="crew exited without recording a reason — see the Dozer loop log (~/.dozers/logs/loop.err.log)"; fi
     task_block "$id"
     task_comment "$id" "$(printf 'Dozer blocked in lane:%s - needs a look.\nReason: %s' "$lane" "$reason")"
-    echo "  x #$id failed: $reason" >&2
+    echo "  x #$id failed: $reason  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
   fi
 }
 

@@ -58,6 +58,11 @@ ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 WORKDIR="${WORKDIR:-.}"; DOZER_PERSONA="${DOZER_PERSONA:-}"
 OUT="$REPO_ROOT/.artifacts/dev"; mkdir -p "$OUT"
+# GSAI-173: declared up here (not at first use, ~line 357) so fail() below can always
+# read its length — a preflight fail (e.g. the test-gate bootstrap check) exits before
+# any pass ever runs, and `${#PASS_ROWS[@]}` on an undeclared array is a hard error
+# under `set -u`. One entry per run_model_pass call = one model invocation attempted.
+PASS_ROWS=()
 
 # Per-issue pass artifacts (GSAI-148): the ARCHITECT pass writes $DESIGN_FILE and the
 # REVIEW pass writes $REVIEW_FILE — named AFTER the issue, not at fixed root paths.
@@ -74,8 +79,8 @@ REVIEW_FILE="DOZER-REVIEW-$ART_ID.md"
 cfg() { grep -E "^$1:" "$REPO_ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
 # fail: print the reason AND record it in $OUT/<id>.fail so the engine can put it
 # in the block comment (GSAI-26 #3) — Directors shouldn't have to read loop.err.log.
-fail() { echo "    [dev] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
-rm -f "$OUT/$ID.fail" "$OUT/$ID.merge" 2>/dev/null || true   # .merge receipt: see GSAI-119 block below
+fail() { echo "    [dev] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; printf '%s' "${#PASS_ROWS[@]}" > "$OUT/$ID.requests" 2>/dev/null || true; exit 1; }
+rm -f "$OUT/$ID.fail" "$OUT/$ID.merge" "$OUT/$ID.requests" 2>/dev/null || true   # .merge receipt: see GSAI-119 block below
 
 # ── Time bounds (GSAI-37) — resolved up front so a bad value fails before any spend ──
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
@@ -943,6 +948,8 @@ MERGE_SHA="$(git -C "$MW" rev-parse HEAD)"
 printf 'branch=%s\nmerge_sha=%s\n' "$INTEG" "$MERGE_SHA" > "$OUT/$ID.merge" 2>/dev/null \
   || fail "merge landed but the receipt could not be written ($OUT/$ID.merge) — NOT labeling merged; investigate .artifacts/dev writability and re-greenlight"
 echo "    [dev] merge receipt: $(git -C "$MW" rev-parse --short HEAD) on $INTEG"
+# GSAI-173: same count fail() would have written, on the success path.
+printf '%s' "${#PASS_ROWS[@]}" > "$OUT/$ID.requests" 2>/dev/null || true
 
 # ── 4. cleanup (success): drop worktrees + branch + state; merge lock released on EXIT ──
 (( MW_OWNED )) && { git worktree remove --force "$MW" >/dev/null 2>&1 || true; }
