@@ -73,14 +73,18 @@ echo "== model routing =="
 # dev.review → ollama-cloud/glm-5.3:cloud, dev.build → ollama-cloud/kimi-k3:cloud, all
 # with small=glm-5.3-flash:cloud; marketing → ollama-cloud/glm-5.3:cloud with
 # small_model glm-5.3-flash:cloud; default (and a bare `dev`, which has no flat
-# meaning in a nested lane) → claude/claude-opus-5. This case tracks WHATEVER ships
-# in org/config.yaml; when the shipped route changes, change these expectations with it ──
+# meaning in a nested lane) → claude/claude-opus-5. Since GSAI-170 the shipped BUILD
+# role also carries `max_turns: 60`, which the route hands to the CLI as --max-turns.
+# This case tracks WHATEVER ships in org/config.yaml; when the shipped route changes,
+# change these expectations with it (the cap's own behaviour lives in
+# tests/crew-profile-test.sh, which uses a temp config) ──
 out="$(route env dev.build)"
 if has "$out" "export DOZER_MODEL_PROVIDER=ollama-cloud" \
    && has "$out" "export ANTHROPIC_MODEL=kimi-k3:cloud" \
    && has "$out" "export ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash:cloud" \
-   && has "$out" "export MODEL_CMD='claude -p'"; then
-  ok "DEFAULT dev.build -> ollama-cloud/kimi-k3:cloud (+ small flash) via claude -p"
+   && has "$out" "export DOZER_MODEL_MAX_TURNS=60" \
+   && has "$out" "export MODEL_CMD='claude -p --max-turns 60'"; then
+  ok "DEFAULT dev.build -> ollama-cloud/kimi-k3:cloud (+ small flash, 60-turn cap) via claude -p"
 else no "DEFAULT dev.build should route to ollama-cloud/kimi-k3:cloud; got: $out"; fi
 out="$(route env marketing)"
 if has "$out" "export ANTHROPIC_MODEL=glm-5.3:cloud" \

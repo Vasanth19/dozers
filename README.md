@@ -356,6 +356,57 @@ the crew with a non-zero exit and a message naming what's absent. It never quiet
 back to `claude` — a silently-swapped brain is worse than a failed run. The key is read
 from the vault only inside the resolver; it is never logged, echoed, or printed by `show`.
 
+### Turn caps — a timebox stops a hang, not a loop
+
+Every crew command already runs under a wall-clock bound (`timeout_model`), which kills a
+process that has *stopped*. It does nothing about a process that is *busy going nowhere* —
+and the dev BUILD role's fix-the-failing-tests loop is exactly that: the 2026-09-20 audit
+attributed **~52% of all Ollama spend** to it, every dollar earned by running to the full
+hour. So a role can also carry a **turn** ceiling:
+
+```yaml
+models:
+  dev:
+    build: { provider: ollama-cloud, model: "kimi-k3:cloud", max_turns: 60 }
+```
+
+It becomes `claude -p --max-turns 60` — the same flag on `claude`, `ollama-cloud` and
+`ollama-local`, all three of which *are* the Claude Code CLI. Override per run with
+`DOZER_MAX_TURNS_DEV_BUILD=<n>`, or `DOZER_MAX_TURNS=<n>` for every role. A provider whose
+CLI has no turn flag (`codex`) cannot honour it: the route reports the budget as
+unsupported and the crew substitutes the bound it *can* impose — a tightened wall-clock
+one (`crews.turn_cap_wallclock_secs`, default 1800) — and says so on every such pass. A
+budget the runtime cannot enforce is announced, never assumed.
+
+### Crew profiles — `full` for code, `lite` for housekeeping
+
+The dev lane's trio is the right shape for code and the wrong shape for chores. A label
+rename does not need a design document and a second opinion, and paying three model passes
+to get one is how a factory spends its budget on its own paperwork. So the pipeline is a
+**profile**, picked per issue, defined in `org/config.yaml` under `crews:`:
+
+| | `full` (default) | `lite` |
+|---|---|---|
+| passes | architect → build → review | build |
+| model | each role's own route | the lane's cheap `small` route (`models.dev.small`) |
+| turns | each role's own `max_turns` | 25 |
+
+`lite` gives up the design doc and the judge. It gives up **no mechanical gate**: deps, the
+test gate, the no-output gate, the migration gate, the serialized merge and the green-gate
+all still run. It trades a second opinion for spend — never a guarantee.
+
+An issue gets `lite` when **any** of these holds, else `full`:
+
+- its lane is in `crews.lite_when_lanes` (default `ops`)
+- it carries `crews.lite_when_label` (default `crew:lite`)
+- its project is in `crews.lite_when_projects` (default `GSAI: Factory housekeeping`)
+
+The engine fetches the facts (it owns the backend adapter) and hands them to the crew as
+`DOZER_LANE` + `DOZER_CREW_META`; `dozers/dev-lane/crew.sh` makes the call. **No facts means
+`full`** — a backend that cannot answer must never be able to quietly downgrade a code task
+to one uncritiqued pass. `DOZER_CREW=<profile>` forces one run; a profile the config does
+not define fails the crew rather than defaulting to something.
+
 ---
 
 ## Repo layout

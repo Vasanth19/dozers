@@ -518,6 +518,33 @@ def team(identifier):
     print(issue(identifier)["team"]["key"])
 
 
+def crew_meta(identifier):
+    """The facts the CREW-PROFILE selector needs: the issue's project + its labels.
+
+    GSAI-170. `issue()` already carries labels, but not `project { name }` — and the
+    selector wants one round trip, not two. Output is tab-separated `<kind>\t<value>`
+    lines, so a name carrying spaces, commas or a colon ("GSAI: Factory housekeeping")
+    survives intact:
+
+        project\tGSAI: Factory housekeeping
+        label\tlane:ops
+        label\tcrew:lite
+
+    An issue with no project prints no `project` line. The DECISION lives in
+    dozers/dev-lane/crew.sh; this verb only reports.
+    """
+    d = gql('query($i:String!){ issue(id:$i){ project{ name } '
+            'labels{ nodes{ name } } } }', {"i": identifier})
+    iss = d["issue"]
+    if not iss:
+        die(f"no issue '{identifier}'")
+    name = ((iss.get("project") or {}).get("name") or "").strip()
+    if name:
+        print(f"project\t{name}")
+    for n in iss["labels"]["nodes"]:
+        print(f"label\t{n['name']}")
+
+
 def description(identifier):
     # The issue description IS the brief (GSAI-7): the engine hands it to the crew so a
     # lane can route on what the Director wrote (e.g. a `production:` line marks a video
@@ -774,6 +801,7 @@ OPS = {
     "comment": lambda a: comment(a[0], a[1]),
     "repo": lambda a: repo(a[0]),
     "team": lambda a: team(a[0]),
+    "crew-meta": lambda a: crew_meta(a[0]),
     "description": lambda a: description(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
