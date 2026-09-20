@@ -324,7 +324,9 @@ run_one() { # <id> <lane> <title> [priority]
   # The merge receipt (GSAI-119) rides with the other artifacts: a STALE receipt from a
   # previous run must never vouch for this one, so it is deleted up front like the rest.
   local merge_file="$art/$id.merge"
-  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" 2>/dev/null || true
+  # <id>.meta (GSAI-170): the crew-profile facts, same stale-artifact discipline.
+  local meta_file="$art/$id.meta"
+  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" "$meta_file" 2>/dev/null || true
 
   # The brief (GSAI-7): the task's description, handed to the crew as a FILE so a lane
   # can route on what the Director wrote — the marketing lane treats a `production:`
@@ -338,7 +340,20 @@ run_one() { # <id> <lane> <title> [priority]
     : > "$brief_file"
   fi
 
-  if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" DOZER_BRIEF="$brief_file" "$crew" "$id" "$title"; then
+  # The crew-profile facts (GSAI-170): the issue's PROJECT and its LABELS, fetched
+  # here because this is the one place that speaks to the backend adapter. The crew
+  # makes the DECISION (dozers/dev-lane/crew.sh) from this file plus DOZER_LANE.
+  # Best-effort, exactly like the brief: a backend with no task_crew_meta, or a fetch
+  # that fails, leaves the file EMPTY — and an empty file is no signal, which the
+  # crew reads as the full trio. A backend that cannot answer must never be able to
+  # quietly downgrade a code task to a single uncritiqued pass.
+  : > "$meta_file"
+  if declare -F task_crew_meta >/dev/null 2>&1; then
+    task_crew_meta "$id" > "$meta_file" 2>/dev/null || : > "$meta_file"
+  fi
+
+  if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" DOZER_BRIEF="$brief_file" \
+     DOZER_LANE="$lane" DOZER_CREW_META="$meta_file" "$crew" "$id" "$title"; then
     local verb VERIFY_PROOF=""
     if [[ "$lane" == "marketing" ]]; then
       task_review "$id"; verb="staged for review"

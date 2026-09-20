@@ -15,7 +15,15 @@
 #     per-project lock, and each merge is GREEN-GATED — verified on the integration
 #     branch after merging; a merge that breaks it is reverted and the task sent back.
 #
-# Env: WORKDIR, DOZER_PERSONA, REPO_ROOT. Config: integration_branch, push,
+# Crew profile (GSAI-170): `full` (architect → build → review) or `lite` (build
+#   alone, on the lane's cheap `small` route, under a 25-turn ceiling) — for
+#   housekeeping, where a design doc and a judge cost more than the change. Picked per
+#   issue from its LANE, its LABELS and its PROJECT (facts the engine hands over in
+#   DOZER_LANE + DOZER_CREW_META); profiles + the selection rules live in
+#   org/config.yaml `crews:`. Every mechanical gate runs on both profiles.
+#
+# Env: WORKDIR, DOZER_PERSONA, REPO_ROOT, DOZER_LANE, DOZER_CREW_META (and DOZER_CREW
+#   to force a profile for one run). Config: integration_branch, push,
 #   branch_prefix, worktree_root. DRY_RUN=1 stubs the model + tests (+ deps install).
 #   DEPS_INSTALL=off skips the lockfile install that otherwise runs when a worktree
 #   has a package.json but no node_modules (GSAI-26). On the merge worktree that
@@ -38,9 +46,10 @@
 #   knowable from the checkout, so don't pay for a run that can never merge), again on
 #   the task worktree after the agent, and once more at the green-gate.
 #
-# Model routing: THREE passes, each on its OWN brain — ARCHITECT (spec → the per-issue
-#   DOZER-DESIGN-$ART_ID.md), BUILD (implement the design), REVIEW (verdict →
-#   DOZER-REVIEW-$ART_ID.md). Each resolves its dotted role via dozers/model.sh:
+# Model routing: up to THREE passes (the crew profile decides which), each on its OWN
+#   brain — ARCHITECT (spec → the per-issue DOZER-DESIGN-$ART_ID.md), BUILD (implement
+#   the design), REVIEW (verdict → DOZER-REVIEW-$ART_ID.md). Each resolves its dotted
+#   role via dozers/model.sh (a profile may pin one role for all its passes):
 #   models.dev.<pass> → flat models.dev → models.default.
 #   Override per-run with DOZER_MODEL_DEV[_<PASS>]="<provider>[:<model>]", or bypass
 #   routing entirely by exporting MODEL_CMD (all three passes then share it). A route
@@ -53,6 +62,13 @@
 #   timeout; nothing merges. Knobs: org/config.yaml `timeout_model / _test / _deps /
 #   _push`, env DOZER_TIMEOUT_<NAME> per run. Before this a single asleep `pnpm test`
 #   held a slot for 8 hours and, through the engine's wave `wait`, every other slot too.
+#
+# Turn cap (GSAI-170): a wall-clock bound stops a HANG, not a LOOP. Each model pass
+#   also carries a TURN ceiling — `max_turns` on the role in `models:`, or the crew
+#   profile's own — handed to the CLI as `--max-turns`. The dev BUILD role's
+#   fix-the-failing-tests loop was ~52% of all Ollama spend in the 2026-09-20 audit,
+#   every dollar of it earned by running to timeout_model. A provider with no turn
+#   flag (codex) gets a tightened wall-clock bound instead, announced on every pass.
 set -euo pipefail
 ID="$1"; TITLE="$2"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -354,20 +370,141 @@ INTEG="${INTEGRATION_BRANCH:-$(cfg integration_branch)}"; INTEG="${INTEG:-develo
 # the pass's DOTTED role resolves nested → flat lane → models.default. Fail fast: a bad
 # provider or a missing key stops the crew — it never silently falls back to claude.
 DOZER_ROLE="${DOZER_ROLE:-dev}"
-PASS_ROWS=()   # "pass: provider/model" per run, in order — the summary reports all three
+PASS_ROWS=()   # "pass: provider/model" per run, in order — the summary reports every pass
 
-_PASS_BLOCK=""; _PASS_DESC=""
-resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK + _PASS_DESC
-  local role="$DOZER_ROLE.$1"
+# ── Crew profile (GSAI-170): WHICH pipeline runs this issue ─────────────────────────
+# `full` is the ARCHITECT → BUILD → REVIEW trio and stays the default: every code task
+# gets a design, a build and a judge. `lite` is ONE build pass, on the lane's cheap
+# `small` route, under a tight TURN budget — for housekeeping, where a design doc and a
+# second opinion cost more than the change they are guarding (a label rename, a config
+# line, a doc fix). Profiles live in org/config.yaml under `crews:`; the fallbacks
+# below are the same values, so a crew run against a REPO_ROOT with no config (the
+# tests, the zero-config mode) still gets a real pipeline instead of an empty one.
+#
+# SELECTION — `lite` when ANY of these holds, else `full`:
+#   • the issue's lane is listed in `crews.lite_when_lanes`   (default: ops)
+#   • the issue carries `crews.lite_when_label`               (default: crew:lite)
+#   • the issue's project is listed in `crews.lite_when_projects`
+#     (default: "GSAI: Factory housekeeping"; `|`-separated — project names carry
+#     commas and colons, so a comma list would split them)
+# The FACTS come from the engine, which owns the backend adapter: dozers/dozer.sh
+# exports DOZER_LANE and writes the issue's project + labels into $DOZER_CREW_META as
+# `project\t<name>` / `label\t<name>` lines. No file, or an empty one, is NO SIGNAL and
+# resolves to `full` — a backend that cannot answer must never be able to quietly
+# downgrade a code task to a single uncritiqued pass. DOZER_CREW=<profile> forces one
+# run (the tests, and a Director who already knows which pipeline this needs).
+
+crews_get() {  # $1 = "<profile>.<key>" or "<key>" under `crews:` in org/config.yaml
+  # Same shape and the same limitation as cfg() above: a scalar, comment-stripped from
+  # the first ` #`, so a value that legitimately contains ` #` is not expressible here.
+  local raw
+  raw="$(awk -v want="$1" '
+    /^crews:/ { inc = 1; next }
+    inc && /^[^[:space:]#]/ { inc = 0 }
+    !inc { next }
+    { line = $0; sub(/[[:space:]]+#.*$/, "", line); sub(/[[:space:]]+$/, "", line) }
+    line ~ /^  [A-Za-z_][A-Za-z0-9_]*:[[:space:]]*$/ {                      # a profile header
+      prof = line; sub(/^  /, "", prof); sub(/:[[:space:]]*$/, "", prof); next }
+    line ~ /^  [A-Za-z_][A-Za-z0-9_]*:[[:space:]]*[^[:space:]]/ {           # a top-level scalar
+      k = line; sub(/^  /, "", k); sub(/:.*$/, "", k)
+      v = line; sub(/^  [^:]*:[[:space:]]*/, "", v)
+      prof = ""; if (k == want) { print v; exit } next }
+    line ~ /^    [A-Za-z_][A-Za-z0-9_]*:/ {                                 # a key inside a profile
+      k = line; sub(/^    /, "", k); sub(/:.*$/, "", k)
+      v = line; sub(/^    [^:]*:[[:space:]]*/, "", v)
+      if (prof != "" && prof "." k == want) { print v; exit } }
+  ' "$REPO_ROOT/org/config.yaml" 2>/dev/null || true)"
+  raw="${raw%\"}"; raw="${raw#\"}"; raw="${raw%\'}"; raw="${raw#\'}"
+  printf '%s' "$raw"
+}
+
+crew_meta_field() {  # $1 = project|label → the engine's recorded value(s), one per line
+  [[ -n "${DOZER_CREW_META:-}" && -f "${DOZER_CREW_META:-}" ]] || return 0
+  awk -F'\t' -v k="$1" '$1 == k { print $2 }' "$DOZER_CREW_META" 2>/dev/null || true
+}
+
+_in_list() {  # $1 = needle, $2 = haystack, $3 = separator — exact match, whitespace-trimmed
+  local IFS="$3" item
+  for item in $2; do
+    item="${item#"${item%%[![:space:]]*}"}"; item="${item%"${item##*[![:space:]]}"}"
+    [[ -n "$item" && "$item" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+CREW_PROFILE=""; CREW_REASON=""
+resolve_crew_profile() {   # sets CREW_PROFILE + CREW_REASON (globals: a $() subshell would lose them)
+  if [[ -n "${DOZER_CREW:-}" ]]; then
+    CREW_PROFILE="$DOZER_CREW"; CREW_REASON="DOZER_CREW=$DOZER_CREW (forced for this run)"; return 0
+  fi
+  local lanes label projects proj l
+  lanes="$(crews_get lite_when_lanes)";       lanes="${lanes:-ops}"
+  label="$(crews_get lite_when_label)";       label="${label:-crew:lite}"
+  projects="$(crews_get lite_when_projects)"; projects="${projects:-GSAI: Factory housekeeping}"
+  if [[ -n "${DOZER_LANE:-}" ]] && _in_list "${DOZER_LANE}" "$lanes" ','; then
+    CREW_PROFILE="lite"; CREW_REASON="lane:${DOZER_LANE} is a lite lane"; return 0
+  fi
+  while IFS= read -r l; do
+    [[ "$l" == "$label" ]] || continue
+    CREW_PROFILE="lite"; CREW_REASON="the issue carries $label"; return 0
+  done < <(crew_meta_field label)
+  proj="$(crew_meta_field project | head -1)"
+  if [[ -n "$proj" ]] && _in_list "$proj" "$projects" '|'; then
+    CREW_PROFILE="lite"; CREW_REASON="project '$proj' is a lite project"; return 0
+  fi
+  CREW_PROFILE="full"; CREW_REASON="no lite signal (lane/label/project)"
+}
+resolve_crew_profile
+
+CREW_PASSES="$(crews_get "$CREW_PROFILE.passes")"
+CREW_MAX_TURNS="$(crews_get "$CREW_PROFILE.max_turns")"
+CREW_MODEL_ROLE="$(crews_get "$CREW_PROFILE.model_role")"
+if [[ -z "$CREW_PASSES" ]]; then   # no `crews:` block in this REPO_ROOT — the built-ins
+  case "$CREW_PROFILE" in
+    full) CREW_PASSES="architect build review" ;;
+    lite) CREW_PASSES="build"
+          CREW_MAX_TURNS="${CREW_MAX_TURNS:-25}"
+          CREW_MODEL_ROLE="${CREW_MODEL_ROLE:-small}" ;;
+    *)    fail "unknown crew profile '$CREW_PROFILE' — org/config.yaml \`crews:\` defines no \`$CREW_PROFILE.passes\` (built-ins: full, lite)" ;;
+  esac
+fi
+pass_enabled() { [[ " $CREW_PASSES " == *" $1 "* ]]; }
+pass_enabled build \
+  || fail "crew profile '$CREW_PROFILE' has passes '$CREW_PASSES' and no BUILD pass — a crew that never builds cannot produce a merge"
+if [[ -n "$CREW_MAX_TURNS" ]]; then
+  [[ "$CREW_MAX_TURNS" =~ ^[0-9]+$ ]] && (( CREW_MAX_TURNS >= 1 )) \
+    || fail "crews.$CREW_PROFILE.max_turns '$CREW_MAX_TURNS' must be a whole number of turns >= 1"
+  # The profile's ceiling reaches the model route as the per-run env override, so it
+  # beats whatever `models.<lane>.<role>.max_turns` says — a lite crew is lite whatever
+  # brain it borrows. `full` deliberately sets none: there, each ROLE owns its budget.
+  export DOZER_MAX_TURNS="$CREW_MAX_TURNS"
+fi
+echo "    [dev] crew profile: $CREW_PROFILE ($CREW_REASON) — passes: $CREW_PASSES${CREW_MAX_TURNS:+; max $CREW_MAX_TURNS turns/pass}${CREW_MODEL_ROLE:+; model role $DOZER_ROLE.$CREW_MODEL_ROLE}"
+
+_PASS_BLOCK=""; _PASS_DESC=""; _PASS_TURNS=""; _PASS_TURNS_UNSUPPORTED=0
+resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK/_DESC/_TURNS
+  # A crew profile may pin ONE model role for every pass it runs (GSAI-170: `lite`
+  # runs on `$DOZER_ROLE.small`, the lane's cheap pin promoted to a real route by
+  # tasks/model_route.py). Unset — which `full` always is — each pass keeps its own
+  # dotted role, exactly as before.
+  local role="$DOZER_ROLE.${CREW_MODEL_ROLE:-$1}" _probe
   if [[ -n "${MODEL_CMD:-}" ]]; then
     DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
+    # The MODEL_CMD bypass hands us a command line somebody else composed: we cannot
+    # add a flag to it, and must not claim a cap we did not apply.
     _PASS_BLOCK=":"; _PASS_DESC="${DOZER_MODEL_PROVIDER}/${DOZER_MODEL_NAME}"
+    _PASS_TURNS=""; _PASS_TURNS_UNSUPPORTED=0
     return 0
   fi
   _PASS_BLOCK="$("$REPO_ROOT/dozers/model.sh" env "$role")" \
     || fail "model routing failed for role '$role'"
-  # Desc from a throwaway subshell — the route's exports must not enter the crew env.
-  _PASS_DESC="$(eval "$_PASS_BLOCK" >/dev/null; printf '%s/%s' "${DOZER_MODEL_PROVIDER:-?}" "${DOZER_MODEL_NAME:-default}")"
+  # Desc + turn-cap facts from ONE throwaway subshell — the route's exports (the
+  # provider token above all) must not enter the crew env.
+  _probe="$(eval "$_PASS_BLOCK" >/dev/null; printf '%s/%s\t%s\t%s' \
+    "${DOZER_MODEL_PROVIDER:-?}" "${DOZER_MODEL_NAME:-default}" \
+    "${DOZER_MODEL_MAX_TURNS:-}" "${DOZER_MODEL_MAX_TURNS_UNSUPPORTED:-0}")"
+  IFS=$'\t' read -r _PASS_DESC _PASS_TURNS _PASS_TURNS_UNSUPPORTED <<<"$_probe"
+  _PASS_TURNS_UNSUPPORTED="${_PASS_TURNS_UNSUPPORTED:-0}"
 }
 
 # branch_has_output <dir> <sha> — the gate's question (GSAI-149): "does the branch
@@ -444,11 +581,42 @@ _model_unreachable_reason() {  # <logfile> → reason string, or empty
   grep -qiE 'ECONNREFUSED|Connection refused|Could not connect|getaddrinfo|network error|fetch failed' "$f" && { echo "could not connect to the provider endpoint"; return 0; }
   printf ''
 }
+# ── Turn cap (GSAI-170) — how a pass's budget is ENFORCED, per provider ────────────
+# A wall-clock timebox stops a HANG; it does not stop a LOOP. The dev BUILD role's
+# fix-the-failing-tests loop is a loop: the 2026-09-20 audit put ~52% of all Ollama
+# spend on it, every dollar of it earned by running to the one-hour timeout_model.
+#
+#   claude / ollama-cloud / ollama-local — all three ARE the Claude Code CLI (the
+#       ollama routes only repoint its endpoint), so tasks/model_route.py appends
+#       `--max-turns N` to MODEL_CMD and the CLI enforces the budget itself. Nothing
+#       for this crew to do beyond reporting it.
+#   codex — `codex exec` has NO turn flag. The route exports the budget together with
+#       DOZER_MODEL_MAX_TURNS_UNSUPPORTED=1, and this crew substitutes the only bound
+#       it can actually impose: a WALL-CLOCK one, tightened to TURN_CAP_WALLCLOCK
+#       (config `crews.turn_cap_wallclock_secs`, default 1800 = half the default
+#       timeout_model), never loosened past the pass's own timebox. It says so out
+#       loud, every time: a budget the runtime cannot honour must be visible, not
+#       assumed. A hit still fails the pass exactly like any other timeout.
+TURN_CAP_WALLCLOCK="$(crews_get turn_cap_wallclock_secs)"; TURN_CAP_WALLCLOCK="${TURN_CAP_WALLCLOCK:-1800}"
+[[ "$TURN_CAP_WALLCLOCK" =~ ^[0-9]+$ ]] && (( TURN_CAP_WALLCLOCK >= 1 )) \
+  || fail "crews.turn_cap_wallclock_secs '$TURN_CAP_WALLCLOCK' must be a whole number of seconds >= 1"
+
 run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artifact (optional)
   resolve_pass "$1"
   echo "    [dev] $1 model: $_PASS_DESC"
-  PASS_ROWS+=("$1: $_PASS_DESC")
+  PASS_ROWS+=("$1: $_PASS_DESC${_PASS_TURNS:+ (max $_PASS_TURNS turns)}")
   local rc=0
+  # The bound this pass actually runs under: its timebox, unless a configured turn cap
+  # cannot be enforced by the provider and has to be paid in seconds instead.
+  local _bound="$T_MODEL"
+  if [[ -n "$_PASS_TURNS" ]]; then
+    if (( _PASS_TURNS_UNSUPPORTED )); then
+      _bound="$TURN_CAP_WALLCLOCK"; (( _bound > T_MODEL )) && _bound="$T_MODEL"
+      echo "    [dev] ⚠ $1: ${_PASS_DESC%%/*} takes no --max-turns — the ${_PASS_TURNS}-turn budget is enforced as a ${_bound}s wall-clock bound instead" >&2
+    else
+      echo "    [dev] $1 turn cap: $_PASS_TURNS turns (--max-turns)"
+    fi
+  fi
   # GSAI-150: the `\$` on _PASS_PROMPT is load-bearing. The prompt is untrusted text —
   # the review prompt embeds the branch's diff, every prompt embeds the task title —
   # and it must expand EXACTLY ONCE, inside double quotes, at the second eval's parse.
@@ -469,7 +637,7 @@ run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artif
   # crew's own stdout/stderr exactly as before — this only gives the rescue a way to ask
   # "did the model actually answer, or did we never reach it at all?".
   local _passlog; _passlog="$(mktemp "${TMPDIR:-/tmp}/dozer-pass.XXXXXX")"
-  _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" _PASSLOG="$_passlog" timebox "$T_MODEL" "$1 agent" "$WT" \
+  _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" _PASSLOG="$_passlog" timebox "$_bound" "$1 agent" "$WT" \
     'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"\$_PASS_PROMPT\"" 2>&1 | tee -a "$_PASSLOG"; exit "${PIPESTATUS[0]}"' \
     || rc=$?
   # if/then, not `&& return`/`&& fail`: a false `(( … ))` short-circuits the list to
@@ -478,7 +646,7 @@ run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artif
   if (( rc == 0 )); then rm -f "$_passlog" "$_proof_marker"; return 0; fi
   if (( TIMEBOX_HIT )); then
     rm -f "$_passlog" "$_proof_marker"
-    fail "$(timed_out_msg "$1 agent" "$T_MODEL" model); worktree kept for resume"
+    fail "$(timed_out_msg "$1 agent" "$_bound" model)$( (( _PASS_TURNS_UNSUPPORTED )) && printf ' — this bound stood in for a %s-turn cap the provider cannot enforce' "$_PASS_TURNS"); worktree kept for resume"
   fi
   # ── GSAI-160: the gate must FAIL CLOSED when it could not reach its model ──────────
   # A gate whose judge never rendered a judgment has not passed anything. Two holes
@@ -657,11 +825,17 @@ fi
 link_deps "$WT"
 [[ "${DRY_RUN:-}" == "1" ]] || install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
 
-# ── 2. three model passes: ARCHITECT → BUILD → REVIEW (each on its own route) ────
-# ARCHITECT turns the spec into $DESIGN_FILE; BUILD implements that design (and must
-# still clear every existing gate: deps, tests, no-commit); REVIEW judges spec-vs-diff
-# and writes $REVIEW_FILE whose first line is the verdict. A FAIL verdict buys ONE
-# rebuild with the review notes; a second FAIL blocks the task.
+# ── 2. the model passes named by the crew profile (each on its own route) ────────
+# `full` ($CREW_PASSES = architect build review): ARCHITECT turns the spec into
+# $DESIGN_FILE; BUILD implements that design (and must still clear every existing
+# gate: deps, tests, no-commit); REVIEW judges spec-vs-diff and writes $REVIEW_FILE
+# whose first line is the verdict. A FAIL verdict buys ONE rebuild with the review
+# notes; a second FAIL blocks the task.
+# `lite` ($CREW_PASSES = build): the BUILD pass alone. What it loses is the design doc
+# and the judge; what it does NOT lose is a single one of the mechanical gates —
+# deps, the test gate, the no-output gate, the migration gate, the serial merge and
+# the green-gate all still run. The profile trades a second opinion for spend, never
+# a guarantee for spend (GSAI-170).
 
 # -- prompts ----------------------------------------------------------------------
 read -r -d '' ARCH_PROMPT <<EOF || true
@@ -674,14 +848,23 @@ Do NOT merge, push, switch branches, or remove this worktree.
 TASK #$ID: $TITLE
 EOF
 
+# One line differs by profile: with no ARCHITECT pass there is no design to follow,
+# and telling the model to follow a file that will never exist is how a build pass
+# wastes its first turns hunting for it.
+if pass_enabled architect; then
+  _BUILD_PLAN="Implement the design in $DESIGN_FILE (the architect pass's plan — follow it)."
+else
+  _BUILD_PLAN="This crew profile ($CREW_PROFILE) runs no architect and no review pass: there is no design file, and no second opinion after you. Work straight from the task spec below, and keep the change as small as the task allows."
+fi
 read -r -d '' BUILD_PROMPT <<EOF || true
 You are the BUILD pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
-Implement the design in $DESIGN_FILE (the architect pass's plan — follow it).
+$_BUILD_PLAN
 Rules (from $DOZER_PERSONA): do ALL work here; run the project's
 tests until green; commit. Do NOT merge, push, switch branches, or remove this worktree.
 
 TASK #$ID: $TITLE
 EOF
+unset _BUILD_PLAN
 
 if (( RESUMING )); then
   _resume_note="RESUMING (attempt $attempt). Prior work is ALREADY committed on $BRANCH:
@@ -692,6 +875,7 @@ If $DESIGN_FILE is already committed on this branch, review it and amend ONLY if
 design must change (then commit it again); otherwise commit nothing new.
 
 $ARCH_PROMPT"
+
   BUILD_PROMPT="$_resume_note
 
 $BUILD_PROMPT"
@@ -699,27 +883,33 @@ $BUILD_PROMPT"
 fi
 
 if [[ "${DRY_RUN:-}" == "1" ]]; then
-  for _p in architect build review; do
+  for _p in $CREW_PASSES; do
     resolve_pass "$_p"
     echo "    [dev] $_p model: $_PASS_DESC"
-    PASS_ROWS+=("$_p: $_PASS_DESC")
+    PASS_ROWS+=("$_p: $_PASS_DESC${_PASS_TURNS:+ (max $_PASS_TURNS turns)}")
   done
   unset _p
   echo "    [dev] DRY_RUN — skipping models$([[ $RESUMING == 1 ]] && echo ' (resume)')"
-  printf '# DOZER-DESIGN (dry-run stub)\n' > "$WT/$DESIGN_FILE"
+  # Stub only what the profile's passes would have produced: a lite dry-run that left a
+  # DOZER-DESIGN behind would be lying about which passes ran.
+  if pass_enabled architect; then printf '# DOZER-DESIGN (dry-run stub)\n' > "$WT/$DESIGN_FILE"; fi
   printf 'dozer #%s attempt %s: %s\n' "$ID" "$attempt" "$TITLE" >> "$WT/.dozer-log"
-  printf 'VERDICT: PASS\n(dry-run stub review)\n' > "$WT/$REVIEW_FILE"
+  if pass_enabled review; then printf 'VERDICT: PASS\n(dry-run stub review)\n' > "$WT/$REVIEW_FILE"; fi
   git -C "$WT" add -A && git -C "$WT" commit -q -m "dozer #$ID: $TITLE (dry-run stub, attempt $attempt)" || true
 else
   # -- 2a. ARCHITECT: spec -> $DESIGN_FILE (per-issue, GSAI-148) --------------------
-  run_model_pass architect "$ARCH_PROMPT" "file:$DESIGN_FILE"
-  if [[ -z "${MODEL_CMD:-}" ]]; then
-    # The pass was told to write AND commit the design; backstop the commit so the
-    # build diff/merge never lose it (still fail-fast on NO design at all).
-    [[ -s "$WT/$DESIGN_FILE" ]] \
-      || fail "architect produced no $DESIGN_FILE (worktree kept for resume)"
-    git -C "$WT" add "$DESIGN_FILE" 2>/dev/null \
-      && git -C "$WT" commit -q -m "dozer #$ID: design (architect pass)" 2>/dev/null || true
+  if pass_enabled architect; then
+    run_model_pass architect "$ARCH_PROMPT" "file:$DESIGN_FILE"
+    if [[ -z "${MODEL_CMD:-}" ]]; then
+      # The pass was told to write AND commit the design; backstop the commit so the
+      # build diff/merge never lose it (still fail-fast on NO design at all).
+      [[ -s "$WT/$DESIGN_FILE" ]] \
+        || fail "architect produced no $DESIGN_FILE (worktree kept for resume)"
+      git -C "$WT" add "$DESIGN_FILE" 2>/dev/null \
+        && git -C "$WT" commit -q -m "dozer #$ID: design (architect pass)" 2>/dev/null || true
+    fi
+  else
+    echo "    [dev] architect pass skipped (crew profile: $CREW_PROFILE)"
   fi
 
   # -- 2b. BUILD: implement the design + the full downstream gates ----------------
@@ -774,13 +964,18 @@ $1"
 
   # -- 2c. REVIEW: spec + diff -> $REVIEW_FILE, verdict line (tolerant scan, GSAI-155) --
   REVIEW_VERDICT=""
+  if pass_enabled architect; then
+    _REVIEW_PLAN_NOTE="$DESIGN_FILE is the architect pass's plan — check the build followed it"
+  else
+    _REVIEW_PLAN_NOTE="this crew profile ran no architect pass, so judge the diff against the spec directly — there is no design file"
+  fi
   review_once() {
     local vline
     read -r -d '' _rev_prompt <<EOF || true
 You are the REVIEW pass of a Dozer dev lane, working inside a dedicated git worktree on branch $BRANCH.
 Judge, don't build: change NOTHING except the review file. Given the spec and the diff
 of this branch below, decide whether the implementation satisfies the spec and is sound
-($DESIGN_FILE is the architect pass's plan — check the build followed it). Then write
+($_REVIEW_PLAN_NOTE). Then write
 $REVIEW_FILE at the worktree root whose FIRST LINE is exactly "VERDICT: PASS" or
 "VERDICT: FAIL", followed by your reasons, and commit ONLY that file.
 Do NOT merge, push, switch branches, or remove this worktree.
@@ -822,22 +1017,30 @@ EOF
   }
 
   build_once ""
-  review_once
-  if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
-    _notes="$(cat "$WT/$REVIEW_FILE" 2>/dev/null || true)"
-    echo "    [dev] review failed — one rebuild with the review notes"
-    build_once "The REVIEW pass FAILED the previous build. Its notes ($REVIEW_FILE):
+  if pass_enabled review; then
+    review_once
+    if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
+      _notes="$(cat "$WT/$REVIEW_FILE" 2>/dev/null || true)"
+      echo "    [dev] review failed — one rebuild with the review notes"
+      build_once "The REVIEW pass FAILED the previous build. Its notes ($REVIEW_FILE):
 
 $_notes
 
 Fix what it names, then run the tests and commit."
-    review_once
-    if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
-      _notes="$(cat "$WT/$REVIEW_FILE" 2>/dev/null || true)"
-      fail "review failed TWICE — not merging (worktree kept, sent back). Review notes:
+      review_once
+      if [[ "$REVIEW_VERDICT" == "FAIL" ]]; then
+        _notes="$(cat "$WT/$REVIEW_FILE" 2>/dev/null || true)"
+        fail "review failed TWICE — not merging (worktree kept, sent back). Review notes:
 $(printf '%s\n' "$_notes" | head -n 40 | sed 's/^/      /')"
+      fi
+      unset _notes
     fi
-    unset _notes
+  else
+    # No judge on this profile. Deliberate, and stated plainly: the merge that follows
+    # is vouched for by the tests and the green-gate alone — which is exactly the trade
+    # `lite` exists to make, and exactly why it is opt-in per issue (GSAI-170).
+    REVIEW_VERDICT="SKIPPED"
+    echo "    [dev] review pass skipped (crew profile: $CREW_PROFILE) — tests + green-gate are the only gates on this merge"
   fi
 fi
 
@@ -962,7 +1165,8 @@ else agent_line="implemented + committed"; tests_line="gate passed"; gate_line="
 _models=""; for _p in "${PASS_ROWS[@]:-}"; do [[ -n "$_p" ]] && _models+="${_models:+ · }$_p"; done; unset _p
 cat > "$OUT/$ID.summary" <<EOF
 - Picked up: $TITLE$([[ $RESUMING == 1 ]] && echo " (RESUMED, attempt $attempt)")
-- models (architect → build → review): ${_models:-unresolved}
+- crew profile: $CREW_PROFILE ($CREW_REASON) — passes: ${CREW_PASSES// / → }
+- models: ${_models:-unresolved}
 - Worktree $BRANCH off $INTEG (isolated)
 - Coding agent: $agent_line
 - Tests: $tests_line

@@ -171,8 +171,55 @@ models:
   default: { provider: claude, model: "claude-opus-5" }
   dev:
     architect: { provider: ollama-cloud, model: "glm-5.3:cloud" }
-    build:     { provider: ollama-cloud, model: "kimi-k3:cloud" }
+    # max_turns (GSAI-170): the BUILD role's ceiling, in agent turns. The 2026-09-20
+    # spend audit attributed ~52% of ALL Ollama spend to this one role — its
+    # fix-the-failing-tests loop happily runs to the 1h timeout_model, and a
+    # wall-clock bound stops a HANG, never a LOOP. 60 turns is roughly the longest
+    # build that has ever actually landed; past it the pass is looping, not working.
+    # Per-run override: DOZER_MAX_TURNS_DEV_BUILD=<n> (or DOZER_MAX_TURNS for every
+    # role). Enforced as `claude -p --max-turns 60`; a provider whose CLI has no turn
+    # flag (codex) gets a wall-clock bound instead and the crew says so out loud.
+    build:     { provider: ollama-cloud, model: "kimi-k3:cloud", max_turns: 60 }
     review:    { provider: ollama-cloud, model: "glm-5.3:cloud" }
     small:     "glm-5.3-flash:cloud"
   marketing: { provider: ollama-cloud, model: "glm-5.3:cloud", small_model: "glm-5.3-flash:cloud" }
 ollama_env: "~/ecosystem/vault/ollama-cloud.env"   # where OLLAMA_API_KEY lives (vault-first); or export OLLAMA_API_KEY
+
+# ── Crew profiles (GSAI-170) — WHICH pipeline the dev lane runs for an issue ─────
+# `full` is the trio and the default: ARCHITECT writes the design, BUILD implements
+# it, REVIEW judges the diff. It is the right shape for code, and the wrong shape for
+# housekeeping — a label rename or a config line does not need a design document and a
+# second opinion, and paying for three model passes to get one is how the factory
+# spends its budget on its own paperwork.
+#
+# `lite` is ONE build pass, on the lane's cheap `small` route (models.dev.small,
+# promoted to a full route by tasks/model_route.py), under a 25-turn ceiling. What it
+# gives up is the design doc and the judge. What it does NOT give up is a single
+# mechanical gate: deps, the test gate, the no-output gate, the migration gate, the
+# serialized merge and the green-gate all still run. It trades a second opinion for
+# spend — never a guarantee.
+#
+#   passes       space-separated, in order; must include `build`
+#   max_turns    the profile's ceiling for EVERY pass it runs (exported as
+#                DOZER_MAX_TURNS, so it beats a role's own models.*.max_turns).
+#                `full` deliberately sets none — there each ROLE owns its budget.
+#   model_role   pin every pass to this role of the lane instead of its own dotted
+#                one (`small` -> models.dev.small). Unset = each pass keeps its route.
+#
+# SELECTION — dozers/dev-lane/crew.sh picks `lite` when ANY of these holds, else
+# `full`. DOZER_CREW=<profile> forces one run.
+crews:
+  full:
+    passes: "architect build review"
+  lite:
+    passes: "build"
+    max_turns: 25
+    model_role: small
+  lite_when_lanes: "ops"                          # comma-separated lane names
+  lite_when_label: "crew:lite"                    # one label, on the issue itself
+  lite_when_projects: "GSAI: Factory housekeeping"  # `|`-separated — project names carry commas AND colons
+  # A turn cap can only be handed to a CLI that has the flag (claude, and the ollama
+  # routes, which are Claude Code repointed). `codex exec` has none, so a capped pass
+  # routed there is bounded by wall clock instead — this many seconds, never more than
+  # the pass's own timeout_model. Reported loudly on every such pass.
+  turn_cap_wallclock_secs: 1800

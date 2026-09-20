@@ -95,9 +95,14 @@ def role_key(role):
     return "DOZER_MODEL_" + "".join(c if c.isalnum() else "_" for c in role).upper()
 
 
-# Keys on a nested lane entry that are NOT roles: `small` pins the small/fast model,
-# `small_model` is the accepted flat-entry spelling (also tolerated nested).
-LANE_META_KEYS = ("small", "small_model")
+# Keys on a nested lane entry that name the SMALL/FAST PIN: `small` is the nested
+# spelling, `small_model` the flat-entry one (also tolerated nested).
+LANE_SMALL_KEYS = ("small", "small_model")
+
+# Every key on a nested lane entry that is NOT a role — the small pin, plus the
+# lane-wide `max_turns:` budget (GSAI-170). A key listed here never becomes a row in
+# `show`, and never appears in the "this lane has roles X, Y" error text.
+LANE_META_KEYS = LANE_SMALL_KEYS + ("max_turns",)
 
 
 def lane_roles(entry):
@@ -105,6 +110,100 @@ def lane_roles(entry):
     if not isinstance(entry, dict) or "provider" in entry:
         return []
     return [r for r in entry if r not in LANE_META_KEYS]
+
+
+def _promote_small(lane, lane_entry, role):
+    """`<lane>.small` — the lane's small/fast PIN promoted to a full route (GSAI-170).
+
+    `small:` on a nested lane entry is a model ID, not a role: it exists to fill
+    ANTHROPIC_SMALL_FAST_MODEL so auto-compact and title-gen stop burning the main
+    model. The `lite` crew profile runs its ONE pass on exactly that cheap model, so
+    asking for the dotted role `<lane>.small` resolves the pin into a real route
+    instead of forcing a second copy of the same model id into config.
+
+    The PROVIDER comes from one of the lane's own roles — a pin is a model id ON the
+    lane's endpoint and carries no provider of its own. Deterministic pick: `build`
+    when the lane has it, else the first role by name.
+    """
+    pin = ""
+    for k in LANE_SMALL_KEYS:
+        v = lane_entry.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            die("`models.%s.%s` must be a model-id string" % (lane, k))
+        pin = v.strip()
+        if pin:
+            break
+    if not pin:
+        die(
+            "role %r asks for the lane's small/fast model but `models.%s` pins none — "
+            'add `small: "<model-id>"` to it' % (role, lane)
+        )
+    roles = sorted(lane_roles(lane_entry))
+    pick = "build" if "build" in roles else (roles[0] if roles else "")
+    if not pick:
+        die("`models.%s` has no role to take a provider from for %r" % (lane, role))
+    base = lane_entry.get(pick)
+    if not isinstance(base, dict) or "provider" not in base:
+        die("`models.%s.%s` must be a mapping with provider/model" % (lane, pick))
+    return (
+        str(base.get("provider") or "claude").strip(),
+        pin,
+        pin,
+        "config:models.%s.small (provider via models.%s.%s)" % (lane, lane, pick),
+    )
+
+
+def max_turns_key(role):
+    """DOZER_MAX_TURNS_<ROLE> — uppercased, non-alphanumerics folded to _."""
+    return "DOZER_MAX_TURNS_" + "".join(c if c.isalnum() else "_" for c in role).upper()
+
+
+# Providers whose CLI *is* Claude Code and therefore accepts `--max-turns`. The ollama
+# routes are Claude Code pointed at a different endpoint, so they take the same flag.
+# `codex exec` has no turn cap at all: a role routed there reports its budget as
+# UNSUPPORTED and the crew enforces a WALL-CLOCK budget instead (dev-lane/crew.sh).
+TURN_CAPPABLE = ("claude", "ollama-cloud", "ollama-local")
+
+
+def _turns(value, where):
+    s = str(value).strip()
+    if not s.isdigit() or int(s) < 1:
+        die("max_turns %r from %s must be a whole number of turns >= 1" % (value, where))
+    return s
+
+
+def resolve_max_turns(role, cfg, env):
+    """Agent-TURN ceiling for a role, or "" when uncapped. Most specific wins:
+
+        DOZER_MAX_TURNS_<ROLE>          env, this run (dots fold to _)
+        DOZER_MAX_TURNS                 env, this run, every role
+        models.<lane>.<role>.max_turns  config, this role
+        models.<lane>.max_turns         config, shared by the lane
+        (nothing)                       uncapped
+
+    Why (GSAI-170): the 2026-09-20 spend audit attributed ~52% of all Ollama spend to
+    the dev BUILD role, whose fix-the-failing-tests loop happily runs to the one-hour
+    timebox. A wall-clock bound stops a HANG; only a turn cap stops a LOOP.
+    """
+    for key in (max_turns_key(role), "DOZER_MAX_TURNS"):
+        v = (env.get(key) or "").strip()
+        if v:
+            return _turns(v, "env:" + key)
+    models = cfg.get("models") or {}
+    if not isinstance(models, dict):
+        return ""
+    lane, _, sub = role.partition(".")
+    lane_entry = models.get(lane)
+    if isinstance(lane_entry, dict):
+        if sub and "provider" not in lane_entry:
+            role_entry = lane_entry.get(sub)
+            if isinstance(role_entry, dict) and role_entry.get("max_turns") is not None:
+                return _turns(role_entry["max_turns"], "config:models.%s.max_turns" % role)
+        if lane_entry.get("max_turns") is not None:
+            return _turns(lane_entry["max_turns"], "config:models.%s.max_turns" % lane)
+    return ""
 
 
 def resolve_route(role, cfg, env):
@@ -138,6 +237,10 @@ def resolve_route(role, cfg, env):
         if lane_entry is not None and not isinstance(lane_entry, dict):
             die("`models.%s` must be a mapping" % lane)
         if isinstance(lane_entry, dict) and "provider" not in lane_entry:
+            # `dev.small` is the lane's pin asked for as a role (GSAI-170), not a
+            # missing role: resolve it here rather than dying on "must be a mapping".
+            if sub in LANE_SMALL_KEYS:
+                return _promote_small(lane, lane_entry, role)
             entry = lane_entry.get(sub)
             if entry is not None:
                 source = "config:models.%s" % role
@@ -145,7 +248,7 @@ def resolve_route(role, cfg, env):
                     die("`models.%s` must be a mapping with provider/model" % role)
                 small = str(entry.get("small_model") or "").strip()
             if not small:
-                for k in LANE_META_KEYS:
+                for k in LANE_SMALL_KEYS:
                     v = lane_entry.get(k)
                     if v is None:
                         continue
@@ -300,6 +403,21 @@ def build(role, cfg, env):
         if model:
             cmd += " --model " + shlex.quote(model)
 
+    # ── Turn cap (GSAI-170) ────────────────────────────────────────────────────────
+    # A budget the crew can SEE either way: DOZER_MODEL_MAX_TURNS is exported whether
+    # or not the flag went on, and DOZER_MODEL_MAX_TURNS_UNSUPPORTED marks the
+    # providers that cannot take it — the crew then bounds that pass by wall clock and
+    # says so, rather than pretending the loop is capped. Both names are cleared first
+    # so a value inherited from an earlier pass can never vouch for this one.
+    out.append("unset DOZER_MODEL_MAX_TURNS DOZER_MODEL_MAX_TURNS_UNSUPPORTED")
+    turns = resolve_max_turns(role, cfg, env)
+    if turns:
+        export("DOZER_MODEL_MAX_TURNS", turns)
+        if provider in TURN_CAPPABLE:
+            cmd += " --max-turns " + shlex.quote(turns)
+        else:
+            export("DOZER_MODEL_MAX_TURNS_UNSUPPORTED", "1")
+
     export("DOZER_MODEL_PROVIDER", provider)
     export("DOZER_MODEL_NAME", model)
     export("DOZER_MODEL_SOURCE", source)
@@ -341,6 +459,10 @@ def show(cfg, env):
         nested = lane_roles(entry)
         if nested and role != "default":
             rows.extend("%s.%s" % (role, sub) for sub in nested)
+            # The lane's small pin is a real route a crew can ask for (the `lite`
+            # profile runs on it, GSAI-170) — show it as its own row, after the roles.
+            if isinstance(entry, dict) and any(entry.get(k) for k in LANE_SMALL_KEYS):
+                rows.append("%s.small" % role)
         else:
             rows.append(role)
     print("%-12s %-14s %-24s %s" % ("ROLE", "PROVIDER", "MODEL", "SOURCE"))
@@ -354,6 +476,12 @@ def show(cfg, env):
         model = model or "(provider default)"
         if small:
             model += " (small: %s)" % small
+        try:
+            turns = resolve_max_turns(role, cfg, env)
+        except SystemExit:
+            turns = "?"
+        if turns:
+            model += " [max %s turns]" % turns
         print("%-12s %-14s %-24s %s" % (role, provider, model, source))
 
     path = expand(cfg.get("ollama_env") or DEFAULT_OLLAMA_ENV)
