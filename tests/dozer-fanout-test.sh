@@ -58,7 +58,12 @@ seed() {  # $1 = id, $2 = seconds
   mkdir -p "$BOARD/ready"; printf 'title: nap sleep=%s\nlane: nap\n' "$2" > "$BOARD/ready/$1.md"
 }
 engine() {  # $1 = mode, $2 = fanout, $3 = log
+  # DEFAULT_GROUP_SLOTS=9 neutralises the per-team cap (GSAI-169): every task here is a
+  # `NAP-*`, i.e. one "team", which would otherwise land in the shared default group and
+  # be throttled to 1 crew. This test is about SLOTS outliving a poll, not about team
+  # budgets — those have their own regression in tests/dozer-group-cap-test.sh.
   env -u DOZER_MODEL_DEV -u MODEL_CMD BACKEND=files ADAPTER_QUIET=1 REAPER_ENABLED=0 \
+      DEFAULT_GROUP_SLOTS=9 \
       FANOUT="$2" POLL_SECONDS=1 HEARTBEAT_SECONDS=1 LOCK_DIR="$LOCKS" HEARTBEAT_FILE="$HB" \
       bash "$FAKE/dozers/dozer.sh" "$1" >"$3" 2>&1 &
   ENGINE_PID=$!

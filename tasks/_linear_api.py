@@ -11,6 +11,8 @@ Env it reads:
                    (LINEAR_TEAMS wins if both are set)
   DOZER_COMMENT_BY identity stamped on every scripted comment's
                    `<!-- board-note by:… -->` marker (GSAI-60)     — default dozer-engine
+  DOZER_STATE_DIR  where the engine's small ephemeral scratch lives — default ~/.dozers
+                   (today: the daily `no-kr-seen-<date>` log-dedupe set, GSAI-171)
 
 Label lifecycle (dozer:* = execution; lane:/repo: = routing):
   greenlight -> dozer:ready + lane:<name>          (a Director sets both) — and a RESET:
@@ -120,8 +122,12 @@ def state_id(tid, type_):
 # --- issue helpers ------------------------------------------------------------
 
 def issue(identifier):
+    # GSAI-173: project{name} + projectMilestone{name} ride along here too (spend
+    # visibility) — one extra round trip avoided for milestone()/project() below,
+    # and no risk to list_ready()'s own fetch, which stays untouched.
     d = gql('query($i:String!){ issue(id:$i){ id identifier title '
-            'team{ id key } state{ type } labels{ nodes{ id name } } } }', {"i": identifier})
+            'team{ id key } state{ type } labels{ nodes{ id name } } '
+            'project{ name } projectMilestone{ name } } }', {"i": identifier})
     iss = d["issue"]
     if not iss:
         die(f"no issue '{identifier}'")
@@ -143,6 +149,7 @@ def _fetch_team_issues(tid):
         d = gql('query($t:ID!,$n:Int!,$c:String){ issues(first:$n, after:$c, '
                 'filter:{team:{id:{eq:$t}}}){ pageInfo{ hasNextPage endCursor } nodes{ '
                 'identifier title team{ key } state{ type } priority createdAt '
+                'projectMilestone{ id name targetDate } '
                 'labels{ nodes{ name } } } } }',
                 {"t": tid, "n": _PAGE, "c": cursor})
         page = d["issues"]
@@ -244,25 +251,147 @@ def _priority_of(i):
     return p if isinstance(p, int) else 0
 
 
+def _kr_of(i):
+    """The issue's Milestone (Key Result) node, or None when it is not laddered to one."""
+    return i.get("projectMilestone") or None
+
+
+def _kr_due(i):
+    """The KR's target date as Linear returns it — a TimelessDate string "YYYY-MM-DD",
+    which sorts correctly as plain text. "" when there is no milestone or no date on it."""
+    return (_kr_of(i) or {}).get("targetDate") or ""
+
+
 def _priority_key(i):
-    """Sort key: urgent first, no-priority LAST (Linear's own ordering does the same),
-    tiebreak oldest createdAt first. GSAI-105: the greenlit queue used to come out in
-    whatever order Linear happened to return it, and drain() claims top-down — so the
-    Dozer's pick order was a lottery and a Director's only "build this first" lever was
-    hoarding greenlights. The list order IS the fleet's pick order; sort it here and
-    priority becomes that lever."""
+    """Claim order, most significant field first:
+
+      1. the KR's targetDate, ASCENDING, nulls LAST  (GSAI-172)
+      2. Linear priority: urgent first, no-priority LAST (Linear's own ordering agrees)
+      3. oldest createdAt first
+      4. identifier, so the sort is total and the order is reproducible
+
+    GSAI-105 put priority at the top and made the queue a plan instead of a lottery, but
+    priority is a per-ISSUE knob and the thing the factory is actually racing is a per-KR
+    DEADLINE. A P1 on a KR due in 90 days outranking anything under a KR due next week is
+    the wrong fleet: the date is the commitment, the priority is only how a Director
+    breaks ties inside one KR's window. So the date sorts first and priority sorts under
+    it. An issue with no dated KR sorts after every dated one (GSAI-171 refuses to run one
+    with no KR at all; a KR with no date is legal and simply carries no urgency claim).
+
+    The list order IS the fleet's pick order — drain() claims top-down."""
     p = _priority_of(i)
-    return (p if 1 <= p <= 4 else 5, i.get("createdAt") or "", i["identifier"])
+    due = _kr_due(i)
+    # (0, "2026-10-01") < (1, "") — a dated KR always precedes an undated one, and
+    # within the dated set the earlier date wins.
+    due_rank = (0, due) if due else (1, "")
+    return (due_rank, p if 1 <= p <= 4 else 5, i.get("createdAt") or "", i["identifier"])
+
+
+# --- GSAI-171: no Key Result, no run -----------------------------------------------
+# The doctrine has always been "every issue must ladder to a Project/Milestone", and the
+# Directors' precheck already computes `leak:no-kr` — but it only REPORTED. An un-laddered
+# issue that carried the greenlight still ran, so the ladder was advice and the label pair
+# was the whole gate. The engine now refuses: an issue with no Milestone is never claimed,
+# and it says so once, on the issue, where the Director who greenlit it will see it.
+#
+# Two separate idempotency mechanisms, on purpose:
+#   · the COMMENT is idempotent forever, by marker — `_no_kr_note` reads the issue's
+#     comments and posts only when `<!-- dozer-no-kr -->` is absent. This is the real
+#     guarantee; nothing else is trusted to prevent a duplicate.
+#   · the LOG LINE is deduped for a DAY, by a small on-disk set under ~/.dozers. Without
+#     it the poll reprints `skip: no-kr <ID>` every 30s forever and the loop log becomes
+#     unreadable. The set is an advisory noise-damper and nothing more: if it cannot be
+#     read or written, the worst case is a repeated log line and one extra comment-marker
+#     check — never a duplicate comment, never a claimed issue. It is keyed by date in the
+#     filename, so it "resets daily" by simply being a new file, and stale days are pruned.
+NO_KR_MARKER = "<!-- dozer-no-kr -->"
+NO_KR_BODY = ("Dozer refuses to run this until it is laddered to a Milestone (Key Result). "
+              + NO_KR_MARKER)
+
+
+def _has_kr(i):
+    """Laddered to a Key Result. The gate is the Milestone's EXISTENCE — a KR with no
+    target date is legal (it just carries no urgency claim; see _priority_key)."""
+    return _kr_of(i) is not None
+
+
+def _state_dir():
+    """Where the engine keeps its small ephemeral scratch. DOZER_STATE_DIR exists so a
+    test never writes into the live ~/.dozers."""
+    return os.path.expanduser(os.environ.get("DOZER_STATE_DIR") or "~/.dozers")
+
+
+def _no_kr_seen_path():
+    import datetime
+    return os.path.join(_state_dir(), f"no-kr-seen-{datetime.date.today().isoformat()}")
+
+
+def _no_kr_seen_load(path):
+    try:
+        with open(path) as f:
+            return {ln.strip() for ln in f if ln.strip()}
+    except OSError:
+        return set()
+
+
+def _no_kr_seen_add(path, identifier):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Prune the other days' sets: this is what makes "resets daily" true on disk
+        # rather than only in the filename.
+        base = os.path.basename(path)
+        for name in os.listdir(os.path.dirname(path)):
+            if name.startswith("no-kr-seen-") and name != base:
+                try:
+                    os.remove(os.path.join(os.path.dirname(path), name))
+                except OSError:
+                    pass
+        with open(path, "a") as f:
+            f.write(identifier + "\n")
+    except OSError:
+        pass  # advisory only — see the block comment above
+
+
+def _no_kr_note(identifier):
+    """Post the refusal comment, once ever. Idempotent by marker: a body already carrying
+    NO_KR_MARKER means it has been said. Returns True when it actually posted."""
+    for c in _issue_comments(identifier):
+        if NO_KR_MARKER in (c.get("body") or ""):
+            return False
+    comment(identifier, NO_KR_BODY)   # already marked, so _stamp_marker is a no-op
+    return True
+
+
+def _refuse_no_kr(identifier):
+    """Say it once a day in the log, once ever on the issue. Deliberately NOT wrapped in
+    a try: a Linear call that fails here fails loudly like every other call in this file
+    (doctrine: no silent fallbacks). The seen-set is written only AFTER the note lands, so
+    a failed post is retried on the next poll rather than swallowed by the cache."""
+    path = _no_kr_seen_path()
+    if identifier in _no_kr_seen_load(path):
+        return
+    print(f"skip: no-kr {identifier}", file=sys.stderr)
+    _no_kr_note(identifier)
+    _no_kr_seen_add(path, identifier)
 
 
 def list_ready():
-    ready = sorted((i for i in _all_issues() if _is_ready(i)), key=_priority_key)
-    for i in ready:
-        # 4th column carries the priority so dozer.sh can log WHY a task was picked
-        # ("" when the issue has none). See the contract in tasks/adapter.sh.
+    claimable = []
+    for i in _all_issues():
+        if not _is_ready(i):
+            continue
+        if not _has_kr(i):
+            _refuse_no_kr(i["identifier"])   # logs + comments; never claimed (GSAI-171)
+            continue
+        claimable.append(i)
+    for i in sorted(claimable, key=_priority_key):
+        # Columns 4 and 5 carry the KEY the sort ran on, so dozer.sh can log WHY a task
+        # was picked rather than just that it was: the priority ("" when the issue has
+        # none) and the KR's target date ("" when there is no dated milestone). See the
+        # contract in tasks/adapter.sh.
         p = _priority_of(i)
         prio = str(p) if 1 <= p <= 4 else ""
-        print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}\t{prio}')
+        print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}\t{prio}\t{_kr_due(i)}')
 
 
 def mark_ready(identifier, lane):
@@ -391,6 +520,47 @@ def requeue(identifier):
 
 def team(identifier):
     print(issue(identifier)["team"]["key"])
+
+
+def crew_meta(identifier):
+    """The facts the CREW-PROFILE selector needs: the issue's project + its labels.
+
+    GSAI-170. `issue()` already carries labels, but not `project { name }` — and the
+    selector wants one round trip, not two. Output is tab-separated `<kind>\t<value>`
+    lines, so a name carrying spaces, commas or a colon ("GSAI: Factory housekeeping")
+    survives intact:
+
+        project\tGSAI: Factory housekeeping
+        label\tlane:ops
+        label\tcrew:lite
+
+    An issue with no project prints no `project` line. The DECISION lives in
+    dozers/dev-lane/crew.sh; this verb only reports.
+    """
+    d = gql('query($i:String!){ issue(id:$i){ project{ name } '
+            'labels{ nodes{ name } } } }', {"i": identifier})
+    iss = d["issue"]
+    if not iss:
+        die(f"no issue '{identifier}'")
+    name = ((iss.get("project") or {}).get("name") or "").strip()
+    if name:
+        print(f"project\t{name}")
+    for n in iss["labels"]["nodes"]:
+        print(f"label\t{n['name']}")
+
+
+def milestone(identifier):
+    """The issue's Key Result (Linear Milestone) name — empty if unlinked (GSAI-173:
+    spend-visibility log fields). Defensive: an issue type/API response that omits
+    projectMilestone entirely (not just null) must still print nothing, not crash."""
+    m = issue(identifier).get("projectMilestone") or {}
+    print(m.get("name") or "")
+
+
+def project(identifier):
+    """The issue's Objective (Linear Project) name — empty if unlinked (GSAI-173)."""
+    p = issue(identifier).get("project") or {}
+    print(p.get("name") or "")
 
 
 def description(identifier):
@@ -630,7 +800,11 @@ def count_ready():
     teams — the third alarm row (alive but not dispatching) needs the number, not the list."""
     # Same predicate as list_ready — the watchdog must count exactly what the poll would
     # dispatch, or "alive but not dispatching" fires on a queue the Dozer cannot see.
-    print(sum(1 for i in _all_issues() if _is_ready(i)))
+    # GSAI-171: that now includes the KR gate. An un-laddered greenlit issue is work the
+    # engine REFUSES, not work it is failing to get to, so counting it would alarm the
+    # watchdog forever on a queue no drain will ever shorten. Read-only on purpose: the
+    # log line and the refusal comment belong to list_ready, not to a health probe.
+    print(sum(1 for i in _all_issues() if _is_ready(i) and _has_kr(i)))
 
 
 OPS = {
@@ -645,6 +819,9 @@ OPS = {
     "comment": lambda a: comment(a[0], a[1]),
     "repo": lambda a: repo(a[0]),
     "team": lambda a: team(a[0]),
+    "crew-meta": lambda a: crew_meta(a[0]),
+    "milestone": lambda a: milestone(a[0]),
+    "project": lambda a: project(a[0]),
     "description": lambda a: description(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),

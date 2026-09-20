@@ -24,9 +24,122 @@ source "$ROOT/tasks/adapter.sh"
 export DOZER_COMMENT_BY="dozer-engine"
 
 cfg() { grep -E "^$1:" "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//; s/#.*//; s/[[:space:]]*$//; s/"//g' || true; }
+
+# GSAI-173: spend-visibility fields, appended to every claim/finish line in run_one so
+# scripts/spend-by-kr.sh can roll the loop log up by Key Result without a Linear call.
+# ONE definition of the format (not inlined at each echo) — a backend without
+# task_milestone/task_project (files, github) just gets empty strings, never an error.
+#   start/claim line:  team=<KEY> milestone="<name>" project="<name>" profile=<full|lite> ts=<epoch>
+#   finish line:       ...same...  duration_s=<n> requests=<n-or-empty>
+# profile is per-LANE, not per-run: the dev lane always runs its 3-pass pipeline
+# (architect/build/review — see dev-lane/crew.sh PASS_ROWS) so it is the "full" spend
+# shape; every other lane (marketing today) is a single content-model pass — "lite".
+# ts is an epoch second, not in the original spec's field list — added so
+# spend-by-kr.sh's --days window means something: the log's existing timestamps are
+# HH:MM:SS-only (`[dozer] poll` lines), no date, so a claim/finish line on its own
+# carries no day at all without this. Lines written before this change have no ts
+# either way and fall back to "always included" in the aggregator (documented there).
+run_log_profile() { case "$1" in dev) echo full ;; *) echo lite ;; esac; }
+run_log_fields() {  # <team> <milestone> <project> <profile>
+  printf 'team=%s milestone="%s" project="%s" profile=%s ts=%s' "$1" "$2" "$3" "$4" "$(date +%s)"
+}
+run_log_requests() {  # <requests-file> -> the crew's own count, or "" if it never wrote one
+  [[ -s "$1" ]] && tr -d '[:space:]' < "$1" 2>/dev/null
+  return 0
+}
 POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
+
+# ── Per-team crew-slot caps (GSAI-169) ─────────────────────────────────────────
+# `fanout` is a GLOBAL cap, and a global cap is won by whoever greenlights the most.
+# That is how the factory ends up building the factory: the 2026-09-20 audit found 57%
+# of the Ollama allowance going to GSAI housekeeping — engine chores, monitors, registry
+# hygiene — while CFW, the team with actual customers, queued behind them. Every one of
+# those tasks was legitimately greenlit; none was worth half the fleet.
+#
+# So slots are budgeted per GROUP of teams (org/config.yaml → fanout_by_group), and
+# drain() never claims an issue whose group already holds its cap in live crew locks —
+# it skips PAST it to the next eligible issue from another group. A saturated group
+# costs that group throughput and nobody else's.
+#
+# This changes only WHO may be claimed right now, never the ORDER: the queue is still
+# sorted by KR date then priority (GSAI-172/105), and drain still walks it top-down.
+#
+# GROUP_TEAMS[i] is the group's team list, space-padded (" CFW GSAI ") so a match is
+# whole-word; GROUP_SLOTS[i] is its cap. Parallel indexed arrays rather than an
+# associative one — this file is deliberately readable bash, and the arrays are tiny.
+# A team in no group falls into ONE shared default group, index ${#GROUP_SLOTS[@]},
+# with DEFAULT_GROUP_SLOTS (1) — so a newly added team can never quietly take the whole
+# fleet before somebody budgets it.
+GROUP_TEAMS=(); GROUP_SLOTS=()
+DEFAULT_GROUP_SLOTS="${DEFAULT_GROUP_SLOTS:-1}"
+
+load_groups() {
+  local cfgf="$ROOT/org/config.yaml" line teams slots sum=0
+  # A tiny targeted parser, not a YAML dependency: this repo ships no package manager on
+  # purpose, and cfg() (a grep for `^key:`) cannot read a list. Reads the flow-style
+  # `- { teams: [A, B], slots: N }` rows under `fanout_by_group:` and stops at the next
+  # top-level key.
+  while IFS= read -r line; do
+    teams="$(sed -n 's/.*teams:[[:space:]]*\[\([^]]*\)\].*/\1/p' <<<"$line")"
+    slots="$(sed -n 's/.*slots:[[:space:]]*\([0-9][0-9]*\).*/\1/p' <<<"$line")"
+    [[ -n "$teams" && -n "$slots" ]] || continue
+    teams="$(tr ',' ' ' <<<"$teams" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
+    [[ -n "$teams" ]] || continue
+    GROUP_TEAMS+=(" $teams "); GROUP_SLOTS+=("$slots"); sum=$(( sum + slots ))
+  done < <(awk '/^fanout_by_group:/{f=1;next} f&&/^[^[:space:]#-]/{exit} f&&/^[[:space:]]*-/{print}' "$cfgf" 2>/dev/null || true)
+  # A sum over fanout cannot over-subscribe the engine (fanout still caps globally) but
+  # it makes these numbers a fiction — the groups would race for a pool smaller than
+  # their budgets, which is the lottery the caps exist to end. Say so, loudly.
+  if (( ${#GROUP_SLOTS[@]} && sum > FANOUT )); then
+    echo "[dozer] WARNING: fanout_by_group slots sum to $sum but fanout is $FANOUT — the caps are a fiction until one of the two is fixed (org/config.yaml)." >&2
+  fi
+}
+
+team_of() { printf '%s' "${1%%-*}"; }   # CFW-237 -> CFW (an id with no dash is its own team)
+
+group_index() {  # <team> -> the group's array index, or ${#GROUP_SLOTS[@]} = the default group
+  local team="$1" i
+  for (( i = 0; i < ${#GROUP_TEAMS[@]}; i++ )); do
+    [[ "${GROUP_TEAMS[i]}" == *" $team "* ]] && { printf '%s' "$i"; return 0; }
+  done
+  printf '%s' "${#GROUP_SLOTS[@]}"
+}
+
+group_cap() {  # <group index> -> its slot cap
+  local gi="$1"
+  if (( gi < ${#GROUP_SLOTS[@]} )); then printf '%s' "${GROUP_SLOTS[gi]}"
+  else printf '%s' "$DEFAULT_GROUP_SLOTS"; fi
+}
+
+# Live crew locks per group, one count per index (groups, then the default group last).
+# Counts LOCKS, not $CREWS: the lock dir is the cross-drain, cross-process truth, and a
+# crew launched by an earlier drain holds no pid in this shell's CREWS array anyway. Same
+# three exclusions as inflight_count — a Director's mutex, an owner-less lock, and a lock
+# whose owner pid is dead (a crashed crew is the reaper's problem, and counting it would
+# starve a group of a slot nothing is using).
+group_live_counts() {
+  # `gn`, not `n`: inflight_count above uses `n` as a scalar, and one name meaning two
+  # shapes in one file is a shellcheck warning and a reader's trap.
+  local -a gn=(); local IFS=' '; local i lock pid id
+  for (( i = 0; i <= ${#GROUP_SLOTS[@]}; i++ )); do gn[i]=0; done
+  shopt -s nullglob
+  for lock in "$LOCK_DIR"/*.lock; do
+    case "${lock##*/}" in director-*.lock) continue ;; esac
+    [[ -f "$lock/owner" ]] || continue
+    pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+    { [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; } || continue
+    id="$( { grep -E '^task=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+    [[ -n "$id" ]] || id="$(basename "$lock" .lock)"
+    i="$(group_index "$(team_of "$id")")"
+    gn[i]=$(( ${gn[i]:-0} + 1 ))
+  done
+  shopt -u nullglob
+  printf '%s' "${gn[*]}"
+}
+
+load_groups
 # Liveness heartbeat: a single beacon the engine keeps fresh, so an external watcher
 # (dozers/heartbeat-check.sh, or `doctor`) can tell the loop is still alive and how
 # busy it is.
@@ -263,8 +376,8 @@ resolve_workdir() {
 }
 
 # Always invoked backgrounded (own subshell), so the EXIT trap + lock are scoped.
-run_one() { # <id> <lane> <title> [priority]
-  local id="$1" lane="$2" title="$3" prio="${4:-}"
+run_one() { # <id> <lane> <title> [priority] [kr-due]
+  local id="$1" lane="$2" title="$3" prio="${4:-}" kr="${5:-}"
   # atomic local mutex so parallel Dozers never double-grab the same task
   local lock="$LOCK_DIR/${id//\//_}.lock"
   if ! mkdir "$lock" 2>/dev/null; then echo "  ~ #$id locked locally, skipping"; return 0; fi
@@ -293,23 +406,36 @@ run_one() { # <id> <lane> <title> [priority]
 
   if ! task_claim "$id"; then echo "  ~ #$id already claimed, skipping" >&2; return 0; fi
   task_comment "$id" "Dozer claimed - lane:$lane. Starting now; will post a summary on finish."
-  # GSAI-105: log the priority the pick was ordered by, so a drain log reads as a plan,
-  # not a lottery. Empty when the backend/issue carries no priority.
-  echo "  -> #$id [$lane]${prio:+ p$prio} $title"
+
+  # GSAI-173: spend-visibility metadata for this run, fetched once so the claim line
+  # and the finish line agree. task_milestone/task_project are Linear-only (see
+  # tasks/linear.sh) — a backend without them (files, github) just logs them empty,
+  # same fail-open contract as task_description above.
+  local rl_team rl_milestone="" rl_project="" rl_profile rl_t0=$SECONDS
+  rl_team="$(task_team "$id" 2>/dev/null || true)"
+  if declare -F task_milestone >/dev/null 2>&1; then rl_milestone="$(task_milestone "$id" 2>/dev/null || true)"; fi
+  if declare -F task_project >/dev/null 2>&1; then rl_project="$(task_project "$id" 2>/dev/null || true)"; fi
+  rl_profile="$(run_log_profile "$lane")"
+
+  # GSAI-105 / GSAI-172: log the SORT KEY the pick was ordered by, so a drain log reads
+  # as a plan, not a lottery — the KR's target date (the commitment the fleet is racing)
+  # and then the issue priority (the tiebreak inside that KR's window). Either field is
+  # empty when the backend/issue carries no such value. GSAI-173 appends the
+  # team/milestone/project/profile fields so the claim line and the finish line agree.
+  echo "  -> #$id [$lane]${prio:+ p$prio}${kr:+ kr-due:$kr} $title  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile")"
 
   # Routing is a PREFLIGHT (GSAI-131): a task that cannot be routed to a repo is
   # blocked here, with the resolver's real error, before a crew — and therefore before
   # a worktree, a branch or a commit — exists anywhere. The engine never guesses.
-  local hint team workdir wd_err wd_errf
+  local hint team="$rl_team" workdir wd_err wd_errf
   hint="$(task_repo "$id" 2>/dev/null || true)"
-  team="$(task_team "$id" 2>/dev/null || true)"
   wd_errf="$(mktemp "${TMPDIR:-/tmp}/dozer-route.XXXXXX" 2>/dev/null)" || wd_errf="/tmp/dozer-route.$BASHPID"
   if ! workdir="$(resolve_workdir "$hint" "$team" 2>"$wd_errf")"; then
     wd_err="$(head -c 2000 "$wd_errf" 2>/dev/null || true)"; rm -f "$wd_errf" 2>/dev/null || true
     [[ -n "$wd_err" ]] || wd_err="workdir resolution failed without a reason"
     task_block "$id"
     task_comment "$id" "$(printf 'Dozer blocked BEFORE any work - could not resolve a working directory, so no crew ran, no worktree was created and no branch was cut.\n  repo hint: %s\n  team: %s\nReason: %s' "${hint:-<none>}" "${team:-<none>}" "$wd_err")"
-    echo "  x #$id unroutable: $wd_err" >&2
+    echo "  x #$id unroutable: $wd_err  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=0" >&2
     return 0
   fi
   rm -f "$wd_errf" 2>/dev/null || true
@@ -324,7 +450,14 @@ run_one() { # <id> <lane> <title> [priority]
   # The merge receipt (GSAI-119) rides with the other artifacts: a STALE receipt from a
   # previous run must never vouch for this one, so it is deleted up front like the rest.
   local merge_file="$art/$id.merge"
-  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" 2>/dev/null || true
+  # <id>.meta (GSAI-170): the crew-profile facts, same stale-artifact discipline.
+  local meta_file="$art/$id.meta"
+  # GSAI-173: the crew's own count of model invocations (dev-lane: PASS_ROWS length;
+  # mktg-lane: 0 or 1) — the finish line's requests=N. A crew that never writes this
+  # file (an older crew, or a lane that added none of this) logs requests= empty; see
+  # run_log_requests below.
+  local requests_file="$art/$id.requests"
+  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" "$meta_file" "$requests_file" 2>/dev/null || true
 
   # The brief (GSAI-7): the task's description, handed to the crew as a FILE so a lane
   # can route on what the Director wrote — the marketing lane treats a `production:`
@@ -338,7 +471,20 @@ run_one() { # <id> <lane> <title> [priority]
     : > "$brief_file"
   fi
 
-  if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" DOZER_BRIEF="$brief_file" "$crew" "$id" "$title"; then
+  # The crew-profile facts (GSAI-170): the issue's PROJECT and its LABELS, fetched
+  # here because this is the one place that speaks to the backend adapter. The crew
+  # makes the DECISION (dozers/dev-lane/crew.sh) from this file plus DOZER_LANE.
+  # Best-effort, exactly like the brief: a backend with no task_crew_meta, or a fetch
+  # that fails, leaves the file EMPTY — and an empty file is no signal, which the
+  # crew reads as the full trio. A backend that cannot answer must never be able to
+  # quietly downgrade a code task to a single uncritiqued pass.
+  : > "$meta_file"
+  if declare -F task_crew_meta >/dev/null 2>&1; then
+    task_crew_meta "$id" > "$meta_file" 2>/dev/null || : > "$meta_file"
+  fi
+
+  if WORKDIR="$workdir" DOZER_PERSONA="$persona" REPO_ROOT="$ROOT" DOZER_BRIEF="$brief_file" \
+     DOZER_LANE="$lane" DOZER_CREW_META="$meta_file" "$crew" "$id" "$title"; then
     local verb VERIFY_PROOF=""
     if [[ "$lane" == "marketing" ]]; then
       task_review "$id"; verb="staged for review"
@@ -357,7 +503,7 @@ run_one() { # <id> <lane> <title> [priority]
       if (( vrc != 0 )); then
         task_block "$id"
         task_comment "$id" "$(printf 'Dozer blocked AFTER the crew reported success — the claimed merge could NOT be verified against %s, so the issue is NOT labeled dozer:merged-develop (GSAI-119).\n\nReason: %s' "$workdir" "$vout")"
-        echo "  x #$id crew succeeded but the merge did not verify — blocked: ${vout%%$'\n'*}" >&2
+        echo "  x #$id crew succeeded but the merge did not verify — blocked: ${vout%%$'\n'*}  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
         return 0
       fi
       echo "    verify-merge: $vout"
@@ -374,14 +520,14 @@ run_one() { # <id> <lane> <title> [priority]
     # the handoff note rides the same comment (capped so a runaway note can't flood it)
     if [[ -s "$handoff_file" ]]; then body="$(printf '%s\n\nHandoff note from the crew:\n%s' "$body" "$(head -c 4000 "$handoff_file")")"; fi
     task_comment "$id" "$(printf 'Dozer %s - lane:%s\n%s' "$verb" "$lane" "$body")"
-    echo "  ok #$id $verb"
+    echo "  ok #$id $verb  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")"
   else
     local reason
     if [[ -s "$fail_file" ]]; then reason="$(head -c 2000 "$fail_file")"
     else reason="crew exited without recording a reason — see the Dozer loop log (~/.dozers/logs/loop.err.log)"; fi
     task_block "$id"
     task_comment "$id" "$(printf 'Dozer blocked in lane:%s - needs a look.\nReason: %s' "$lane" "$reason")"
-    echo "  x #$id failed: $reason" >&2
+    echo "  x #$id failed: $reason  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
   fi
 }
 
@@ -414,21 +560,38 @@ reap_crews() {  # drop finished crews from CREWS (collect their status); keep th
 
 drain() {  # fill the free slots from the ready list; returns immediately, never waits on a crew
   reap_crews
-  # The ready list arrives in claim order (GSAI-105: backend priority, then oldest
-  # first — see tasks/adapter.sh); claiming top-down is what orders the fleet.
-  local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 id lane title prio
-  while IFS=$'\t' read -r id lane title prio; do
+  # The ready list arrives in claim order (GSAI-172: the KR's target date, then backend
+  # priority, then oldest first — see tasks/adapter.sh); claiming top-down orders the fleet.
+  local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 capped=0
+  local id lane title prio kr team gi cap
+  # GSAI-169: per-group live counts, taken ONCE at the top of the drain and then
+  # incremented as this drain launches, because a crew's lock is written by the
+  # backgrounded subshell and is not guaranteed to exist yet when the next row is read.
+  local -a gcount gskip=(); read -r -a gcount <<<"$(group_live_counts)"
+  while IFS=$'\t' read -r id lane title prio kr; do
     [[ -z "$id" ]] && continue; seen=$((seen+1))
     # Already in flight on this host (its crew holds a slot): the backend just hasn't
     # caught up. Don't burn a slot on a crew that would only say "locked, skipping".
     [[ -d "$LOCK_DIR/${id//\//_}.lock" ]] && continue
     if (( launched >= free )); then queued=$((queued+1)); continue; fi
-    run_one "$id" "$lane" "$title" "$prio" &
-    CREWS+=("$!"); launched=$((launched+1))
+    # The group cap: skip PAST a saturated group to the next eligible issue rather than
+    # blocking on it. Logged once per group per drain — the invariant is worth a line,
+    # ten identical lines are not.
+    team="$(team_of "$id")"; gi="$(group_index "$team")"; cap="$(group_cap "$gi")"
+    if (( ${gcount[gi]:-0} >= cap )); then
+      capped=$((capped+1))
+      [[ -n "${gskip[gi]:-}" ]] || { gskip[gi]=1; echo "  ~ skip: group-cap $team ${gcount[gi]:-0}/$cap"; }
+      continue
+    fi
+    run_one "$id" "$lane" "$title" "$prio" "$kr" &
+    CREWS+=("$!"); launched=$((launched+1)); gcount[gi]=$(( ${gcount[gi]:-0} + 1 ))
   done < <(task_list_ready)
   if (( seen == 0 )); then echo "  (nothing ready)"
-  elif (( queued )); then echo "  ~ $queued ready but waiting: all $FANOUT slots busy (started $launched this poll)"
+  else
+    (( capped )) && echo "  ~ $capped ready but deferred by a group cap (started $launched this poll)"
+    (( queued )) && echo "  ~ $queued ready but waiting: all $FANOUT slots busy (started $launched this poll)"
   fi
+  return 0
 }
 
 # Sleep for up to $1 seconds, but wake early the moment any crew finishes, so its slot

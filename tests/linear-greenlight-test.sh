@@ -23,8 +23,12 @@ spec = importlib.util.spec_from_file_location("lin", "_linear_api.py")
 lin = importlib.util.module_from_spec(spec); spec.loader.exec_module(lin)
 
 def iss(ident, state, *labels):
+    # Every fixture is laddered to a Milestone: GSAI-171 refuses an un-laddered issue,
+    # and this test is about the GREENLIGHT gate, not the KR gate (which has its own
+    # regression in tests/linear-kr-gate-test.sh).
     return {"identifier": ident, "title": "t", "team": {"key": "T"},
             "state": {"type": state}, "priority": 0, "createdAt": "2026-09-01T00:00:00Z",
+            "projectMilestone": {"id": "m1", "name": "KR one", "targetDate": "2026-12-01"},
             "labels": {"nodes": [{"name": l} for l in labels]}}
 
 # --- 1 + 2: what the poll sees -------------------------------------------------

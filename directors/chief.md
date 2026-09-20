@@ -45,6 +45,14 @@ through a lane-Director.
    Projects. You never add `dozer:ready`+lane yourself (that's a lane-Director's greenlight).
 4. **Review direction** the Directors report up; approve or redirect.
 5. **Escalate** what only the human can decide.
+6. **Spend by Key Result (7d).** Run `scripts/spend-by-kr.sh --days 7` (repo `~/Code/dozers`
+   — no LLM, reads the loop log directly) and paste its table verbatim into your digest
+   under a **"Spend by Key Result (7d)"** heading, one pass per KR: which Objective/Milestone
+   the fleet's spend is actually landing on, not just which lane. Follow it with **one line**
+   flagging any single KR whose share exceeds **40%** — that's a concentration call for you,
+   not the lane-Directors: redirect, split the KR, or explicitly bless it. A catch-all row
+   with no milestone above 40% is the same flag, aimed at the OKR-tree hygiene in step 2
+   instead (unlinked work spending real money).
 
 ## Across teams
 
