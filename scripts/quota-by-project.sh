@@ -194,6 +194,13 @@ if os.path.exists(MAPFILE):
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 3 and parts[0]:
                 ISSUE_MAP[parts[0]] = (parts[1], parts[2])
+else:
+    # Not fatal — the report still stands up, every issue just lands in "(no project)",
+    # which is the one failure mode that would make the table look like the factory has
+    # no projects rather than like the map is missing. So say it out loud.
+    print("quota-by-project.sh: no issue->project map at %s — every issue-bearing "
+          "session will show as '(no project)'. Build it with --refresh-map." % MAPFILE,
+          file=sys.stderr)
 
 # ── repo -> team, from the registry (orgs[].linear_team + projects[].local) ─────
 # Parsed with a tolerant line reader rather than PyYAML: the registry is a plain
