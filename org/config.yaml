@@ -55,6 +55,44 @@ fanout_by_group:
   - { teams: [GSAI], slots: 1 }
   - { teams: [LL, BRD, DLY], slots: 1 }
 
+# ── The weekly focus (GSAI-176) ─────────────────────────────────────────────
+# Vasanth, 2026-09-20: "nail it down on only top three projects and make it meaningful
+# for the next one week."
+#
+# The greenlight answers "may this run?". It never answered "is this what we are doing
+# THIS WEEK?" — and a Director with a healthy lane will always find something legitimate
+# to greenlight, so the queue fills with real work that is not the work that matters.
+# While a focus is ACTIVE the engine claims ONLY issues whose Linear PROJECT is named
+# here; everything else keeps its greenlight and simply waits its turn until the window
+# closes. The Directors read the same block and refuse to greenlight outside it.
+#
+#   projects   EXACT Linear project names — the gate is a string match, not a fuzzy one.
+#              Verify against Linear before editing (the name is "MGG: Reels", not
+#              "BRD: MGG Reels" — BRD is the TEAM, not part of the name).
+#   until      ISO date, INCLUSIVE — the last day the focus binds. Non-negotiable: a
+#              focus with no expiry is just a smaller factory, forever.
+#   note       one line, shown in every Director digest — WHY these three.
+#
+# ACTIVE = projects non-empty AND `until` a real YYYY-MM-DD AND today <= until. Anything
+# else — empty list, garbled date, a date that has passed — means NO focus and the engine
+# behaves exactly as it did before, which is the deliberate fail-open direction: a stale
+# config must never be able to silently stop the factory. It is never SILENT about it
+# either: the reason is printed in the Dozer's banner, once an hour in its log, and on
+# every Director's precheck line.
+#
+# ESCAPE HATCH: the label `focus:override` on an issue passes the gate. Production
+# outage or a Vasanth ask only — the Director justifies it in a comment
+# (`<!-- focus-override by:<name> reason:… -->`) and the Chief lists every one in its
+# digest. See directors/LINEAR.md § "Weekly focus".
+#
+# An out-of-focus skip posts NO Linear comment (hundreds of issues are out of focus in
+# any week — that would be spam). It gets one stderr line per issue per day plus one
+# summary line per poll: `focus: <n> in-focus ready, <m> out-of-focus skipped`.
+focus:
+  projects: ["CFW: Sellable V1", "CFW: Platform Publishers", "MGG: Reels"]
+  until: "2026-09-27"
+  note: "Week of 2026-09-20: first revenue (10 paying brands), publish path live, MGG content engine. Everything else waits."
+
 # Only used when backend: github
 repo: "OWNER/REPO"             # e.g. acme/dozers
 

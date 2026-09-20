@@ -155,12 +155,15 @@ get2() { sed -n "s/^$1=//p" <<<"$out2"; }
 
 # 12. The contract sentence is in LINEAR.md, and no Director template carries a stray
 #     `board-*`-only rule or invents a marker name outside the `<name>-<purpose>` shape.
+#     `focus-override` joined the allowlist with GSAI-176: it is a PROTOCOL marker like
+#     the board-* three (the Chief reads it back out of the issue to list every override
+#     in its digest), not a Director inventing a name for its own comments.
 grep -qF "an unmarked comment is Vas" "$ROOT/directors/LINEAR.md" && ok "LINEAR.md states the contract: an agent comment MUST carry a marker; an unmarked comment is Vas" || bad "LINEAR.md is missing the one-sentence contract"
 grep -q 'no `board-\*` marker' "$ROOT/directors/LINEAR.md" && bad "LINEAR.md still carries the narrow 'no board-* marker' rule" || ok "LINEAR.md no longer scopes the reconcile rule to board-* markers"
 for t in chief dev-director mktg-director ops-director; do
   f="$ROOT/directors/$t.md"
   grep -qF -- '-<purpose>' "$f" && ok "$t.md: every comment carries a <name>-<purpose> marker" || bad "$t.md: no marker rule"
-  grep -Eo '<!--[^>]*-->' "$f" | grep -Ev '<!-- *(board-(ask|mirror|clear)|<(your-)?name>-<purpose>)' | grep -q . && bad "$t.md: stray marker literal: $(grep -Eo '<!--[^>]*-->' "$f" | tr '\n' ' ')" || ok "$t.md: no stray marker literals"
+  grep -Eo '<!--[^>]*-->' "$f" | grep -Ev '<!-- *(board-(ask|mirror|clear)|focus-override|<(your-)?name>-<purpose>)' | grep -q . && bad "$t.md: stray marker literal: $(grep -Eo '<!--[^>]*-->' "$f" | tr '\n' ' ')" || ok "$t.md: no stray marker literals"
 done
 
 # 13/14/15. GSAI-60 — the incident's fix. STAMP: every scripted comment self-marks at

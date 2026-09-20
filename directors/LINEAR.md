@@ -75,6 +75,38 @@ An **artifact to judge** also gets `ln -s <abs-path> ~/ecosystem/board/review/<I
 **Act on every `board:responded` issue you own in the same awake** — progress it, re-greenlight the Dozer, or ask
 again (fresh `board-ask` + `board:to_review`) — then **remove `board:responded`**. Nothing may sit there across two awakes.
 
+## Weekly focus — the only work that may be greenlit right now
+
+`org/config.yaml` in `~/Code/dozers` carries a **`focus:`** block: a short list of exact
+Linear **project names** and an **`until:`** date.
+
+```yaml
+focus:
+  projects: ["CFW: Sellable V1", "CFW: Platform Publishers", "MGG: Reels"]
+  until: "2026-09-27"
+  note: "why these three, this week"
+```
+
+**Read it at the start of every pass.** While it is active (projects non-empty **and**
+today ≤ `until`):
+
+- **Greenlight ONLY issues under a focus project.** This is not a preference, it is the
+  gate: the Dozer refuses to claim anything else, so a greenlight outside the focus
+  produces a task that sits at `dozer:ready` until the window closes and fools your own
+  next pass into thinking work is in flight.
+- **Important out-of-focus work still gets filed and triaged** — spec it, ladder it to
+  its Project/Milestone, leave it **un-greenlit**, and mention it in **one line** of your
+  digest. You are deferring it, not losing it.
+- **`focus:override`** is the escape hatch and it is narrow: a **production outage** or a
+  **direct ask from Vasanth**. Nothing else. Add the label, and in the same pass post the
+  justification on the issue, last line
+  `<!-- focus-override by:<your name> reason:<one line> -->`.
+  The **Chief lists every override in its digest** — an override you cannot justify there
+  is one you should not have used.
+- An **expired or empty** focus means no restriction at all and everything behaves as
+  normal. The Dozer prints which of those it is in its banner and once an hour in its log;
+  your precheck line says the same.
+
 ---
 
 
@@ -97,6 +129,7 @@ the concrete "how" — the labels/states are the contract; use whichever access 
 | **Your decision labels** | `director:triaged`, `director:changes-requested`, `director:merged-main` |
 | **Waiting on Vas** | label **`board:to_review`** — see *Board protocol* above; shows in the shared **Board** view |
 | **Vas answered** | label **`board:responded`** — you must act on it in the same awake, then remove it |
+| **Exempt from the weekly focus** | label **`focus:override`** — outage or a Vasanth ask only, justified in a comment (see *Weekly focus* above) |
 | **OKR ladder** | issue belongs to a **Project** (Objective) + ideally a **Milestone** (KR), under an **Initiative** (Pillar) |
 
 Team keys (live in Linear): **CFW** = cfw-social · **LL** = learnloop · **BRD** = brands ·
@@ -109,6 +142,7 @@ Team keys (live in Linear): **CFW** = cfw-social · **LL** = learnloop · **BRD*
 - **Ladder** → set the issue's **Project** (and Milestone) so it maps to an OKR.
   *No Project → do not greenlight; link it or drop it.*
 - **Greenlight** → add labels `dozer:ready` + `lane:dev|lane:marketing|lane:ops` (+ `repo:` if it touches a repo).
+  *While a **weekly focus** is active, only for an issue under a focus project — see the section above.*
 
 > **Dates go on Milestones, not on issues (GSAI-172).** The Dozer claims the greenlit queue
 > top-down, and that queue is now sorted by the issue's **Milestone `targetDate`, ascending,

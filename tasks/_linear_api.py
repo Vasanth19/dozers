@@ -12,7 +12,9 @@ Env it reads:
   DOZER_COMMENT_BY identity stamped on every scripted comment's
                    `<!-- board-note by:… -->` marker (GSAI-60)     — default dozer-engine
   DOZER_STATE_DIR  where the engine's small ephemeral scratch lives — default ~/.dozers
-                   (today: the daily `no-kr-seen-<date>` log-dedupe set, GSAI-171)
+                   (the daily `<kind>-seen-<date>` log-dedupe sets: no-kr GSAI-171,
+                   out-of-focus + focus-override GSAI-176)
+  DOZER_CONFIG     org/config.yaml override (tests) — read for the `focus:` block only
 
 Label lifecycle (dozer:* = execution; lane:/repo: = routing):
   greenlight -> dozer:ready + lane:<name>          (a Director sets both) — and a RESET:
@@ -149,7 +151,7 @@ def _fetch_team_issues(tid):
         d = gql('query($t:ID!,$n:Int!,$c:String){ issues(first:$n, after:$c, '
                 'filter:{team:{id:{eq:$t}}}){ pageInfo{ hasNextPage endCursor } nodes{ '
                 'identifier title team{ key } state{ type } priority createdAt '
-                'projectMilestone{ id name targetDate } '
+                'projectMilestone{ id name targetDate } project{ name } '
                 'labels{ nodes{ name } } } } }',
                 {"t": tid, "n": _PAGE, "c": cursor})
         page = d["issues"]
@@ -321,12 +323,18 @@ def _state_dir():
     return os.path.expanduser(os.environ.get("DOZER_STATE_DIR") or "~/.dozers")
 
 
-def _no_kr_seen_path():
+def _seen_path(kind):
+    """The day's advisory log-dedupe set for one KIND of skip ("no-kr", "out-of-focus",
+    "focus-override"). One file per kind per day, so the kinds never prune each other."""
     import datetime
-    return os.path.join(_state_dir(), f"no-kr-seen-{datetime.date.today().isoformat()}")
+    return os.path.join(_state_dir(), f"{kind}-seen-{datetime.date.today().isoformat()}")
 
 
-def _no_kr_seen_load(path):
+def _no_kr_seen_path():
+    return _seen_path("no-kr")
+
+
+def _seen_load(path):
     try:
         with open(path) as f:
             return {ln.strip() for ln in f if ln.strip()}
@@ -334,14 +342,16 @@ def _no_kr_seen_load(path):
         return set()
 
 
-def _no_kr_seen_add(path, identifier):
+def _seen_add(path, identifier):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Prune the other days' sets: this is what makes "resets daily" true on disk
-        # rather than only in the filename.
+        # Prune the other days' sets of THIS kind: this is what makes "resets daily" true
+        # on disk rather than only in the filename. Keyed by the kind's own prefix, so the
+        # focus gate's set never deletes the no-KR gate's.
         base = os.path.basename(path)
+        prefix = base.rsplit("-seen-", 1)[0] + "-seen-"
         for name in os.listdir(os.path.dirname(path)):
-            if name.startswith("no-kr-seen-") and name != base:
+            if name.startswith(prefix) and name != base:
                 try:
                     os.remove(os.path.join(os.path.dirname(path), name))
                 except OSError:
@@ -350,6 +360,17 @@ def _no_kr_seen_add(path, identifier):
             f.write(identifier + "\n")
     except OSError:
         pass  # advisory only — see the block comment above
+
+
+def _seen_once(kind, identifier):
+    """True the FIRST time today this (kind, id) is asked about — the log-line damper.
+    Never a correctness gate: the worst case on an unreadable state dir is a repeated
+    log line."""
+    path = _seen_path(kind)
+    if identifier in _seen_load(path):
+        return False
+    _seen_add(path, identifier)
+    return True
 
 
 def _no_kr_note(identifier):
@@ -368,22 +389,231 @@ def _refuse_no_kr(identifier):
     (doctrine: no silent fallbacks). The seen-set is written only AFTER the note lands, so
     a failed post is retried on the next poll rather than swallowed by the cache."""
     path = _no_kr_seen_path()
-    if identifier in _no_kr_seen_load(path):
+    if identifier in _seen_load(path):
         return
     print(f"skip: no-kr {identifier}", file=sys.stderr)
     _no_kr_note(identifier)
-    _no_kr_seen_add(path, identifier)
+    _seen_add(path, identifier)
+
+
+# --- GSAI-176: the weekly focus — the factory only spends inside a short list ---------
+# Vasanth, 2026-09-20: "nail it down on only top three projects and make it meaningful
+# for the next one week." The greenlight already answers "may this run?"; it never
+# answered "is this what we are doing THIS WEEK?". A Director with a healthy lane will
+# always find something legitimate to greenlight, so the queue fills with real work that
+# is not the work that matters — and the fleet's whole capacity goes to it.
+#
+# The focus is a DATED list of Linear PROJECT names in org/config.yaml. While it is
+# active the engine claims only issues under those projects; everything else stays
+# greenlit and simply waits. It is deliberately config, not a label sweep: one edit
+# re-aims the whole fleet, and the window expires on its own rather than quietly
+# becoming permanent.
+#
+#   focus:
+#     projects: ["CFW: Sellable V1", "CFW: Platform Publishers", "MGG: Reels"]
+#     until: "2026-09-27"     # ISO date, inclusive — the last day the focus binds
+#     note: "one line, shown in every Director digest"
+#
+# ACTIVE = projects is non-empty AND `until` is a real ISO date AND today <= until.
+# Anything else (empty list, missing/garbled date, a date that has passed) means NO
+# focus and the engine behaves exactly as it did before this change — the fail-open
+# direction on purpose: a stale config must never be able to silently stop the factory.
+# It is never silent, though: `focus_line()` says which of those it is, in the banner,
+# in the hourly log line and on every Director's gate output.
+#
+# ESCAPE HATCH: the label `focus:override` on an issue passes the gate. It exists for a
+# production outage or a Vasanth ask — the Director who uses it justifies it in a comment
+# (`<!-- focus-override by:<name> reason:… -->`) and the Chief lists every one in its
+# digest (directors/LINEAR.md).
+#
+# NOT A COMMENT: unlike the no-KR refusal, an out-of-focus skip posts NOTHING on the
+# issue. Hundreds of issues are out of focus in any given week — commenting on each
+# would be spam, and the issue is not WRONG, it is merely not now. It gets one stderr
+# line per issue per day, and one summary line per poll.
+FOCUS_OVERRIDE = "focus:override"
+
+
+def _config_path():
+    """org/config.yaml, resolved from THIS file (tasks/ -> ../org/config.yaml) so it is
+    found however the module was loaded. DOZER_CONFIG overrides it (tests)."""
+    env = os.environ.get("DOZER_CONFIG")
+    if env:
+        return os.path.expanduser(env)
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "org", "config.yaml")
+
+
+def _strip_comment(v):
+    """Drop a trailing `# …` that is OUTSIDE quotes — a project name may contain one."""
+    q = None
+    for idx, ch in enumerate(v):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#":
+            return v[:idx]
+    return v
+
+
+def _scalar(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+def _scalar_list(v):
+    """A flow-style `["A", "B"]` (or an empty `[]`). QUOTED items are extracted as
+    quoted strings rather than split on commas, because a Linear project name carries
+    both commas and colons ("CFW: Sellable V1") — splitting would shred it. An unquoted
+    list falls back to a comma split, which is fine for names without commas."""
+    v = v.strip()
+    if v.startswith("["):
+        v = v[1:]
+        if v.endswith("]"):
+            v = v[:-1]
+    if not v.strip():
+        return []
+    quoted = re.findall(r'"([^"]*)"|\'([^\']*)\'', v)
+    if quoted:
+        return [(a or b) for a, b in quoted if (a or b).strip()]
+    return [p.strip() for p in v.split(",") if p.strip()]
+
+
+def _parse_focus(text):
+    """Read the `focus:` block. A targeted parser, not a YAML dependency: this repo
+    ships no package manager on purpose (dozer.sh hand-parses fanout_by_group for the
+    same reason). Accepts the flow-style list and a `- item` block list."""
+    out = {"projects": [], "until": "", "note": ""}
+    lines = text.splitlines()
+    start = None
+    for idx, ln in enumerate(lines):
+        if re.match(r'^focus:\s*(#.*)?$', ln):
+            start = idx + 1
+            break
+    if start is None:
+        return out
+    cur = None
+    for ln in lines[start:]:
+        if ln.strip() and not ln[:1].isspace():
+            break                                   # the next top-level key ends the block
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = re.match(r'^(projects|until|note):\s*(.*)$', s)
+        if m:
+            key, val = m.group(1), _strip_comment(m.group(2))
+            if key == "projects":
+                cur, out["projects"] = "projects", _scalar_list(val)
+            else:
+                cur, out[key] = None, _scalar(val)
+        elif cur == "projects" and s.startswith("-"):
+            item = _scalar(_strip_comment(s[1:]))
+            if item:
+                out["projects"].append(item)
+    return out
+
+
+_FOCUS = None
+
+
+def focus_config():
+    """The weekly focus, read ONCE per process. Returns the parsed block plus:
+       active  bool   — the gate binds
+       reason  str    — why it does or does not, in one human line
+       days    int    — days left (inclusive), 0 when inactive"""
+    global _FOCUS
+    if _FOCUS is not None:
+        return _FOCUS
+    import datetime
+    path = _config_path()
+    try:
+        with open(path) as fh:
+            f = _parse_focus(fh.read())
+        missing = ""
+    except OSError as e:
+        # No config = no focus. Said out loud (never swallowed) because every caller
+        # prints `reason`, and the fail-open direction is deliberate: see the block
+        # comment above.
+        f, missing = {"projects": [], "until": "", "note": ""}, f"cannot read {path}: {e}"
+    f["days"] = 0
+    if missing:
+        f["active"], f["reason"] = False, f"no focus ({missing})"
+    elif not f["projects"]:
+        f["active"], f["reason"] = False, "no focus (focus.projects is empty)"
+    elif not re.match(r'^\d{4}-\d{2}-\d{2}$', f["until"] or ""):
+        f["active"], f["reason"] = False, (
+            f"no focus (focus.until is {f['until'] or 'empty'}, not an ISO date YYYY-MM-DD) "
+            f"— {len(f['projects'])} project(s) configured but NOT enforced")
+    else:
+        today = datetime.date.today()
+        until = datetime.date.fromisoformat(f["until"])
+        f["days"] = (until - today).days
+        if f["days"] < 0:
+            f["active"] = False
+            f["reason"] = f"no focus (focus.until {f['until']} has passed — clear it or extend it)"
+        else:
+            f["active"] = True
+            f["reason"] = (f"FOCUS until {f['until']} ({f['days']} days left): "
+                           + " · ".join(f["projects"])
+                           + (f" — {f['note']}" if f["note"] else ""))
+    _FOCUS = f
+    return f
+
+
+def _project_name(i):
+    return ((i.get("project") or {}).get("name") or "")
+
+
+def _in_focus(i, f):
+    """Pure predicate — no logging, so count_ready() can share it with list_ready().
+    Only meaningful when f["active"]; callers check that first."""
+    return (_has(i["labels"]["nodes"], FOCUS_OVERRIDE)
+            or _project_name(i) in f["projects"])
+
+
+def focus_line():
+    """One human line: what the focus is right now. Printed by dozer.sh in its startup
+    banner and once an hour in the loop log."""
+    print("focus: " + focus_config()["reason"])
 
 
 def list_ready():
-    claimable = []
+    """The claimable queue, in claim order. GATE PRECEDENCE — each stage is a refusal the
+    next one never sees:
+      1. greenlight   dozer:ready + a lane:            (_is_ready)
+      2. Key Result   no Milestone, no run             (GSAI-171, _has_kr)
+      3. weekly focus out-of-focus project waits       (GSAI-176, _in_focus)
+      4. the sort     KR target date, then priority    (GSAI-172/105, _priority_key)
+    The per-group crew cap is stage 5 and lives in dozer.sh's drain(), because it depends
+    on what is running right now, not on what is claimable."""
+    f = focus_config()
+    claimable, skipped = [], 0
     for i in _all_issues():
         if not _is_ready(i):
             continue
         if not _has_kr(i):
             _refuse_no_kr(i["identifier"])   # logs + comments; never claimed (GSAI-171)
             continue
+        if f["active"] and not _in_focus(i, f):
+            skipped += 1
+            if _seen_once("out-of-focus", i["identifier"]):
+                print(f'skip: out-of-focus {i["identifier"]} '
+                      f'({_project_name(i) or "no project"})', file=sys.stderr)
+            continue
+        elif f["active"] and _project_name(i) not in f["projects"]:
+            # Past the gate but not under a focus project — it can only have got here on
+            # the `focus:override` label. Name it: an override nobody can see is a hole.
+            if _seen_once("focus-override", i["identifier"]):
+                print(f'focus: override {i["identifier"]}', file=sys.stderr)
         claimable.append(i)
+    # One line per poll, not one per issue: the per-issue lines are deduped for a day, so
+    # without this the log would stop saying anything about the focus after the first poll.
+    if f["active"]:
+        print(f"focus: {len(claimable)} in-focus ready, {skipped} out-of-focus skipped",
+              file=sys.stderr)
     for i in sorted(claimable, key=_priority_key):
         # Columns 4 and 5 carry the KEY the sort ran on, so dozer.sh can log WHY a task
         # was picked rather than just that it was: the priority ("" when the issue has
@@ -804,7 +1034,12 @@ def count_ready():
     # engine REFUSES, not work it is failing to get to, so counting it would alarm the
     # watchdog forever on a queue no drain will ever shorten. Read-only on purpose: the
     # log line and the refusal comment belong to list_ready, not to a health probe.
-    print(sum(1 for i in _all_issues() if _is_ready(i) and _has_kr(i)))
+    # GSAI-176: and the focus gate, for exactly the same reason — out-of-focus work is
+    # work the engine is deliberately not doing this week, not work it is failing to
+    # reach, so counting it would hold the alarm high for the whole focus window.
+    f = focus_config()
+    print(sum(1 for i in _all_issues()
+              if _is_ready(i) and _has_kr(i) and (not f["active"] or _in_focus(i, f))))
 
 
 OPS = {
@@ -832,6 +1067,7 @@ OPS = {
     "alarm-raise": lambda a: alarm_raise(a[0], a[1]),
     "alarm-clear": lambda a: alarm_clear(a[0], a[1]),
     "count-ready": lambda a: count_ready(),
+    "focus-line": lambda a: focus_line(),     # GSAI-176: one human line, no Linear call
     "board-answer": lambda a: board_answer(a[0]),
 }
 

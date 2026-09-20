@@ -47,6 +47,28 @@ run_log_requests() {  # <requests-file> -> the crew's own count, or "" if it nev
   [[ -s "$1" ]] && tr -d '[:space:]' < "$1" 2>/dev/null
   return 0
 }
+# ── Weekly focus (GSAI-176) ────────────────────────────────────────────────────
+# The backend enforces the gate (tasks/_linear_api.py: out-of-focus greenlit work is
+# never listed). The engine's job is to SAY so — a fleet that quietly ignores most of
+# its queue for a week must never be something you have to read the code to discover.
+# So: one line in the startup banner, and one line an hour in the loop log. Free —
+# `task_focus_line` reads org/config.yaml, not Linear. A backend without the verb
+# (files, github) prints nothing at all.
+FOCUS_LOG_EVERY="${FOCUS_LOG_EVERY:-3600}"   # seconds between focus lines in the loop
+FOCUS_LAST=0
+focus_banner() {
+  declare -F task_focus_line >/dev/null || return 0
+  local line; line="$(task_focus_line 2>/dev/null || true)"
+  [[ -n "$line" ]] && echo "[dozer] $line"
+  FOCUS_LAST="$(date +%s)"
+  return 0
+}
+focus_tick() {   # ...and once an hour thereafter
+  local now; now="$(date +%s)"
+  (( now - FOCUS_LAST < FOCUS_LOG_EVERY )) && return 0
+  focus_banner
+}
+
 POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
@@ -672,11 +694,12 @@ doctor() {
 }
 
 case "${1:-once}" in
-  once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; recover; drain_all ;;
+  once)    echo "[dozer] recovering stranded work, then draining (fanout=$FANOUT)..."; focus_banner; recover; drain_all ;;
   recover) recover "${2:-}" ;;                              # run the reaper standalone (pass --dry-run)
   heartbeat) heartbeat "${2:-}"; cat "$HEARTBEAT_FILE" ;;   # emit one beat now, print it (scriptable/testable)
   doctor)  doctor ;;                                        # health view: in-flight, alive?, orphans
   loop) echo "[dozer] looping every ${POLL_SECONDS}s, fanout=$FANOUT, beating every ${HEARTBEAT_SECONDS}s (Ctrl-C to stop)"
+        focus_banner                                        # what the fleet is aimed at this week
         recover                                             # heal once on startup
         REAPER_EVERY="${REAPER_EVERY:-10}"; ticks=0         # then re-run every N polls
         heartbeat "$ticks"                                  # beat once before the first drain
@@ -684,7 +707,7 @@ case "${1:-once}" in
         trap 'beat_stop; exit 0' INT TERM
         beat_start                                          # ...then keep beating THROUGH each drain
         while true; do
-          echo "[dozer] $(date '+%H:%M:%S') poll (running=${#CREWS[@]}/$FANOUT)"; drain
+          echo "[dozer] $(date '+%H:%M:%S') poll (running=${#CREWS[@]}/$FANOUT)"; focus_tick; drain
           ticks=$((ticks+1)); heartbeat "$ticks"            # stamp the new tick (the ticker keeps ts fresh between these)
           (( REAPER_EVERY > 0 && ticks % REAPER_EVERY == 0 )) && recover
           nap "$POLL_SECONDS"                               # ...or sooner, the moment a crew frees its slot
