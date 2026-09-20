@@ -1,0 +1,23 @@
+# tests/fixtures/quota-by-project-ecosystem.yaml — a miniature ~/ecosystem/ecosystem.yaml
+# for tests/quota-by-project-test.sh. Shaped like the real registry (orgs map with
+# linear_team, projects list with local + org) and nothing more, so the repo->team
+# lookup is exercised without the test depending on the live registry's contents.
+version: 1
+orgs:
+  cfw_social:
+    name: CFW Social
+    prefix: CFW
+    linear_team: CFW
+  growth_systems_ai:
+    name: Growth Systems AI
+    prefix: GRO
+    linear_team: GSAI
+projects:
+  - id: cfw-social
+    name: CFW Social
+    org: cfw_social
+    local: /Users/vasanth/initiatives/cfw/cfw-social/
+  - id: dozers
+    name: Dozers
+    org: growth_systems_ai
+    local: /Users/vasanth/Code/dozers/

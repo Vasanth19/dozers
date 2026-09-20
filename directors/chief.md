@@ -53,6 +53,15 @@ through a lane-Director.
    not the lane-Directors: redirect, split the KR, or explicitly bless it. A catch-all row
    with no milestone above 40% is the same flag, aimed at the OKR-tree hygiene in step 2
    instead (unlinked work spending real money).
+7. **Quota by project (7d).** Run `scripts/quota-by-project.sh --days 7` (repo `~/Code/dozers`
+   — no LLM, offline) and paste its tables verbatim into your digest under a
+   **"Quota by project (7d)"** heading. Step 6 ranks Dozer runs by KR; this one ranks
+   **every** consumer of the two quotas — the Claude cap and the Ollama request cap —
+   side by side, so Director passes, Buzz agents and interactive sessions are weighed
+   against project work instead of being invisible. Follow it with **one line** flagging
+   any bucket over **40%** of total Claude $ (the script prints the ⚠ for you). Read
+   `interactive: <repo>` as repo-level, never as one project. If the map is stale,
+   `scripts/quota-by-project.sh --refresh-map` (needs `LINEAR_API_KEY`) rebuilds it.
 
 ## Across teams
 
