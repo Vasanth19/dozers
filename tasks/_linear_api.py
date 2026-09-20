@@ -143,6 +143,7 @@ def _fetch_team_issues(tid):
         d = gql('query($t:ID!,$n:Int!,$c:String){ issues(first:$n, after:$c, '
                 'filter:{team:{id:{eq:$t}}}){ pageInfo{ hasNextPage endCursor } nodes{ '
                 'identifier title team{ key } state{ type } priority createdAt '
+                'projectMilestone{ id name targetDate } '
                 'labels{ nodes{ name } } } } }',
                 {"t": tid, "n": _PAGE, "c": cursor})
         page = d["issues"]
@@ -244,25 +245,52 @@ def _priority_of(i):
     return p if isinstance(p, int) else 0
 
 
+def _kr_of(i):
+    """The issue's Milestone (Key Result) node, or None when it is not laddered to one."""
+    return i.get("projectMilestone") or None
+
+
+def _kr_due(i):
+    """The KR's target date as Linear returns it — a TimelessDate string "YYYY-MM-DD",
+    which sorts correctly as plain text. "" when there is no milestone or no date on it."""
+    return (_kr_of(i) or {}).get("targetDate") or ""
+
+
 def _priority_key(i):
-    """Sort key: urgent first, no-priority LAST (Linear's own ordering does the same),
-    tiebreak oldest createdAt first. GSAI-105: the greenlit queue used to come out in
-    whatever order Linear happened to return it, and drain() claims top-down — so the
-    Dozer's pick order was a lottery and a Director's only "build this first" lever was
-    hoarding greenlights. The list order IS the fleet's pick order; sort it here and
-    priority becomes that lever."""
+    """Claim order, most significant field first:
+
+      1. the KR's targetDate, ASCENDING, nulls LAST  (GSAI-172)
+      2. Linear priority: urgent first, no-priority LAST (Linear's own ordering agrees)
+      3. oldest createdAt first
+      4. identifier, so the sort is total and the order is reproducible
+
+    GSAI-105 put priority at the top and made the queue a plan instead of a lottery, but
+    priority is a per-ISSUE knob and the thing the factory is actually racing is a per-KR
+    DEADLINE. A P1 on a KR due in 90 days outranking anything under a KR due next week is
+    the wrong fleet: the date is the commitment, the priority is only how a Director
+    breaks ties inside one KR's window. So the date sorts first and priority sorts under
+    it. An issue with no dated KR sorts after every dated one (GSAI-171 refuses to run one
+    with no KR at all; a KR with no date is legal and simply carries no urgency claim).
+
+    The list order IS the fleet's pick order — drain() claims top-down."""
     p = _priority_of(i)
-    return (p if 1 <= p <= 4 else 5, i.get("createdAt") or "", i["identifier"])
+    due = _kr_due(i)
+    # (0, "2026-10-01") < (1, "") — a dated KR always precedes an undated one, and
+    # within the dated set the earlier date wins.
+    due_rank = (0, due) if due else (1, "")
+    return (due_rank, p if 1 <= p <= 4 else 5, i.get("createdAt") or "", i["identifier"])
 
 
 def list_ready():
     ready = sorted((i for i in _all_issues() if _is_ready(i)), key=_priority_key)
     for i in ready:
-        # 4th column carries the priority so dozer.sh can log WHY a task was picked
-        # ("" when the issue has none). See the contract in tasks/adapter.sh.
+        # Columns 4 and 5 carry the KEY the sort ran on, so dozer.sh can log WHY a task
+        # was picked rather than just that it was: the priority ("" when the issue has
+        # none) and the KR's target date ("" when there is no dated milestone). See the
+        # contract in tasks/adapter.sh.
         p = _priority_of(i)
         prio = str(p) if 1 <= p <= 4 else ""
-        print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}\t{prio}')
+        print(f'{i["identifier"]}\t{_lane_of(i["labels"]["nodes"])}\t{i["title"]}\t{prio}\t{_kr_due(i)}')
 
 
 def mark_ready(identifier, lane):
