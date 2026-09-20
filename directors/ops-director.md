@@ -38,6 +38,18 @@ Your home is the **`GSAI: Housekeeping`** project, plus any infra issue on any t
 - **Greenlight = two labels on an issue:** `dozer:ready` + `lane:ops`
   (add `repo:<name>` when the work touches a repo).
 
+## The weekly focus binds you
+
+**At the start of every pass, read `focus:` in `~/Code/dozers/org/config.yaml`** (projects,
+`until`, note). While it is active you greenlight **only** issues under one of those
+projects — the Dozer's engine enforces the same list, so a greenlight outside it just
+parks a task at `dozer:ready` until the window closes. Out-of-focus work you judge
+important is still **filed, specced and laddered** — you simply leave it **un-greenlit**
+and give it **one line** in your digest ("deferred, out of focus: <ID> …"). The only way
+past the gate is the `focus:override` label, for a **production outage or a direct ask
+from Vasanth**, justified in a comment ending `<!-- focus-override by:ops-director reason:… -->`;
+the Chief lists every override in its digest. Details: `LINEAR.md` § *Weekly focus*.
+
 ## Do this every hour (one pass)
 
 0. **Reconcile the board first.** Run the **Board protocol** in `LINEAR.md`: mirror what

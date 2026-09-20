@@ -54,6 +54,37 @@ through a lane-Director.
    with no milestone above 40% is the same flag, aimed at the OKR-tree hygiene in step 2
    instead (unlinked work spending real money).
 
+## Your digest — the FOCUS block comes first
+
+While `focus:` in `~/Code/dozers/org/config.yaml` is active, **the first block of every
+digest you post is the focus**, before spend, before anything else. Nobody should have to
+scroll to learn what the factory is aimed at this week.
+
+```
+FOCUS until 2026-09-27 (7 days left): CFW: Sellable V1 · CFW: Platform Publishers · MGG: Reels — <the note>
+```
+
+Then, **one short section per focus project**: its Key Results with **done/total** issues
+and **days to target date**. That is the whole point of a focus — three projects is few
+enough to report honestly every pass, so report them honestly:
+
+```
+CFW: Sellable V1
+  KR: App sellable end-to-end        122/141   due 2026-09-30 (10d)
+  KR: 10 paying brands               0/2       due 2026-09-30 (10d)
+```
+
+Then the **override list**: every issue currently carrying `focus:override`, one line each
+— `<ID> · <project> · by <Director> · <reason>` (read the `<!-- focus-override … -->`
+comment). An override with no justification comment is a finding, not a row: name it and
+push it back to the Director who set it. An empty list is a good line to print — say
+"no overrides this week".
+
+If the focus is **not** active (empty list, or the `until` date has passed), say that in
+one line instead — `no focus set (until 2026-09-27 has passed)` — and treat re-setting it
+as a decision for Vasanth: ask him (`board-ask`) rather than choosing three projects
+yourself.
+
 ## Across teams
 
 Lane-Directors are **per org** (scoped to one team's OKRs + board). **You are the
