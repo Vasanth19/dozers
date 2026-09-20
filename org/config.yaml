@@ -20,6 +20,41 @@ linear_teams: "CFW,LL,BRD,GSAI,DLY"           # serve both orgs from one Dozer
 # Parallel crews one Dozer runs at once (fan-out). 1 = sequential; up to ~8.
 fanout: 5                                     # 5 parallel crews (Vas, 2026-09-04). History: 8 saturated shared Claude Code usage (throttled to 3 on 2026-09-03); per-role model routing (models:) now lets roles move off Claude to relieve that.
 
+# ── Per-team crew-slot caps (GSAI-169) ──────────────────────────────────────
+# `fanout` alone is a GLOBAL cap, and a global cap is won by whoever greenlights the
+# most. That is how the factory ends up building the factory: the 2026-09-20 audit
+# found 57% of the Ollama allowance going to GSAI housekeeping — engine chores,
+# monitors, registry hygiene — while CFW, the team with actual customers, queued
+# behind them. Every one of those tasks was legitimately greenlit; none of them was
+# worth more than half the fleet.
+#
+# So slots are budgeted per GROUP of teams, not just globally. `drain()` counts the
+# live crew locks belonging to each group and never claims an issue whose group is
+# already at cap — it skips PAST it to the next eligible issue from another group
+# (logging `skip: group-cap <team> <live>/<cap>`), so a saturated group costs that
+# group throughput and nobody else's. Ordering is untouched: the queue is still
+# sorted by KR date then priority (GSAI-172/105); this only decides who may be
+# claimed from it right now.
+#
+# The team is read off the issue id's prefix (CFW-237 -> CFW). A team named in no
+# group falls into one shared default group with 1 slot, so a new team can never
+# quietly take the whole fleet before someone budgets it here.
+#
+# NOTE for the files/github backends: their ids often share one prefix (the demo board
+# uses `101`, `102`), so every task lands in that single default group and the engine
+# runs them one at a time regardless of `fanout`. That is the safe direction, but it is
+# surprising if you did not expect it — budget those ids in a group above, or raise the
+# default with `DEFAULT_GROUP_SLOTS=<n>` in the environment.
+#
+# THE SUM MUST BE <= `fanout` (3+1+1 = 5). A larger sum cannot over-subscribe the
+# engine — fanout still caps it globally — but it makes these numbers a fiction,
+# since the groups would then race for a pool smaller than their budgets. The engine
+# warns loudly on load if the sum exceeds fanout.
+fanout_by_group:
+  - { teams: [CFW], slots: 3 }
+  - { teams: [GSAI], slots: 1 }
+  - { teams: [LL, BRD, DLY], slots: 1 }
+
 # Only used when backend: github
 repo: "OWNER/REPO"             # e.g. acme/dozers
 

@@ -32,8 +32,13 @@ spec = importlib.util.spec_from_file_location("lin", "_linear_api.py")
 lin = importlib.util.module_from_spec(spec); spec.loader.exec_module(lin)
 
 def iss(ident, prio, created, *labels):
+    # GSAI-171 refuses an issue with no Milestone, so every fixture carries one — and
+    # they all carry the SAME targetDate on purpose: GSAI-172 sorts on that date first,
+    # so an identical date is what isolates this test on the priority tiebreak it is
+    # actually about.
     return {"identifier": ident, "title": "t", "team": {"key": "T"},
             "state": {"type": "unstarted"}, "priority": prio, "createdAt": created,
+            "projectMilestone": {"id": "m1", "name": "KR one", "targetDate": "2026-12-01"},
             "labels": {"nodes": [{"name": l} for l in labels]}}
 
 R, L = "dozer:ready", "lane:dev"
@@ -53,8 +58,8 @@ lin._all_issues = lambda: [
 ]
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf): lin.list_ready()
-# splitlines, not strip().splitlines(): strip() would eat the LAST line's trailing
-# tab — which is exactly the empty 4th column this test asserts on.
+# splitlines, not strip().splitlines(): strip() would eat the trailing tabs — which is
+# exactly the empty 4th column this test asserts on.
 lines = [l for l in buf.getvalue().splitlines() if l]
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf): lin.count_ready()

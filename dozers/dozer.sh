@@ -27,6 +27,96 @@ cfg() { grep -E "^$1:" "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/^[
 POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
+
+# ── Per-team crew-slot caps (GSAI-169) ─────────────────────────────────────────
+# `fanout` is a GLOBAL cap, and a global cap is won by whoever greenlights the most.
+# That is how the factory ends up building the factory: the 2026-09-20 audit found 57%
+# of the Ollama allowance going to GSAI housekeeping — engine chores, monitors, registry
+# hygiene — while CFW, the team with actual customers, queued behind them. Every one of
+# those tasks was legitimately greenlit; none was worth half the fleet.
+#
+# So slots are budgeted per GROUP of teams (org/config.yaml → fanout_by_group), and
+# drain() never claims an issue whose group already holds its cap in live crew locks —
+# it skips PAST it to the next eligible issue from another group. A saturated group
+# costs that group throughput and nobody else's.
+#
+# This changes only WHO may be claimed right now, never the ORDER: the queue is still
+# sorted by KR date then priority (GSAI-172/105), and drain still walks it top-down.
+#
+# GROUP_TEAMS[i] is the group's team list, space-padded (" CFW GSAI ") so a match is
+# whole-word; GROUP_SLOTS[i] is its cap. Parallel indexed arrays rather than an
+# associative one — this file is deliberately readable bash, and the arrays are tiny.
+# A team in no group falls into ONE shared default group, index ${#GROUP_SLOTS[@]},
+# with DEFAULT_GROUP_SLOTS (1) — so a newly added team can never quietly take the whole
+# fleet before somebody budgets it.
+GROUP_TEAMS=(); GROUP_SLOTS=()
+DEFAULT_GROUP_SLOTS="${DEFAULT_GROUP_SLOTS:-1}"
+
+load_groups() {
+  local cfgf="$ROOT/org/config.yaml" line teams slots sum=0
+  # A tiny targeted parser, not a YAML dependency: this repo ships no package manager on
+  # purpose, and cfg() (a grep for `^key:`) cannot read a list. Reads the flow-style
+  # `- { teams: [A, B], slots: N }` rows under `fanout_by_group:` and stops at the next
+  # top-level key.
+  while IFS= read -r line; do
+    teams="$(sed -n 's/.*teams:[[:space:]]*\[\([^]]*\)\].*/\1/p' <<<"$line")"
+    slots="$(sed -n 's/.*slots:[[:space:]]*\([0-9][0-9]*\).*/\1/p' <<<"$line")"
+    [[ -n "$teams" && -n "$slots" ]] || continue
+    teams="$(tr ',' ' ' <<<"$teams" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
+    [[ -n "$teams" ]] || continue
+    GROUP_TEAMS+=(" $teams "); GROUP_SLOTS+=("$slots"); sum=$(( sum + slots ))
+  done < <(awk '/^fanout_by_group:/{f=1;next} f&&/^[^[:space:]#-]/{exit} f&&/^[[:space:]]*-/{print}' "$cfgf" 2>/dev/null || true)
+  # A sum over fanout cannot over-subscribe the engine (fanout still caps globally) but
+  # it makes these numbers a fiction — the groups would race for a pool smaller than
+  # their budgets, which is the lottery the caps exist to end. Say so, loudly.
+  if (( ${#GROUP_SLOTS[@]} && sum > FANOUT )); then
+    echo "[dozer] WARNING: fanout_by_group slots sum to $sum but fanout is $FANOUT — the caps are a fiction until one of the two is fixed (org/config.yaml)." >&2
+  fi
+}
+
+team_of() { printf '%s' "${1%%-*}"; }   # CFW-237 -> CFW (an id with no dash is its own team)
+
+group_index() {  # <team> -> the group's array index, or ${#GROUP_SLOTS[@]} = the default group
+  local team="$1" i
+  for (( i = 0; i < ${#GROUP_TEAMS[@]}; i++ )); do
+    [[ "${GROUP_TEAMS[i]}" == *" $team "* ]] && { printf '%s' "$i"; return 0; }
+  done
+  printf '%s' "${#GROUP_SLOTS[@]}"
+}
+
+group_cap() {  # <group index> -> its slot cap
+  local gi="$1"
+  if (( gi < ${#GROUP_SLOTS[@]} )); then printf '%s' "${GROUP_SLOTS[gi]}"
+  else printf '%s' "$DEFAULT_GROUP_SLOTS"; fi
+}
+
+# Live crew locks per group, one count per index (groups, then the default group last).
+# Counts LOCKS, not $CREWS: the lock dir is the cross-drain, cross-process truth, and a
+# crew launched by an earlier drain holds no pid in this shell's CREWS array anyway. Same
+# three exclusions as inflight_count — a Director's mutex, an owner-less lock, and a lock
+# whose owner pid is dead (a crashed crew is the reaper's problem, and counting it would
+# starve a group of a slot nothing is using).
+group_live_counts() {
+  # `gn`, not `n`: inflight_count above uses `n` as a scalar, and one name meaning two
+  # shapes in one file is a shellcheck warning and a reader's trap.
+  local -a gn=(); local IFS=' '; local i lock pid id
+  for (( i = 0; i <= ${#GROUP_SLOTS[@]}; i++ )); do gn[i]=0; done
+  shopt -s nullglob
+  for lock in "$LOCK_DIR"/*.lock; do
+    case "${lock##*/}" in director-*.lock) continue ;; esac
+    [[ -f "$lock/owner" ]] || continue
+    pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+    { [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; } || continue
+    id="$( { grep -E '^task=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+    [[ -n "$id" ]] || id="$(basename "$lock" .lock)"
+    i="$(group_index "$(team_of "$id")")"
+    gn[i]=$(( ${gn[i]:-0} + 1 ))
+  done
+  shopt -u nullglob
+  printf '%s' "${gn[*]}"
+}
+
+load_groups
 # Liveness heartbeat: a single beacon the engine keeps fresh, so an external watcher
 # (dozers/heartbeat-check.sh, or `doctor`) can tell the loop is still alive and how
 # busy it is.
@@ -263,8 +353,8 @@ resolve_workdir() {
 }
 
 # Always invoked backgrounded (own subshell), so the EXIT trap + lock are scoped.
-run_one() { # <id> <lane> <title> [priority]
-  local id="$1" lane="$2" title="$3" prio="${4:-}"
+run_one() { # <id> <lane> <title> [priority] [kr-due]
+  local id="$1" lane="$2" title="$3" prio="${4:-}" kr="${5:-}"
   # atomic local mutex so parallel Dozers never double-grab the same task
   local lock="$LOCK_DIR/${id//\//_}.lock"
   if ! mkdir "$lock" 2>/dev/null; then echo "  ~ #$id locked locally, skipping"; return 0; fi
@@ -293,9 +383,11 @@ run_one() { # <id> <lane> <title> [priority]
 
   if ! task_claim "$id"; then echo "  ~ #$id already claimed, skipping" >&2; return 0; fi
   task_comment "$id" "Dozer claimed - lane:$lane. Starting now; will post a summary on finish."
-  # GSAI-105: log the priority the pick was ordered by, so a drain log reads as a plan,
-  # not a lottery. Empty when the backend/issue carries no priority.
-  echo "  -> #$id [$lane]${prio:+ p$prio} $title"
+  # GSAI-105 / GSAI-172: log the SORT KEY the pick was ordered by, so a drain log reads
+  # as a plan, not a lottery — the KR's target date (the commitment the fleet is racing)
+  # and then the issue priority (the tiebreak inside that KR's window). Either field is
+  # empty when the backend/issue carries no such value.
+  echo "  -> #$id [$lane]${prio:+ p$prio}${kr:+ kr-due:$kr} $title"
 
   # Routing is a PREFLIGHT (GSAI-131): a task that cannot be routed to a repo is
   # blocked here, with the resolver's real error, before a crew — and therefore before
@@ -414,21 +506,38 @@ reap_crews() {  # drop finished crews from CREWS (collect their status); keep th
 
 drain() {  # fill the free slots from the ready list; returns immediately, never waits on a crew
   reap_crews
-  # The ready list arrives in claim order (GSAI-105: backend priority, then oldest
-  # first — see tasks/adapter.sh); claiming top-down is what orders the fleet.
-  local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 id lane title prio
-  while IFS=$'\t' read -r id lane title prio; do
+  # The ready list arrives in claim order (GSAI-172: the KR's target date, then backend
+  # priority, then oldest first — see tasks/adapter.sh); claiming top-down orders the fleet.
+  local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 capped=0
+  local id lane title prio kr team gi cap
+  # GSAI-169: per-group live counts, taken ONCE at the top of the drain and then
+  # incremented as this drain launches, because a crew's lock is written by the
+  # backgrounded subshell and is not guaranteed to exist yet when the next row is read.
+  local -a gcount gskip=(); read -r -a gcount <<<"$(group_live_counts)"
+  while IFS=$'\t' read -r id lane title prio kr; do
     [[ -z "$id" ]] && continue; seen=$((seen+1))
     # Already in flight on this host (its crew holds a slot): the backend just hasn't
     # caught up. Don't burn a slot on a crew that would only say "locked, skipping".
     [[ -d "$LOCK_DIR/${id//\//_}.lock" ]] && continue
     if (( launched >= free )); then queued=$((queued+1)); continue; fi
-    run_one "$id" "$lane" "$title" "$prio" &
-    CREWS+=("$!"); launched=$((launched+1))
+    # The group cap: skip PAST a saturated group to the next eligible issue rather than
+    # blocking on it. Logged once per group per drain — the invariant is worth a line,
+    # ten identical lines are not.
+    team="$(team_of "$id")"; gi="$(group_index "$team")"; cap="$(group_cap "$gi")"
+    if (( ${gcount[gi]:-0} >= cap )); then
+      capped=$((capped+1))
+      [[ -n "${gskip[gi]:-}" ]] || { gskip[gi]=1; echo "  ~ skip: group-cap $team ${gcount[gi]:-0}/$cap"; }
+      continue
+    fi
+    run_one "$id" "$lane" "$title" "$prio" "$kr" &
+    CREWS+=("$!"); launched=$((launched+1)); gcount[gi]=$(( ${gcount[gi]:-0} + 1 ))
   done < <(task_list_ready)
   if (( seen == 0 )); then echo "  (nothing ready)"
-  elif (( queued )); then echo "  ~ $queued ready but waiting: all $FANOUT slots busy (started $launched this poll)"
+  else
+    (( capped )) && echo "  ~ $capped ready but deferred by a group cap (started $launched this poll)"
+    (( queued )) && echo "  ~ $queued ready but waiting: all $FANOUT slots busy (started $launched this poll)"
   fi
+  return 0
 }
 
 # Sleep for up to $1 seconds, but wake early the moment any crew finishes, so its slot

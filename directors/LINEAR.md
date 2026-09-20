@@ -109,6 +109,16 @@ Team keys (live in Linear): **CFW** = cfw-social · **LL** = learnloop · **BRD*
 - **Ladder** → set the issue's **Project** (and Milestone) so it maps to an OKR.
   *No Project → do not greenlight; link it or drop it.*
 - **Greenlight** → add labels `dozer:ready` + `lane:dev|lane:marketing|lane:ops` (+ `repo:` if it touches a repo).
+
+> **Dates go on Milestones, not on issues (GSAI-172).** The Dozer claims the greenlit queue
+> top-down, and that queue is now sorted by the issue's **Milestone `targetDate`, ascending,
+> with undated KRs last** — *before* Linear priority. So the lever that steers the whole fleet
+> is the **target date you set on a Key Result**: give a KR a date and everything laddered under
+> it moves ahead of work hanging off KRs due later, across every team. Per-issue **priority only
+> breaks ties inside the same KR window** — a P1 under a KR due in 90 days does not and must not
+> outrank an unprioritised issue under a KR due next week. If your team's work is being claimed
+> in the wrong order, the fix is a date on a Milestone, never a priority bump or a hoarded
+> greenlight. (And an issue with no Milestone at all is not claimed — see GSAI-171.)
 - **Review** → read `dozer:needs-review` issues + the Dozer's summary comment / staged draft.
 - **Approve (mktg)** → remove `dozer:needs-review`, set state **Done**.
 - **Promote (dev)** → after `dozer:merged-develop`, run **`directors/promote.sh <repo-id|path> --summary "<issue ids>"`** — never hand-roll the git — then set `director:merged-main` → **Done**.
