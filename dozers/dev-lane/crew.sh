@@ -407,6 +407,43 @@ branch_has_output() {  # $1 = dir, $2 = pinned base sha
 # earned by a deliverable, not by exit-code generosity. Every rescue logs a loud ⚠
 # naming the pass, the exit code, and the artifact — reported, never masked
 # (fail-fast doctrine).
+# ── GSAI-160 helpers: telling "the model judged" apart from "we never reached it" ──
+# _artifact_fingerprint: content identity of a proof artifact, or "" when absent. Content
+# and not mtime — a model that rewrites a file with identical bytes has added nothing,
+# and mtime alone is forgeable by a `touch` anywhere in a crew prompt's blast radius.
+_artifact_fingerprint() {  # <path> → hash, or empty when the file does not exist
+  [[ -f "$1" ]] || { printf ''; return 0; }
+  shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || printf 'unhashable'
+}
+# _artifact_is_fresh: did THIS attempt produce the artifact? Two independent signals,
+# either of which is proof, because each covers the other's blind spot:
+#   • mtime newer than a marker stamped at pass start — catches a re-judgement that
+#     happens to reach a byte-identical verdict (a review that FAILs the same build
+#     twice for the same reason is ordinary, not suspicious).
+#   • content differs from the pre-pass snapshot — catches a filesystem whose mtime
+#     granularity swallowed a very fast write.
+# A file left by an EARLIER run satisfies neither: it predates the marker and its bytes
+# are unchanged. That is the case this exists to reject.
+_artifact_is_fresh() {  # <path> <marker> <hash-before> → 0 when this attempt wrote it
+  [[ -f "$1" ]] || return 1
+  [[ -n "$2" && -f "$2" && "$1" -nt "$2" ]] && return 0
+  [[ "$(_artifact_fingerprint "$1")" != "$3" ]] && return 0
+  return 1
+}
+# _model_unreachable_reason: echo a short human reason when a pass's output shows the
+# PROVIDER refused or never served the request, else echo nothing. Matched on the
+# provider's own error text, so a diff or a review that merely QUOTES one of these
+# phrases cannot trip it — these are the shapes the CLI emits, not prose.
+# Deliberately consulted ONLY on a non-zero exit, so it can never fail a passing run.
+_model_unreachable_reason() {  # <logfile> → reason string, or empty
+  local f="$1"
+  grep -qiE 'reached your monthly usage limit|add usage credits' "$f" && { echo "provider out of credits (ollama-cloud monthly usage limit)"; return 0; }
+  grep -qiE '\[claude-code:unrecognized_model\]|isn.t described by this version.s model catalog' "$f" && { echo "the configured model id was rejected by the CLI as unrecognized"; return 0; }
+  grep -qiE '"type"[[:space:]]*:[[:space:]]*"(authentication_error|permission_error)"|invalid[_ ]api[_ ]key|401 Unauthorized|403 Forbidden' "$f" && { echo "provider rejected our credentials"; return 0; }
+  grep -qiE '429 Too Many Requests|"type"[[:space:]]*:[[:space:]]*"rate_limit_error"|overloaded_error' "$f" && { echo "provider rate-limited or overloaded the request"; return 0; }
+  grep -qiE 'ECONNREFUSED|Connection refused|Could not connect|getaddrinfo|network error|fetch failed' "$f" && { echo "could not connect to the provider endpoint"; return 0; }
+  printf ''
+}
 run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artifact (optional)
   resolve_pass "$1"
   echo "    [dev] $1 model: $_PASS_DESC"
@@ -419,19 +456,70 @@ run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artif
   # re-parsed the diff as shell code: every $( … ) and backtick in the diff EXECUTED,
   # and a stray " silently mangled the prompt the model received. As written, the
   # second eval hands the CLI one byte-identical argv; metacharacters stay inert bytes.
-  _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" timebox "$T_MODEL" "$1 agent" "$WT" \
-    'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"\$_PASS_PROMPT\""' || rc=$?
+  # GSAI-160 (a): snapshot the proof artifact BEFORE the pass runs. The rescue below
+  # may only be earned by work THIS attempt produced — see the freshness note there.
+  local _proof_before="" _proof_marker=""
+  case "${3:-}" in
+    file:*)
+      _proof_before="$(_artifact_fingerprint "$WT/${3#file:}")"
+      _proof_marker="$(mktemp "${TMPDIR:-/tmp}/dozer-passmark.XXXXXX")"
+      ;;
+  esac
+  # GSAI-160 (b): tee the pass's output to a log we can inspect. It still streams to the
+  # crew's own stdout/stderr exactly as before — this only gives the rescue a way to ask
+  # "did the model actually answer, or did we never reach it at all?".
+  local _passlog; _passlog="$(mktemp "${TMPDIR:-/tmp}/dozer-pass.XXXXXX")"
+  _PASS_BLOCK="$_PASS_BLOCK" _PASS_PROMPT="$2" _PASSLOG="$_passlog" timebox "$T_MODEL" "$1 agent" "$WT" \
+    'eval "$_PASS_BLOCK"; eval "$MODEL_CMD \"\$_PASS_PROMPT\"" 2>&1 | tee -a "$_PASSLOG"; exit "${PIPESTATUS[0]}"' \
+    || rc=$?
   # if/then, not `&& return`/`&& fail`: a false `(( … ))` short-circuits the list to
   # status 1, and run_model_pass runs as a plain command under set -e — that would
   # kill the crew silently before either branch below could speak.
-  if (( rc == 0 )); then return 0; fi
+  if (( rc == 0 )); then rm -f "$_passlog" "$_proof_marker"; return 0; fi
   if (( TIMEBOX_HIT )); then
+    rm -f "$_passlog" "$_proof_marker"
     fail "$(timed_out_msg "$1 agent" "$T_MODEL" model); worktree kept for resume"
   fi
+  # ── GSAI-160: the gate must FAIL CLOSED when it could not reach its model ──────────
+  # A gate whose judge never rendered a judgment has not passed anything. Two holes
+  # closed here, both of which merged unverified work while ollama-cloud sat at its
+  # monthly usage limit (every call → HTTP 429, so every pass exited non-zero):
+  #
+  #   1) PROVIDER NEVER ANSWERED. The artifact-rescue was written for a model that
+  #      finishes its work and then dies on teardown (GSAI-147). It cannot tell that
+  #      apart from a model that was never reached — out of credits, bad key, a model
+  #      id the CLI rejects, the daemon down. Those are not flakes on the far side of a
+  #      completed judgment; they mean NO judgment exists. They now fail, never rescue.
+  #   2) STALE ARTIFACT. `[[ -s $file ]]` is true for a DOZER-REVIEW-$ID.md left by an
+  #      EARLIER attempt in the same kept-for-resume worktree. A prior round's
+  #      "VERDICT: PASS" therefore authorised a merge for a review that never ran this
+  #      time. The rescue now additionally requires the artifact to have CHANGED during
+  #      this attempt — a deliverable this pass actually produced.
+  #
+  # Both are reported loudly and fail the crew (fail-fast doctrine): the issue goes back
+  # with dozer:failed and a named cause, which is the correct outcome. Silence and a
+  # green merge is the one outcome that is never acceptable.
+  local _unreachable=""
+  if [[ -s "$_passlog" ]] && _unreachable="$(_model_unreachable_reason "$_passlog")" && [[ -n "$_unreachable" ]]; then
+    echo "    [dev] ✗ $1 agent: the model was never reached — $_unreachable" >&2
+    sed 's/^/      | /' "$_passlog" | tail -n 15 >&2
+    rm -f "$_passlog" "$_proof_marker"
+    fail "$1 pass could not reach its model ($_unreachable) — NOT merging. \
+A pass that never ran cannot pass: no design, no build and no review verdict from this \
+attempt can be trusted. Resolve the provider problem, then re-greenlight. (worktree kept)"
+  fi
+  rm -f "$_passlog"
   case "${3:-}" in
     file:*)
       if [[ -s "$WT/${3#file:}" ]]; then
-        echo "    [dev] ⚠ $1 agent exited $rc but ${3#file:} is on disk — continuing from the artifact"
+        if ! _artifact_is_fresh "$WT/${3#file:}" "$_proof_marker" "$_proof_before"; then
+          rm -f "$_proof_marker"
+          fail "$1 agent exited $rc and ${3#file:} is UNTOUCHED by this attempt \
+— a stale artifact from an earlier run is not this pass's deliverable and will not be \
+taken as its verdict (worktree kept for resume)"
+        fi
+        rm -f "$_proof_marker"
+        echo "    [dev] ⚠ $1 agent exited $rc but ${3#file:} was written by this attempt — continuing from the artifact"
         return 0
       fi ;;
     changes:*)
@@ -440,6 +528,7 @@ run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artif
         return 0
       fi ;;
   esac
+  rm -f "$_proof_marker"
   fail "$1 agent failed (worktree kept for resume)"
 }
 PUSH="${PUSH:-$(cfg push)}"
