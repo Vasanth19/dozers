@@ -26,7 +26,8 @@ ok()  { pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { fail=$((fail+1)); echo "  ✗ $1" >&2; }
 
 # ── 1 + 2. the sort key and the list it produces ──────────────────────────────
-out="$(cd "$ROOT/tasks" && LINEAR_API_KEY=test-not-used LINEAR_TEAMS=T python3 - <<'PY'
+KR_STATE="$(mktemp -d)"
+out="$(cd "$ROOT/tasks" && LINEAR_API_KEY=test-not-used LINEAR_TEAMS=T DOZER_STATE_DIR="$KR_STATE" python3 - <<'PY'
 import importlib.util, io, contextlib, json, datetime
 spec = importlib.util.spec_from_file_location("lin", "_linear_api.py")
 lin = importlib.util.module_from_spec(spec); spec.loader.exec_module(lin)
@@ -57,6 +58,10 @@ fixtures = [
     iss("NO-KR",         1,    "2026-01-03T09:00:00Z", None,     R, L),   # not laddered at all
 ]
 lin._all_issues = lambda: list(fixtures)
+# NO-KR trips the GSAI-171 refusal, which reads the issue's comments and may post one.
+# Stub the I/O so this test stays hermetic: the marker is already there, so nothing posts.
+lin._issue_comments = lambda ident: [{"body": lin.NO_KR_MARKER, "createdAt": "2026-09-01T00:00:00Z"}]
+lin.comment = lambda ident, body: (_ for _ in ()).throw(AssertionError("posted a duplicate no-kr note"))
 
 # (1) the raw sort key, independent of any gate that may filter the list later
 key_order = [i["identifier"] for i in sorted(fixtures, key=lin._priority_key)]
@@ -89,21 +94,22 @@ kidx() { python3 -c "import json,sys; print(json.loads(sys.stdin.read())['key_or
   && ok "inside one KR window Linear priority still breaks the tie (P3 over no-priority)" \
   || bad "same-KR-window order broke: $(j '" ".join(d["key_order"])')"
 
-# list_ready emits the same order (GSAI-171 may later gate NO-KR out of it; every other
-# row is unaffected, so assert on the dated ones only).
+# list_ready emits the same order, minus NO-KR — GSAI-171 gates an un-laddered issue out
+# of the list entirely, which is why the sort-key assertions above are made on
+# _priority_key directly rather than on what the list happens to contain.
 listed="$(j '" ".join(l.split(chr(9))[0] for l in d["lines"])')"
 [[ "$listed" == "NEAR-P3 NEAR-NOPRIO MID-P4 FAR-P1 UNDATED-P1"* ]] \
   && ok "list_ready emits the KR-date order" \
   || bad "list_ready order was: $listed"
 [[ "$(j '" ".join((l.split(chr(9))[4] if len(l.split(chr(9)))>4 else "?") or "-" for l in d["lines"])')" \
-   == "$(j 'd["near"]') $(j 'd["near"]') 2026-10-20 $(j 'd["far"]') - -" ]] \
+   == "$(j 'd["near"]') $(j 'd["near"]') 2026-10-20 $(j 'd["far"]') -" ]] \
   && ok "the 5th column carries the KR target date (empty when there is none)" \
   || bad "KR column wrong: $(j 'd["lines"]')"
 
 # ── 3. the engine logs the key it picked on ──────────────────────────────────
 # The files backend carries no KR, so the 5th column is genuinely absent there — which
 # is the case that must NOT regress: an absent field may never shift the priority tag.
-FAKE="$(mktemp -d)/root"; trap 'rm -rf "$(dirname "$FAKE")" 2>/dev/null || true' EXIT
+FAKE="$(mktemp -d)/root"; trap 'rm -rf "$(dirname "$FAKE")" "$KR_STATE" 2>/dev/null || true' EXIT
 mkdir -p "$FAKE/dozers/nap-lane" "$FAKE/tasks" "$FAKE/org"
 cp -R "$ROOT/dozers/." "$FAKE/dozers/"
 for f in "$ROOT"/tasks/*; do [[ -f "$f" ]] && cp "$f" "$FAKE/tasks/"; done
