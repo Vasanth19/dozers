@@ -47,8 +47,14 @@ WORKDIR="${WORKDIR:-.}"; DOZER_PERSONA="${DOZER_PERSONA:-}"
 OUT="$REPO_ROOT/.artifacts/mktg"; mkdir -p "$OUT"
 # fail: print the reason AND record it in $OUT/<id>.fail so the engine puts it in the
 # block comment (GSAI-26 #3) — same contract as the dev lane.
-fail() { echo "    [mktg] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; exit 1; }
-rm -f "$OUT/$ID.fail" "$OUT/$ID.handoff" 2>/dev/null || true
+fail() { echo "    [mktg] ✗ $*" >&2; printf '%s\n' "$*" > "$OUT/$ID.fail" 2>/dev/null || true; printf '%s' "${MKTG_REQUESTS:-0}" > "$OUT/$ID.requests" 2>/dev/null || true; exit 1; }
+rm -f "$OUT/$ID.fail" "$OUT/$ID.handoff" "$OUT/$ID.requests" 2>/dev/null || true
+# GSAI-173: this (copy-brief) path makes at most ONE content-model call — set to 1
+# right before that call (an attempt that timed out or errored still spent tokens).
+# A video brief execs into video.sh below and never reaches here, so its run logs
+# requests= empty (documented in dozer.sh's run_log_requests) until video.sh grows
+# its own count.
+MKTG_REQUESTS=0
 
 # ── Time bound on the model run (GSAI-37): a content model that hangs must FAIL this
 # task, not hold a slot forever. Bound = timeout_model in org/config.yaml, or
@@ -170,6 +176,8 @@ EOF
   # </dev/null + own process group come from timebox (GSAI-37): a headless CLI waits on
   # a piped stdin, and a content model that hangs must fail this task, not hold a slot.
   # stderr is kept for the fail message (the old 2>/dev/null hid the real error).
+  # GSAI-173: set BEFORE the call, not after — a timeout/error below still spent tokens.
+  MKTG_REQUESTS=1
   if ! timebox "$T_MODEL" "content model" "$PWD" "$MODEL_CMD \"\$PROMPT\" > \"\$RAW\" 2>\"\$OUT/\$ID.model.err\""; then
     (( TIMEBOX_HIT )) && fail "content model timed out after ${T_MODEL}s (DOZER_TIMEOUT_MODEL / timeout_model in org/config.yaml) — killed its process group; nothing staged"
     fail "content model failed: $(tail -c 600 "$OUT/$ID.model.err" 2>/dev/null | tr '\n' ' ')"
@@ -204,4 +212,5 @@ EOF
   [[ -n "$BACKSTOP_NOTE" ]] && printf '%s\n' "$BACKSTOP_NOTE"
   echo "- Awaiting human approval"
 } > "$OUT/$ID.summary"
+printf '%s' "$MKTG_REQUESTS" > "$OUT/$ID.requests" 2>/dev/null || true   # GSAI-173
 echo "    [mktg] done #$ID (staged)"

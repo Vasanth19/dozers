@@ -38,6 +38,8 @@ task_comment()        { local id="$1"; shift; python3 "$_LIN" comment "$id" "$*"
 
 task_repo()          { python3 "$_LIN" repo "$1"; }   # repo:<name> hint, or empty
 task_team()          { python3 "$_LIN" team "$1"; }   # the task's Linear team key
+task_milestone()     { python3 "$_LIN" milestone "$1"; }   # KR name (Milestone), or empty (GSAI-173)
+task_project()       { python3 "$_LIN" project "$1"; }     # Objective name (Project), or empty (GSAI-173)
 task_description()   { python3 "$_LIN" description "$1"; }   # the issue body — the brief (GSAI-7)
 task_crew_meta()     { python3 "$_LIN" crew-meta "$1"; }  # project + labels, for the crew-profile pick (GSAI-170)
 task_review()        { python3 "$_LIN" review "$1"; }   # mktg: stage for human approval (dozer:needs-review)

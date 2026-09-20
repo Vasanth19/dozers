@@ -1,0 +1,13 @@
+[dozer] looping every 30s, fanout=2 (Ctrl-C to stop)
+[dozer] 08:00:00 poll (running=0/2)
+  (nothing ready)
+[dozer] 08:00:30 poll (running=0/2)
+  -> #OLD-1 [dev] pre-GSAI-173 task, no spend fields at all
+    cwd -> /Users/vasanth/Code/dozers  [team:GSAI] (repo:dozers)
+  ok #OLD-1 merged to develop
+[dozer] 08:01:00 poll (running=0/2)
+  -> #OLD-2 [dev] another pre-GSAI-173 task
+  x #OLD-2 failed: tests failed after 12s — not merging (worktree kept for resume)
+[reaper] requeued=0 reaped-locks=0 healthy=0 foreign-skipped=0
+[dozer] 08:01:30 poll (running=0/2)
+  (nothing ready)

@@ -151,10 +151,12 @@ env -u DOZER_MODEL_DEV -u MODEL_CMD BACKEND=files ADAPTER_QUIET=1 REAPER_ENABLED
     HEARTBEAT_FILE="$(mktemp)" \
     bash "$FAKE/dozers/dozer.sh" once >"$LOG" 2>&1 \
   || { bad "engine: \`once\` exited non-zero"; sed 's/^/    | /' "$LOG" >&2; }
-grep -qE '^  -> #KR-NEAR \[nap\] p3 kr-due:2026-09-30 near task$' "$LOG" \
+# The pick line also carries GSAI-173's spend fields (team=/milestone=/project=/
+# profile=/ts=) after the title, so match the prefix, not the end of the line.
+grep -qE '^  -> #KR-NEAR \[nap\] p3 kr-due:2026-09-30 near task( |$)' "$LOG" \
   && ok "engine: the drain log names the KR date the pick was ordered by" \
   || { bad "engine: no kr-due tag on the pick line: $(grep -E '^  -> #' "$LOG")"; }
-grep -qE '^  -> #KR-NONE \[nap\] undated task$' "$LOG" \
+grep -qE '^  -> #KR-NONE \[nap\] undated task( |$)' "$LOG" \
   && ok "engine: a row with no KR date logs no tag (a 4-column backend is unchanged)" \
   || bad "engine: the undated pick line is wrong: $(grep -E '^  -> #KR-NONE' "$LOG")"
 rm -f "$LOG"

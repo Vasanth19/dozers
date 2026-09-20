@@ -122,8 +122,12 @@ def state_id(tid, type_):
 # --- issue helpers ------------------------------------------------------------
 
 def issue(identifier):
+    # GSAI-173: project{name} + projectMilestone{name} ride along here too (spend
+    # visibility) — one extra round trip avoided for milestone()/project() below,
+    # and no risk to list_ready()'s own fetch, which stays untouched.
     d = gql('query($i:String!){ issue(id:$i){ id identifier title '
-            'team{ id key } state{ type } labels{ nodes{ id name } } } }', {"i": identifier})
+            'team{ id key } state{ type } labels{ nodes{ id name } } '
+            'project{ name } projectMilestone{ name } } }', {"i": identifier})
     iss = d["issue"]
     if not iss:
         die(f"no issue '{identifier}'")
@@ -545,6 +549,20 @@ def crew_meta(identifier):
         print(f"label\t{n['name']}")
 
 
+def milestone(identifier):
+    """The issue's Key Result (Linear Milestone) name — empty if unlinked (GSAI-173:
+    spend-visibility log fields). Defensive: an issue type/API response that omits
+    projectMilestone entirely (not just null) must still print nothing, not crash."""
+    m = issue(identifier).get("projectMilestone") or {}
+    print(m.get("name") or "")
+
+
+def project(identifier):
+    """The issue's Objective (Linear Project) name — empty if unlinked (GSAI-173)."""
+    p = issue(identifier).get("project") or {}
+    print(p.get("name") or "")
+
+
 def description(identifier):
     # The issue description IS the brief (GSAI-7): the engine hands it to the crew so a
     # lane can route on what the Director wrote (e.g. a `production:` line marks a video
@@ -802,6 +820,8 @@ OPS = {
     "repo": lambda a: repo(a[0]),
     "team": lambda a: team(a[0]),
     "crew-meta": lambda a: crew_meta(a[0]),
+    "milestone": lambda a: milestone(a[0]),
+    "project": lambda a: project(a[0]),
     "description": lambda a: description(a[0]),
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
