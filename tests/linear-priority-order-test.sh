@@ -26,7 +26,10 @@ ok()  { pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { fail=$((fail+1)); echo "  ✗ $1" >&2; }
 
 # ── 1. the Linear backend sorts by priority, then age ─────────────────────────
-out="$(cd "$ROOT/tasks" && LINEAR_API_KEY=test-not-used LINEAR_TEAMS=T python3 - <<'PY'
+# Hermetic against the LIVE config too (GSAI-176): list_ready reads org/config.yaml
+# for the weekly focus window, and an active focus would filter these fixtures — which
+# would fail this suite on the repo's own config. DOZER_CONFIG=/dev/null = no focus.
+out="$(cd "$ROOT/tasks" && LINEAR_API_KEY=test-not-used LINEAR_TEAMS=T DOZER_CONFIG=/dev/null python3 - <<'PY'
 import importlib.util, io, contextlib, json
 spec = importlib.util.spec_from_file_location("lin", "_linear_api.py")
 lin = importlib.util.module_from_spec(spec); spec.loader.exec_module(lin)
