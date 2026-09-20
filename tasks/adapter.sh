@@ -46,6 +46,12 @@
 #   task_requeue <id>     -> undo a claim: put the task back to ready (keep its lane).
 # A backend without these degrades gracefully — the reaper still reaps stale locks.
 #
+# Optional FOCUS verb (GSAI-176; implemented by linear):
+#   task_focus_line       -> print ONE human line describing the weekly focus window
+#                            (org/config.yaml -> focus:). Reads config only, never the
+#                            backend, so the engine can print it every hour for free. A
+#                            backend that does not define it is simply never asked.
+#
 # Optional BRIEF verb (GSAI-7; implemented by files/github/linear):
 #   task_description <id> -> print the task body (the Director's brief). The engine
 #                            hands it to the crew as a file (DOZER_BRIEF) so a lane can

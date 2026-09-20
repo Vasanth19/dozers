@@ -58,3 +58,9 @@ task_audit_strip()     { python3 "$_LIN" audit-strip "$1"; }    # hygiene: strip
 # board protocol (GSAI-41) — read-only reconcile probe: did Vas answer the newest board-ask?
 # exit 0 = answered (prints `<createdAt>\t<first line>` per answer), 3 = waiting, 2 = no ask.
 task_board_answer()  { python3 "$_LIN" board-answer "$1"; }
+
+# weekly focus (GSAI-176) — one human line describing the active focus window. No Linear
+# call: it reads org/config.yaml only, so dozer.sh can print it in its startup banner and
+# once an hour without spending a round-trip. A backend with no notion of focus simply
+# does not define this, and dozer.sh prints nothing.
+task_focus_line()    { python3 "$_LIN" focus-line; }
