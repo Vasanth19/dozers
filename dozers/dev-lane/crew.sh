@@ -100,6 +100,7 @@ rm -f "$OUT/$ID.fail" "$OUT/$ID.merge" "$OUT/$ID.requests" 2>/dev/null || true  
 
 # ── Time bounds (GSAI-37) — resolved up front so a bad value fails before any spend ──
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/model-failure.sh"
 TIMEBOX_CONFIG="$REPO_ROOT/org/config.yaml"
 T_MODEL="$(timebox_secs model 3600)" || fail "bad timeout_model / DOZER_TIMEOUT_MODEL"
 T_TEST="$(timebox_secs test 900)"    || fail "bad timeout_test / DOZER_TIMEOUT_TEST"
@@ -487,12 +488,24 @@ fi
 echo "    [dev] crew profile: $CREW_PROFILE ($CREW_REASON) — passes: $CREW_PASSES${CREW_MAX_TURNS:+; max $CREW_MAX_TURNS turns/pass}${CREW_MODEL_ROLE:+; model role $DOZER_ROLE.$CREW_MODEL_ROLE}"
 
 _PASS_BLOCK=""; _PASS_DESC=""; _PASS_TURNS=""; _PASS_TURNS_UNSUPPORTED=0
+# Set only by a fallback re-run; consumed and cleared by resolve_pass. Declared here
+# so `set -u` is satisfied on the very first pass.
+_PASS_FORCE_BLOCK=""; _PASS_FORCE_DESC=""; _PASS_FORCE_TURNS=""
 resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK/_DESC/_TURNS
   # A crew profile may pin ONE model role for every pass it runs (GSAI-170: `lite`
   # runs on `$DOZER_ROLE.small`, the lane's cheap pin promoted to a real route by
   # tasks/model_route.py). Unset — which `full` always is — each pass keeps its own
   # dotted role, exactly as before.
   local role="$DOZER_ROLE.${CREW_MODEL_ROLE:-$1}" _probe
+  # A fallback re-run (run_model_pass, below) hands us the route to use instead of
+  # resolving the role's own — which is the one that just proved unavailable. Consumed
+  # exactly once: cleared here so the NEXT pass resolves normally.
+  if [[ -n "${_PASS_FORCE_BLOCK:-}" ]]; then
+    _PASS_BLOCK="$_PASS_FORCE_BLOCK"; _PASS_DESC="${_PASS_FORCE_DESC:-models.fallback}"
+    _PASS_TURNS="${_PASS_FORCE_TURNS:-}"; _PASS_TURNS_UNSUPPORTED=0
+    _PASS_FORCE_BLOCK=""; _PASS_FORCE_DESC=""; _PASS_FORCE_TURNS=""
+    return 0
+  fi
   if [[ -n "${MODEL_CMD:-}" ]]; then
     DOZER_MODEL_PROVIDER="${DOZER_MODEL_PROVIDER:-env}"; DOZER_MODEL_NAME="${DOZER_MODEL_NAME:-MODEL_CMD}"
     # The MODEL_CMD bypass hands us a command line somebody else composed: we cannot
@@ -577,15 +590,9 @@ _artifact_is_fresh() {  # <path> <marker> <hash-before> → 0 when this attempt 
 # provider's own error text, so a diff or a review that merely QUOTES one of these
 # phrases cannot trip it — these are the shapes the CLI emits, not prose.
 # Deliberately consulted ONLY on a non-zero exit, so it can never fail a passing run.
-_model_unreachable_reason() {  # <logfile> → reason string, or empty
-  local f="$1"
-  grep -qiE 'reached your monthly usage limit|add usage credits' "$f" && { echo "provider out of credits (ollama-cloud monthly usage limit)"; return 0; }
-  grep -qiE '\[claude-code:unrecognized_model\]|isn.t described by this version.s model catalog' "$f" && { echo "the configured model id was rejected by the CLI as unrecognized"; return 0; }
-  grep -qiE '"type"[[:space:]]*:[[:space:]]*"(authentication_error|permission_error)"|invalid[_ ]api[_ ]key|401 Unauthorized|403 Forbidden' "$f" && { echo "provider rejected our credentials"; return 0; }
-  grep -qiE '429 Too Many Requests|"type"[[:space:]]*:[[:space:]]*"rate_limit_error"|overloaded_error' "$f" && { echo "provider rate-limited or overloaded the request"; return 0; }
-  grep -qiE 'ECONNREFUSED|Connection refused|Could not connect|getaddrinfo|network error|fetch failed' "$f" && { echo "could not connect to the provider endpoint"; return 0; }
-  printf ''
-}
+# The patterns themselves now live in dozers/model-failure.sh, shared with the mktg
+# lane — the two crews must not drift on what "the provider never answered" means.
+_model_unreachable_reason() { model_failure_reason "$1"; }
 # ── Turn cap (GSAI-170) — how a pass's budget is ENFORCED, per provider ────────────
 # A wall-clock timebox stops a HANG; it does not stop a LOOP. The dev BUILD role's
 # fix-the-failing-tests loop is a loop: the 2026-09-20 audit put ~52% of all Ollama
@@ -607,6 +614,11 @@ TURN_CAP_WALLCLOCK="$(crews_get turn_cap_wallclock_secs)"; TURN_CAP_WALLCLOCK="$
   || fail "crews.turn_cap_wallclock_secs '$TURN_CAP_WALLCLOCK' must be a whole number of seconds >= 1"
 
 run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artifact (optional)
+  # Read BEFORE resolve_pass consumes the force block: a pass that is itself the
+  # fallback must never fall back again. One retry, then the failure is real —
+  # otherwise two dead providers ping-pong until the timebox kills the crew.
+  local _is_fallback=0
+  [[ -n "${_PASS_FORCE_BLOCK:-}" ]] && _is_fallback=1
   resolve_pass "$1"
   echo "    [dev] $1 model: $_PASS_DESC"
   PASS_ROWS+=("$1: $_PASS_DESC${_PASS_TURNS:+ (max $_PASS_TURNS turns)}")
@@ -676,6 +688,29 @@ run_model_pass() {  # $1 = architect|build|review, $2 = prompt, $3 = proof artif
   if [[ -s "$_passlog" ]] && _unreachable="$(_model_unreachable_reason "$_passlog")" && [[ -n "$_unreachable" ]]; then
     echo "    [dev] ✗ $1 agent: the model was never reached — $_unreachable" >&2
     sed 's/^/      | /' "$_passlog" | tail -n 15 >&2
+    # ── Fallback (Vasanth, 2026-09-21) ────────────────────────────────────────
+    # An AVAILABILITY failure — out of credits, 429, unreachable endpoint — is
+    # re-run ONCE on `models.fallback`. A CONFIGURATION failure (bad model id,
+    # rejected key) is not: routing around a typo is the hazard model_route.py's
+    # no-fallback rule exists to prevent, and it would hide the bug forever.
+    # `_fell_back` makes this once per pass — a fallback that is itself
+    # unavailable fails for real rather than looping between two dead providers.
+    if (( ! _is_fallback )) && model_failure_transient "$_passlog"; then
+      local _fb_block _fb_desc
+      _fb_block="$(model_fallback_block "$_PASS_TURNS")"
+      if [[ -n "$_fb_block" ]]; then
+        _fb_desc="$(model_fallback_desc)"
+        echo "    [dev] ↪ $1: ${_PASS_DESC} is unavailable ($_unreachable) — re-running this pass on ${_fb_desc:-models.fallback}" >&2
+        PASS_ROWS+=("$1: FELL BACK ${_PASS_DESC} → ${_fb_desc:-models.fallback} ($_unreachable)")
+        rm -f "$_passlog" "$_proof_marker"
+        _PASS_FORCE_BLOCK="$_fb_block"
+        _PASS_FORCE_DESC="${_fb_desc:-models.fallback}"
+        _PASS_FORCE_TURNS="$_PASS_TURNS"
+        run_model_pass "$1" "$2" "${3:-}"
+        return $?
+      fi
+      echo "    [dev] ⚠ $1: no models.fallback configured — cannot route around this" >&2
+    fi
     rm -f "$_passlog" "$_proof_marker"
     fail "$1 pass could not reach its model ($_unreachable) — NOT merging. \
 A pass that never ran cannot pass: no design, no build and no review verdict from this \
