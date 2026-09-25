@@ -55,11 +55,13 @@ rm -f "$OUT/$ID.fail" "$OUT/$ID.handoff" "$OUT/$ID.requests" 2>/dev/null || true
 # requests= empty (documented in dozer.sh's run_log_requests) until video.sh grows
 # its own count.
 MKTG_REQUESTS=0
+MKTG_FELL_BACK=""   # set when a provider outage forced models.fallback (set -u)
 
 # ── Time bound on the model run (GSAI-37): a content model that hangs must FAIL this
 # task, not hold a slot forever. Bound = timeout_model in org/config.yaml, or
 # DOZER_TIMEOUT_MODEL for one run; resolved before any spend so a bad value fails first.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/timebox.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/model-failure.sh"
 TIMEBOX_CONFIG="$REPO_ROOT/org/config.yaml"
 T_MODEL="$(timebox_secs model 3600)" || fail "bad timeout_model / DOZER_TIMEOUT_MODEL"
 
@@ -180,7 +182,39 @@ EOF
   MKTG_REQUESTS=1
   if ! timebox "$T_MODEL" "content model" "$PWD" "$MODEL_CMD \"\$PROMPT\" > \"\$RAW\" 2>\"\$OUT/\$ID.model.err\""; then
     (( TIMEBOX_HIT )) && fail "content model timed out after ${T_MODEL}s (DOZER_TIMEOUT_MODEL / timeout_model in org/config.yaml) — killed its process group; nothing staged"
-    fail "content model failed: $(tail -c 600 "$OUT/$ID.model.err" 2>/dev/null | tr '\n' ' ')"
+    # ── Fallback (Vasanth, 2026-09-21) ──────────────────────────────────────────
+    # The dev lane has classified provider failures since GSAI-160; this lane never
+    # did, so an out-of-credits ollama read here as "content model failed" with the
+    # 429 buried in a 600-char tail. Same split as dev: an AVAILABILITY failure
+    # (credits, 429, unreachable) re-runs once on `models.fallback`; a CONFIGURATION
+    # failure (bad model id, rejected key) still fails hard, because routing around
+    # a typo is the hazard tasks/model_route.py's no-fallback rule exists to stop.
+    _mk_reason="$(model_failure_reason "$OUT/$ID.model.err")"
+    if [[ -n "$_mk_reason" ]] && model_failure_transient "$OUT/$ID.model.err"; then
+      _mk_fb="$(model_fallback_block "${DOZER_MODEL_MAX_TURNS:-}")"
+      if [[ -n "$_mk_fb" ]]; then
+        _mk_desc="$(model_fallback_desc)"
+        echo "    [mktg] ↪ ${MODEL_DESC:-primary route} is unavailable ($_mk_reason) — re-running on ${_mk_desc:-models.fallback}" >&2
+        MKTG_REQUESTS=2
+        # A subshell: the fallback route's exports (the provider token above all)
+        # must not outlive this one retry and leak into the rest of the crew.
+        # claude_isolate MUST re-run here: the fallback block rebuilds MODEL_CMD from
+        # scratch, so the --safe-mode flag applied at startup is gone. Without this the
+        # fallback would produce a publishable asset through the operator's personal
+        # harness — exactly the leak GSAI-33 rule 1 exists to prevent.
+        if ! ( eval "$_mk_fb"; claude_isolate; timebox "$T_MODEL" "content model (fallback)" "$PWD" \
+                 "$MODEL_CMD \"\$PROMPT\" > \"\$RAW\" 2>\"\$OUT/\$ID.model.err\"" ); then
+          (( TIMEBOX_HIT )) && fail "content model (fallback ${_mk_desc:-models.fallback}) timed out after ${T_MODEL}s — nothing staged"
+          fail "content model failed on BOTH routes — primary: $_mk_reason; fallback ${_mk_desc:-models.fallback}: $(tail -c 400 "$OUT/$ID.model.err" 2>/dev/null | tr '\n' ' ')"
+        fi
+        MKTG_FELL_BACK="${MODEL_DESC:-primary} → ${_mk_desc:-models.fallback} ($_mk_reason)"
+        echo "    [mktg] ↪ fallback produced the draft"
+      else
+        fail "content model could not reach its provider ($_mk_reason) and no models.fallback is configured — nothing staged"
+      fi
+    else
+      fail "content model failed: $(tail -c 600 "$OUT/$ID.model.err" 2>/dev/null | tr '\n' ' ')"
+    fi
   fi
   [[ -s "$RAW" ]] || fail "empty draft (model produced no output)"
   stage_draft "$RAW"
@@ -208,6 +242,7 @@ if [[ "${DRY_RUN:-}" == "1" ]]; then made="placeholder draft (dry-run)"; else ma
 - Produced: $made
 - Staged → $DRAFT (NOT published)
 EOF
+  [[ -n "$MKTG_FELL_BACK" ]] && printf -- '- ⚠ provider fallback: %s\n' "$MKTG_FELL_BACK"
   [[ -n "$HANDOFF_NOTE" ]] && printf '%s\n' "$HANDOFF_NOTE"
   [[ -n "$BACKSTOP_NOTE" ]] && printf '%s\n' "$BACKSTOP_NOTE"
   echo "- Awaiting human approval"
