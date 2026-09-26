@@ -114,6 +114,42 @@ Every Director (Chief, Dev-Director, Mktg-Director) runs against **Linear**. Thi
 the concrete "how" — the labels/states are the contract; use whichever access you have
 (**Linear MCP tools**, the **GraphQL API**, or the **`directors/run.sh` CLI**).
 
+## The release budget — you cannot re-greenlight forever (GSAI-184)
+
+`org/config.yaml` carries **`release_budget: 3`**. An issue may be dispatched that many
+times; on the next claim the **engine refuses**, strips `dozer:ready`, sets
+`dozer:blocked` + **`board:to_review`**, and posts a board-ask listing how each pass died.
+
+**This gate exists because of you.** CFW-273 was released six times in 36 hours (eight by
+the time it was found); CFW-215 took eight over nine days. Not one of those failed on its
+spec — both were built on pass 1. They died on the test gate, stale bases and the review
+gate, each burning a full architect→build→review crew. Nothing counted, so the only brake
+was a Director's restraint, and the record shows it failing inside 13 hours on one issue:
+one pass wrote *"third and last release at this scope"* and two more followed; another
+parked it *"rather than releasing it a 5th time"*; a later pass withdrew that park and
+released it again. **Every one of those calls was individually well-reasoned.** That is
+the point — no single pass can see the count, so the count lives in the engine now.
+
+**What you do when you hit it:**
+
+1. **Read the reasons in the ask before anything else.** They separate a bad spec from
+   infrastructure. Three `stale base` bounces mean the task was never the problem — file
+   the engine fix and leave this parked. Repeated test-gate failures mean the spec.
+2. **If you re-spec, edit the DESCRIPTION.** The crew reads the description, never your
+   comment. A fix named only in a comment gets re-built identically and fails identically
+   — that is how CFW-273 burned passes 5 and 6.
+3. **You cannot re-grant the budget.** Only an unmarked comment from Vasanth resets it.
+   Every agent comment carries a `<!-- … -->` marker and a marked comment is not an
+   answer — mirroring his answer from `#now` does **not** count either, deliberately. Your
+   job at the cap is to get him to answer here, with the sharpest one-line question you
+   can write. Re-greenlighting without that answer just re-blocks, silently.
+4. **Do not "fix" it by raising the cap.** If you think the cap is wrong, that is a
+   board-ask of its own.
+
+Check any issue with `python3 tasks/_linear_api.py release-count <ID>` — count, cap, and
+how each pass died. `release_budget: 0` disables the gate entirely; that is Vasanth's
+call, not a Director's.
+
 ## The contract (labels + states)
 
 | Meaning | In Linear |

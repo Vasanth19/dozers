@@ -32,7 +32,13 @@
 #                            gets this free (mv into ready/), linear and github had to
 #                            be taught. New backend? Assert the round-trip:
 #                            mark_ready -> list_ready contains <id>.
-#   task_claim <id>       -> take the task, non-zero if already taken.
+#   task_claim <id>       -> take the task, non-zero if already taken. A backend MAY
+#                            also refuse a claim on policy and exit 4: the linear
+#                            backend does this when an issue has exhausted its release
+#                            budget (GSAI-184 — org/config.yaml `release_budget:`),
+#                            having already stripped the greenlight and raised a
+#                            board-ask. dozer.sh logs 4 distinctly; every other
+#                            non-zero keeps meaning "someone else got there first".
 #                            Atomic on the files backend (single rename); best-effort
 #                            on github (read-then-write) — assumes ONE worker/runner,
 #                            which the cloud Action and a single local loop both satisfy.
