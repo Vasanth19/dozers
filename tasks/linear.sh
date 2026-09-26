@@ -32,7 +32,7 @@ _LIN="$ROOT/tasks/_linear_api.py"
 task_list_untriaged() { python3 "$_LIN" list-untriaged; }
 task_list_ready()     { python3 "$_LIN" list-ready; }
 task_mark_ready()     { python3 "$_LIN" mark-ready "$1" "$2"; }
-task_claim()          { python3 "$_LIN" claim "$1"; }      # exits 1 if already claimed
+task_claim()          { python3 "$_LIN" claim "$1"; }      # 1 = already claimed, 4 = release budget exhausted (GSAI-184)
 task_done()           { python3 "$_LIN" done "$1"; }
 task_comment()        { local id="$1"; shift; python3 "$_LIN" comment "$id" "$*"; }
 
@@ -58,6 +58,11 @@ task_audit_strip()     { python3 "$_LIN" audit-strip "$1"; }    # hygiene: strip
 # board protocol (GSAI-41) — read-only reconcile probe: did Vas answer the newest board-ask?
 # exit 0 = answered (prints `<createdAt>\t<first line>` per answer), 3 = waiting, 2 = no ask.
 task_board_answer()  { python3 "$_LIN" board-answer "$1"; }
+
+# release budget (GSAI-184) — read-only: how many times has this issue been dispatched
+# on its current budget, what is the cap, and how did those passes die. The gate itself
+# lives inside claim(); this is only the window onto it.
+task_release_count() { python3 "$_LIN" release-count "$1"; }
 
 # weekly focus (GSAI-176) — one human line describing the active focus window. No Linear
 # call: it reads org/config.yaml only, so dozer.sh can print it in its startup banner and

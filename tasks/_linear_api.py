@@ -648,9 +648,16 @@ def mark_ready(identifier, lane):
 
 
 def claim(identifier):
+    """Take the task. Exit 1 = already claimed, exit 4 = release budget exhausted.
+
+    The budget gate sits HERE rather than in dozer.sh so every caller is covered by
+    construction — see the release-budget block below for why an engine-level count is
+    the only kind that holds (GSAI-184)."""
     iss = issue(identifier)
     if not _has(iss["labels"]["nodes"], READY):
         sys.exit(1)  # already claimed (dozer:ready is gone)
+    if not budget_check(iss):
+        sys.exit(4)  # refused + escalated to the board; distinct from "already claimed"
     _relabel(iss, add=[INPROG], remove=[READY], state_type="started")
 
 
@@ -957,7 +964,15 @@ def _now_iso():
 
 
 def _issue_comments(identifier):
-    d = gql('query($i:String!){ issue(id:$i){ comments(first:100){ nodes{ body createdAt url } } } }',
+    # first:250 (Linear's page maximum), raised from 100 with GSAI-184. `first:` returns
+    # the OLDEST n, so a truncated fetch silently drops the NEWEST comments — which for
+    # the release budget means undercounting dispatches. That direction is the safe one
+    # (the gate fails open rather than refusing work it has no evidence against) but it
+    # is still wrong, and a long-running issue like CFW-215 was already at 31. A single
+    # page is deliberate: this runs inside claim(), and paginating every dispatch to
+    # defend against a >250-comment issue would cost every claim for a case that has
+    # never occurred. If one ever does, the count reads low and the gate under-fires.
+    d = gql('query($i:String!){ issue(id:$i){ comments(first:250){ nodes{ body createdAt url } } } }',
             {"i": identifier})
     iss = d["issue"]
     if not iss:
@@ -1025,6 +1040,219 @@ def alarm_clear(identifier, body):
     print(f'{identifier} -> {BOARD_RESPONDED if human else "flag removed"} {url}')
 
 
+# --- the release budget: an issue may not be re-released forever (GSAI-184) -------
+# THE FAILURE THIS CLOSES. CFW-273 was released SIX times between 2026-09-22 and
+# 09-23; CFW-215 took eight over nine days. Not one of those passes failed because
+# the spec was wrong — the feature was built and committed on pass 1 (13 files,
+# +957). They failed on the test gate (3x), a stale base (1x) and the review gate
+# (2x), and each one burned a full architect->build->review crew.
+#
+# Nothing counted. `grep -rn 'attempt\|retry' ` over this engine finds hits only in
+# tests/ — mark_ready() just sets a label and has no memory of how many times it has
+# set it. So the ONLY brake was a Director's self-restraint, and the record shows that
+# brake failing in writing, on one issue, inside 13 hours:
+#
+#   09-23 06:46  a Director: "third and last release at this scope"   -> two more followed
+#   09-23 13:10  a Director parks it: "rather than releasing it a 5th time"
+#   09-23 19:19  a later pass withdraws that park and releases it a 6th time
+#
+# Every one of those decisions was individually well-reasoned. That is the whole
+# point: judgment cannot hold a line the engine does not enforce, because each pass
+# only sees its own reasoning and none of them sees the count. So the count lives here.
+#
+# WHERE. Inside claim() — the single door every dispatch goes through, for every lane,
+# every team, every backend caller. Not in dozer.sh (that leaves directors/run.sh
+# uncovered) and emphatically not as advice in a Director template, which is precisely
+# the brake that already failed.
+#
+# HOW IT COUNTS. From Linear, never from local state: `~/.dozers` is ephemeral scratch
+# and doctrine is "state lives in Linear. There is no dozer DB." The record already
+# exists — dozer.sh posts "Dozer claimed - lane:<lane>…" on every single dispatch, and
+# GSAI-60 hardened that line into an anchored AGENT_SIGNATURE. Counting those comments
+# needs no new state anywhere.
+#
+# HOW IT RESETS — and why only Vasanth can reset it. A budget with no reset bricks an
+# issue whose spec genuinely changed, so exhausting it raises a board-ask and the
+# budget is re-granted by ONE thing: an unmarked human comment after that ask. That is
+# unforgeable by construction — every agent comment carries a `<!-- … -->` marker
+# (GSAI-60 stamps it automatically in _stamp_marker), and a marker disqualifies a
+# comment as an answer. A Director cannot vote itself more budget.
+#
+# A `<!-- board-mirror src:… -->` comment deliberately does NOT re-grant it, even
+# though doctrine §3 lets Vasanth answer in #now and have a Director mirror it here.
+# That is the one deliberate piece of friction in this gate: accepting a marked mirror
+# would hand the reset back to the Directors, which is the exact hole this closes. At
+# pass N the Director's job is to get Vasanth to answer, not to relay an answer.
+#
+# FAILS OPEN, LOUDLY. A budget check that cannot read Linear lets the claim through and
+# says so on stderr — same direction as focus_config() and director-precheck.py: a gate
+# that cannot decide must never silently stop the factory. The window is tiny anyway,
+# since a Linear outage stops the poll that feeds claim() in the first place.
+BUDGET_BY = "by:dozer-budget"
+BUDGET_ASK_RE = re.compile(r"<!--\s*board-ask\b[^>]*\bby:dozer-budget\b[^>]*-->")
+CLAIMED_RE = re.compile(r"^Dozer claimed\b", re.M)
+BLOCKED_RE = re.compile(r"^Dozer blocked\b.*?Reason:\s*(.*)$", re.M | re.S)
+DEFAULT_RELEASE_BUDGET = 3
+
+
+def release_budget():
+    """The cap, read once: env (tests) > org/config.yaml `release_budget:` > 3.
+
+    0 or a negative value DISABLES the gate — an explicit, greppable off switch beats
+    someone commenting the call site out. An unparseable value is not silently ignored:
+    it falls back to the default and says why, because a typo'd cap that reads as
+    "unlimited" would restore the exact bug this closes."""
+    raw = os.environ.get("DOZER_RELEASE_BUDGET")
+    if raw is None:
+        try:
+            with open(_config_path()) as fh:
+                for ln in fh:
+                    m = re.match(r'^\s*release_budget:\s*(.*)$', ln)
+                    if m:
+                        raw = _scalar(_strip_comment(m.group(1)))
+                        break
+        except OSError as e:
+            print(f"budget: cannot read config ({e}) — using default {DEFAULT_RELEASE_BUDGET}",
+                  file=sys.stderr)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_RELEASE_BUDGET
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        print(f"budget: release_budget '{raw}' is not an integer — using default "
+              f"{DEFAULT_RELEASE_BUDGET}", file=sys.stderr)
+        return DEFAULT_RELEASE_BUDGET
+
+
+def release_state(comments):
+    """Pure. How many times has this issue been dispatched on its current budget?
+
+    Returns (count, outstanding_ask, reasons):
+      count           "Dozer claimed" comments since the budget was last granted
+      outstanding_ask the budget board-ask still waiting on a human answer, or None
+      reasons         each "Dozer blocked … Reason: …" in that same window, in order —
+                      the evidence the escalation shows Vasanth, so he can tell a spec
+                      problem from three infrastructure bounces at a glance.
+
+    The budget is granted at the start of time and re-granted by an unmarked human
+    comment that follows a budget ask. is_human_answer() is the same predicate the
+    board reconcile uses (GSAI-41/60): no marker, and no known agent signature."""
+    comments = sorted(comments, key=lambda c: c["createdAt"])
+    granted_at = ""          # before every real createdAt — the issue's first budget
+    outstanding = None
+    for c in comments:
+        body = c.get("body") or ""
+        if BUDGET_ASK_RE.search(body):
+            outstanding = c
+        elif outstanding is not None and is_human_answer(body):
+            granted_at, outstanding = c["createdAt"], None
+    window = [c for c in comments if c["createdAt"] > granted_at]
+    count = sum(1 for c in window if CLAIMED_RE.search(c.get("body") or ""))
+    reasons = []
+    for c in window:
+        m = BLOCKED_RE.search(c.get("body") or "")
+        if m:
+            # Strip the provenance marker before it reaches the escalation body: every
+            # engine comment carries one (_stamp_marker), and `Reason:` runs to end-of-
+            # body, so an un-stripped reason reads as "tests failed after 641s <!--
+            # board-note by:dozer-engine -->" on Vasanth's board.
+            reasons.append(" ".join(MARKER_RE.sub("", m.group(1)).split())[:110])
+    return count, outstanding, reasons
+
+
+def _budget_ask_body(identifier, count, cap, reasons):
+    lines = [
+        f"**Release budget exhausted — {identifier} has been dispatched {count} time(s) "
+        f"on one budget (cap {cap}). The engine is refusing to release it again.**",
+        "",
+        "This is not a verdict on the work. It is the engine saying: something here is "
+        "not converging, and another identical pass is not going to find it. Each pass "
+        "costs a full architect→build→review crew.",
+    ]
+    if reasons:
+        lines += ["", "**How the passes died** — read this before re-specing; it "
+                      "separates a bad spec from infrastructure:"]
+        lines += [f"{n}. {r}" for n, r in enumerate(reasons, 1)]
+    lines += [
+        "",
+        "**Options**",
+        "(a) **Re-spec** — the crew reads the DESCRIPTION, never a comment. If the fix "
+        "is only named in a comment it will be re-built identically and fail identically. "
+        "Edit the description, then answer here.",
+        "(b) **Split it** — a repeated gate failure on a large issue is usually two "
+        "issues wearing one hat.",
+        "(c) **Fix the gate, not the task** — if the reasons above are stale bases or "
+        "timeouts, the task was never the problem; file the engine fix and leave this parked.",
+        "(d) **Drop it** — close it and say so.",
+        "",
+        f"**To re-grant the budget, comment on this issue.** Any plain comment from you "
+        f"resets the count to zero and the next greenlight runs. A Director cannot do it "
+        f"for you — every agent comment carries a marker, and a marked comment is not an "
+        f"answer. Mirroring your answer from #now does not count either, on purpose.",
+    ]
+    return "\n".join(lines)
+
+
+def budget_refuse(iss, count, cap, reasons, outstanding):
+    """Refuse the claim and put the decision on Vasanth's board.
+
+    The labels matter more than the comment. dozer:ready comes OFF — block() alone
+    would not remove it (it only drops in-progress, because every ordinary caller has
+    already had it removed by claim()), and an issue left ready would be re-polled 30
+    seconds later into a tight loop. board:to_review is the teeth: it is the one pile a
+    Director cannot clear itself, and mark_ready() does not strip it, so a re-greenlight
+    leaves the question standing.
+
+    Idempotent: an ask already outstanding is not re-posted. A re-greenlight past the cap
+    is silently re-blocked with one stderr line, because an alarm that duplicates itself
+    on every poll is how a real one stops being read (GSAI-180)."""
+    _relabel(iss, add=[BLOCKED, BOARD_REVIEW], remove=[READY, INPROG, BOARD_RESPONDED],
+             state_type="unstarted")
+    ident = iss["identifier"]
+    if outstanding is not None:
+        print(f"budget: {ident} re-greenlit past the cap ({count}/{cap}) — re-blocked; "
+              f"the ask from {outstanding['createdAt']} is still unanswered", file=sys.stderr)
+        return
+    body = f"{_budget_ask_body(ident, count, cap, reasons)}\n\n<!-- board-ask id:{_now_iso()} {BUDGET_BY} -->"
+    url = _comment_url(ident, body)
+    print(f"budget: {ident} exhausted its release budget ({count}/{cap}) -> "
+          f"{BLOCKED} + {BOARD_REVIEW} {url}", file=sys.stderr)
+
+
+def budget_check(iss):
+    """May this issue be dispatched? True = yes. False = refused (and escalated).
+
+    Fails OPEN on any error reading Linear: the claim proceeds and the reason is named
+    on stderr. gql() dies via sys.exit, so SystemExit is caught alongside Exception —
+    otherwise a single API hiccup would read as a refusal."""
+    cap = release_budget()
+    if cap <= 0:
+        return True
+    try:
+        count, outstanding, reasons = release_state(_issue_comments(iss["identifier"]))
+    except (Exception, SystemExit) as e:
+        print(f"budget: check could not run for {iss['identifier']} ({e}) — allowing the "
+              f"claim (fail-open)", file=sys.stderr)
+        return True
+    if count < cap:
+        return True
+    budget_refuse(iss, count, cap, reasons, outstanding)
+    return False
+
+
+def release_count(identifier):
+    """CLI: `release-count <ID>` — the count, the cap and how the passes died.
+    Read-only; the observability half of the gate, and what the tests assert against."""
+    cap = release_budget()
+    count, outstanding, reasons = release_state(_issue_comments(identifier))
+    print(f"{identifier}\treleases={count}\tcap={cap}\t"
+          f"{'EXHAUSTED' if cap > 0 and count >= cap else 'ok'}\t"
+          f"ask={'outstanding' if outstanding else 'none'}")
+    for n, r in enumerate(reasons, 1):
+        print(f"  {n}. {r}")
+
+
+
 def count_ready():
     """How many greenlit (dozer:ready + lane:) issues are queued across the configured
     teams — the third alarm row (alive but not dispatching) needs the number, not the list."""
@@ -1069,6 +1297,7 @@ OPS = {
     "count-ready": lambda a: count_ready(),
     "focus-line": lambda a: focus_line(),     # GSAI-176: one human line, no Linear call
     "board-answer": lambda a: board_answer(a[0]),
+    "release-count": lambda a: release_count(a[0]),   # GSAI-184: the budget, read-only
 }
 
 if __name__ == "__main__":

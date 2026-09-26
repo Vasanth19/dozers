@@ -88,6 +88,33 @@ fanout_by_group:
 # An out-of-focus skip posts NO Linear comment (hundreds of issues are out of focus in
 # any week — that would be spam). It gets one stderr line per issue per day plus one
 # summary line per poll: `focus: <n> in-focus ready, <m> out-of-focus skipped`.
+# ── The release budget (GSAI-184) ───────────────────────────────────────────
+# How many times ONE issue may be dispatched before the engine refuses and puts the
+# decision on Vasanth's board. 0 or negative disables the gate.
+#
+# Vasanth, 2026-09-24, on finding CFW-273 had been released six times: "this is crazy".
+# CFW-273 went six passes between 09-22 and 09-23; CFW-215 took eight over nine days.
+# Not one of those failed on the spec — the feature was built and committed on pass 1
+# (13 files, +957). They failed on the test gate (3x), a stale base (1x) and the review
+# gate (2x), each burning a full architect->build->review crew.
+#
+# The greenlight answers "may this run?" and the focus above answers "is this this
+# week's work?". Neither ever answered "have we already tried this five times?" — and
+# nothing in the engine counted, so the only brake was a Director's self-restraint. That
+# brake is on the record failing inside 13 hours on one issue: a Director wrote "third
+# and last release at this scope" and two more followed; another parked it explicitly
+# "rather than releasing it a 5th time"; a later pass withdrew that park and released it
+# a 6th time. Every decision was individually well-reasoned. None of them could see the
+# count, which is why the count now lives in the engine (tasks/_linear_api.py, claim()).
+#
+# Exhausting it is not a failure verdict — it raises a board-ask carrying HOW each pass
+# died, so a bad spec is visibly distinguishable from three infrastructure bounces. Only
+# an unmarked comment from Vasanth re-grants the budget; a Director cannot vote itself
+# more, because every agent comment carries a marker and a marked comment is not an
+# answer. 3 is deliberately low: by pass 3 the evidence is in, and answering costs one
+# comment while a fourth pass costs a crew.
+release_budget: 3
+
 focus:
   projects: ["CFW: Sellable V1", "CFW: Platform Publishers", "MGG: Reels"]
   until: "2026-09-27"

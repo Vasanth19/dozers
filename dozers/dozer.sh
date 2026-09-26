@@ -426,7 +426,20 @@ run_one() { # <id> <lane> <title> [priority] [kr-due]
   local art="$ROOT/.artifacts/$art_dir"
   [[ -x "$crew" ]] || { echo "  x no crew for lane '$lane' ($lane_dir) - skipping #$id" >&2; return 0; }
 
-  if ! task_claim "$id"; then echo "  ~ #$id already claimed, skipping" >&2; return 0; fi
+  # GSAI-184: exit 4 = the release budget is exhausted. The backend has already
+  # refused, stripped dozer:ready and raised a board-ask, so this is a NORMAL skip (the
+  # lock releases as usual) — but it must not be logged as "already claimed", because
+  # that line reads as a harmless race and this one means a human now owns the decision.
+  # Any other non-zero keeps the old meaning; only the linear backend returns 4.
+  local claim_rc=0
+  task_claim "$id" || claim_rc=$?
+  if (( claim_rc == 4 )); then
+    echo "  ! #$id release budget exhausted - refused, escalated to the board, skipping" >&2
+    return 0
+  elif (( claim_rc != 0 )); then
+    echo "  ~ #$id already claimed, skipping" >&2
+    return 0
+  fi
   task_comment "$id" "Dozer claimed - lane:$lane. Starting now; will post a summary on finish."
 
   # GSAI-173: spend-visibility metadata for this run, fetched once so the claim line
