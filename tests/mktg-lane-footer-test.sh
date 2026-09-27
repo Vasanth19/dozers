@@ -156,10 +156,18 @@ has "$ART/FT-8.fail" "no --safe-mode" && ok "NOFLAG fail reason names --safe-mod
 # ── ENGINE: files backend, real engine, real crew, stub model ─────────────────
 echo "== ENGINE"
 ER="$TMP/engine"; mkdir -p "$ER/dozers"
-ln -s "$ROOT/dozers/dozer.sh" "$ER/dozers/dozer.sh"
+# Link EVERY top-level dozers/*.sh, not a hand-picked list. A crew resolves what it
+# sources from its OWN path — `dirname $BASH_SOURCE/..` — which inside this fake root is
+# $ER/dozers, so a helper the fixture forgot is simply absent and the crew dies on line
+# 1 of its run. That is GSAI-185: 3f08d6b made crews source a SECOND helper
+# (model-failure.sh, the provider-outage fallback) next to timebox.sh, the list here
+# still named only timebox.sh, and all 7 ENGINE assertions failed with
+# "model-failure.sh: No such file or directory" — a red gate that looked like a broken
+# marketing lane and was really a stale fixture. Globbing means the next helper added
+# beside them needs no edit here. (Crews currently source timebox.sh + model-failure.sh;
+# the rest are harmless to link.)
+for _h in "$ROOT"/dozers/*.sh; do ln -s "$_h" "$ER/dozers/$(basename "$_h")"; done
 ln -s "$ROOT/dozers/mktg-lane" "$ER/dozers/mktg-lane"
-ln -s "$ROOT/dozers/model.sh" "$ER/dozers/model.sh"
-ln -s "$ROOT/dozers/timebox.sh" "$ER/dozers/timebox.sh"   # crews source it (GSAI-37)
 cp -R "$ROOT/tasks" "$ER/tasks"; cp -R "$ROOT/org" "$ER/org"; rm -rf "$ER/tasks/board"
 mkdir -p "$ER/tasks/board/ready"
 printf 'title: Show HN post\nlane: marketing\n\nWrite the Show HN post.\n' > "$ER/tasks/board/ready/ENG-1.md"
