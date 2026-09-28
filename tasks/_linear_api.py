@@ -51,7 +51,7 @@ def gql(query, variables=None):
     req = urllib.request.Request(API, data=body,
                                  headers={"Authorization": KEY, "Content-Type": "application/json"})
     try:
-        r = json.load(urllib.request.urlopen(req))
+        r = json.load(urllib.request.urlopen(req, timeout=30))
     except Exception as e:
         die(f"API call failed: {e}")
     if "errors" in r:
