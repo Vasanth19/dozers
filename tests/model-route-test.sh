@@ -69,29 +69,46 @@ route() {
 
 echo "== model routing =="
 
-# ── DEFAULT: shipped config (2026-09-15): `dev` is a NESTED lane — dev.architect and
-# dev.review → ollama-cloud/glm-5.3:cloud, dev.build → ollama-cloud/kimi-k3:cloud, all
-# with small=glm-5.3-flash:cloud; marketing → ollama-cloud/glm-5.3:cloud with
-# small_model glm-5.3-flash:cloud; default (and a bare `dev`, which has no flat
-# meaning in a nested lane) → claude/claude-opus-5. Since GSAI-170 the shipped BUILD
-# role also carries `max_turns: 60`, which the route hands to the CLI as --max-turns.
+# ── DEFAULT: shipped config (2026-09-21, flipped off ollama in 3f08d6b): every dev
+# role and marketing route to claude/claude-sonnet-5, because ollama-cloud is at 100%
+# of its monthly allowance until the rolling window clears (~mid-October). `dev` is
+# still a NESTED lane, so a bare `dev` has no flat meaning and falls back to
+# models.default (claude/claude-opus-5), as does an unlisted role. Since GSAI-170 the
+# shipped BUILD role carries `max_turns: 60`, handed to the CLI as --max-turns.
+#
+# NOTE the shape difference, which is what went stale in GSAI-185: a NATIVE `claude`
+# route emits `--model <id>` on MODEL_CMD and NO `ANTHROPIC_*` variables. The
+# ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL/SMALL_FAST_MODEL recipe exists only to point the
+# Claude CLI at an ollama endpoint — `model_route.py` scopes `small`/`small_model` to
+# the ollama providers by design, so `models.dev.small` is deliberately INERT while the
+# primaries are on Claude (the CLI picks its own small/fast model). Do not "fix" that
+# by asserting ANTHROPIC_SMALL_FAST_MODEL here; assert the ollama recipe in the
+# OVERRIDE cases below, which is where it belongs.
+#
 # This case tracks WHATEVER ships in org/config.yaml; when the shipped route changes,
 # change these expectations with it (the cap's own behaviour lives in
-# tests/crew-profile-test.sh, which uses a temp config) ──
+# tests/crew-profile-test.sh, which uses a temp config). TO RESTORE the ollama
+# assertions when credits reset, swap them back alongside the four config routes ──
 out="$(route env dev.build)"
-if has "$out" "export DOZER_MODEL_PROVIDER=ollama-cloud" \
-   && has "$out" "export ANTHROPIC_MODEL=kimi-k3:cloud" \
-   && has "$out" "export ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash:cloud" \
+if has "$out" "export DOZER_MODEL_PROVIDER=claude" \
+   && has "$out" "export DOZER_MODEL_NAME=claude-sonnet-5" \
+   && has "$out" "export DOZER_MODEL_SOURCE=config:models.dev.build" \
    && has "$out" "export DOZER_MODEL_MAX_TURNS=60" \
-   && has "$out" "export MODEL_CMD='claude -p --max-turns 60'"; then
-  ok "DEFAULT dev.build -> ollama-cloud/kimi-k3:cloud (+ small flash, 60-turn cap) via claude -p"
-else no "DEFAULT dev.build should route to ollama-cloud/kimi-k3:cloud; got: $out"; fi
+   && has "$out" "export MODEL_CMD='claude -p --model claude-sonnet-5 --max-turns 60'"; then
+  ok "DEFAULT dev.build -> claude/claude-sonnet-5 (+ 60-turn cap) via claude -p --model"
+else no "DEFAULT dev.build should route to claude/claude-sonnet-5; got: $out"; fi
+# A native claude route must emit NO ollama recipe — asserting the absence is the half
+# that would have caught 3f08d6b's config flip leaving this test behind.
+if ! has "$out" "export ANTHROPIC_MODEL=" && ! has "$out" "export ANTHROPIC_BASE_URL="; then
+  ok "DEFAULT dev.build emits no ANTHROPIC_* recipe (native claude, not an ollama shim)"
+else no "native claude route must not emit ANTHROPIC_BASE_URL/MODEL; got: $out"; fi
 out="$(route env marketing)"
-if has "$out" "export ANTHROPIC_MODEL=glm-5.3:cloud" \
-   && has "$out" "export ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash:cloud" \
-   && has "$out" "export MODEL_CMD='claude -p'"; then
-  ok "DEFAULT marketing -> ollama-cloud/glm-5.3:cloud (+ small flash) via claude -p"
-else no "DEFAULT marketing should route to ollama-cloud/glm-5.3:cloud; got: $out"; fi
+if has "$out" "export DOZER_MODEL_PROVIDER=claude" \
+   && has "$out" "export DOZER_MODEL_NAME=claude-sonnet-5" \
+   && has "$out" "export DOZER_MODEL_SOURCE=config:models.marketing" \
+   && has "$out" "export MODEL_CMD='claude -p --model claude-sonnet-5'"; then
+  ok "DEFAULT marketing -> claude/claude-sonnet-5 via claude -p --model"
+else no "DEFAULT marketing should route to claude/claude-sonnet-5; got: $out"; fi
 # an unlisted role falls back to models.default
 out="$(route env sales)"
 has "$out" "config:models.default" && ok "DEFAULT unlisted role falls back to models.default" \
