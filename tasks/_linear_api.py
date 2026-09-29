@@ -519,6 +519,18 @@ def _parse_focus(text):
 _FOCUS = None
 
 
+def _validate_focus_projects(configured_projects):
+    """Return the list of configured projects that have no matching issues.
+
+    If all configured projects have at least one matching issue, returns empty list.
+    This validation happens only when the focus is active, to give immediate feedback
+    if the projects list is misconfigured."""
+    if not configured_projects:
+        return []
+    used_projects = {_project_name(i) for i in _all_issues() if _project_name(i)}
+    return [p for p in configured_projects if p not in used_projects]
+
+
 def focus_config():
     """The weekly focus, read ONCE per process. Returns the parsed block plus:
        active  bool   — the gate binds
@@ -553,12 +565,21 @@ def focus_config():
         f["days"] = (until - today).days
         if f["days"] < 0:
             f["active"] = False
-            f["reason"] = f"no focus (focus.until {f['until']} has passed — clear it or extend it)"
+            f["reason"] = (f"no focus (focus.until {f['until']} has passed — clear it or extend it) "
+                           f"— {len(f['projects'])} project(s) were configured: "
+                           + " · ".join(f["projects"]))
         else:
             f["active"] = True
-            f["reason"] = (f"FOCUS until {f['until']} ({f['days']} days left): "
-                           + " · ".join(f["projects"])
-                           + (f" — {f['note']}" if f["note"] else ""))
+            invalid = _validate_focus_projects(f["projects"])
+            if invalid:
+                f["reason"] = (f"FOCUS until {f['until']} ({f['days']} days left): "
+                               + " · ".join(f["projects"])
+                               + (f" — {f['note']}" if f["note"] else "")
+                               + f" ⚠️  WARNING: these project(s) have no matching issues: {', '.join(invalid)}")
+            else:
+                f["reason"] = (f"FOCUS until {f['until']} ({f['days']} days left): "
+                               + " · ".join(f["projects"])
+                               + (f" — {f['note']}" if f["note"] else ""))
     _FOCUS = f
     return f
 
