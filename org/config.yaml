@@ -116,9 +116,9 @@ fanout_by_group:
 release_budget: 3
 
 focus:
-  projects: ["CFW: Sellable V1", "CFW: Platform Publishers", "MGG: Reels"]
-  until: "2026-09-27"
-  note: "Week of 2026-09-20: first revenue (10 paying brands), publish path live, MGG content engine. Everything else waits."
+  projects: ["CFW: Sellable V1", "MGG: Reels"]
+  until: "2026-10-06"
+  note: "Week of 2026-09-29 (Vas: same priorities as last week). Two, not three: CFW: Platform Publishers COMPLETED 2026-09-23 and was dropped — a finished project here is an inert slot, never a third priority, because the gate is an exact name match and a completed project has no open issues to admit (GSAI-186)."
 
 # Only used when backend: github
 repo: "OWNER/REPO"             # e.g. acme/dozers
