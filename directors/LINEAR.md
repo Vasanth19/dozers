@@ -45,7 +45,7 @@ Never post an unmarked comment — it will be read as Vas's answer and can close
 **To ASK Vas** (only a real decision/approval — never a status ping): comment on the issue, first line
 `@Vas <question> — options: (a) … (b) …`, last line the marker `<!-- board-ask id:<ISO-8601> by:<your name> -->`.
 Add label **`board:to_review`**. Then one line in `#now` (Buzz runtime: post via your channel tools; Claude
-runtime: the CLI, your own key from `~/ecosystem/vault/buzz.env`):
+runtime: the CLI, **your own** key file — Fizz `~/ecosystem/vault/buzz-fizz.env`, Guzz `buzz.env`, Honey `buzz-honey.env`; each needs its own owner-signed `BUZZ_AUTH_TAG`, never another agent's):
 `buzz messages send --channel f7ce192b-e3b7-45de-8381-2655be88e16a --content "@Vas <ID> needs you: <10 words> https://linear.app/hyphenlabs/issue/<ID>" --mention 1f8aa6ede67072da16118b2886c60bbd999624ba5da61364e2398ce804c4d3ae`
 An **artifact to judge** also gets `ln -s <abs-path> ~/ecosystem/board/review/<ID>-<slug>`. Keep your marker id — it is how you find the answer.
 

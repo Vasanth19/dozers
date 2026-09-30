@@ -8,14 +8,15 @@
 # Pipeline — the automatable spine, with the rest gated (spec: GSAI-7, craft: brain
 # `vasanth-hq/sops/content-production-pipeline.md`):
 #
-#   Phase 1  SUBMIT   — NOT automated. The API key funds ~1 render (`api: 2` credits);
-#                       the usable credits live in the web account, so a human submits
-#                       in Chrome. No matching COMPLETED render -> dozer:blocked with the
-#                       exact title to submit + the recipe + "Motion Engine: Avatar III".
-#                       This crew NEVER calls a HeyGen generate endpoint.
+#   Phase 1  SUBMIT   — automated (GSAI-233). No usable render (none found, or the found
+#                       one is stale/failed/rejected/cancelled) -> the crew submits itself
+#                       via HeyGen's Remote MCP (OAuth, web-plan credits) — never the
+#                       api-key pool, never a raw REST generate/submit endpoint. Ends the
+#                       run with "processing"; the next greenlight downloads it once done.
 #   Gate     STALE    — the script is hashed and compared to the render's record (and
 #                       the script mtime to renderedAt). A render older than its script
-#                       is stale: block, re-submit instruction, no compose, no stage.
+#                       is stale: auto_submit() resubmits it (GSAI-233), no compose,
+#                       no stage this run.
 #   Phase 2  DOWNLOAD — /v1/video_status.get -> signed video_url -> heygen/raw-avatar.mp4,
 #                       ffprobe-asserted (h264, 1080x1920, duration ±1s of the estimate).
 #                       Record refreshed in heygen/heygen-submission.json.
@@ -26,16 +27,25 @@
 #                       captions and the exact `POST /api/v1/posts/quick` payload it
 #                       WOULD send. The publish endpoint is never called. Ever.
 #
-# HeyGen: only /v1/video.list, /v1/video_status.get and /v3/... are allowed — /v2/ sunsets
-# 2026-10-31 and hg_get refuses it. The key is HEYGEN_API_KEY read from the vault
-# (~/ecosystem/vault/secrets.env — NOT the dead ~/.gsai/secrets.env the old SOP named);
-# missing or rejected -> fail fast naming the vault path. Never printed.
+# HeyGen: only /v1/video.list, /v1/video_status.get and /v3/... are allowed via REST —
+# /v2/ sunsets 2026-10-31 and hg_get refuses it. The key is HEYGEN_API_KEY read from the
+# vault (~/ecosystem/vault/secrets.env — NOT the dead ~/.gsai/secrets.env the old SOP
+# named); missing or rejected -> fail fast naming the vault path. Never printed. This
+# key funds ~1 render and is NEVER used to spend — submission (Phase 1) is a separate
+# credential path: HeyGen's Remote MCP (OAuth, web-plan credits, GSAI-233).
 #
 # Env (from crew.sh): ID/TITLE args, WORKDIR, REPO_ROOT, DOZER_BRIEF, MODEL_CMD, MODEL_DESC.
 # Knobs (tests + deliberate runs):
 #   HEYGEN_VAULT      path of the env file holding HEYGEN_API_KEY (default: the vault)
 #   HEYGEN_API_BASE   API origin (default https://api.heygen.com; tests point it at a stub)
 #   HEYGEN_LIST_LIMIT how many recent renders to scan for a title match (default 50)
+#   HEYGEN_MCP_VAULT  env file holding the Remote MCP OAuth tokens (default:
+#                     ~/ecosystem/vault/heygen-mcp-oauth.env — populated by a ONE-TIME
+#                     human OAuth login, outside this script)
+#   HEYGEN_MCP_URL    Remote MCP Streamable-HTTP endpoint (default https://mcp.heygen.com/mcp/v1/;
+#                     tests point it at a stub)
+#   HEYGEN_MCP_TOOL   the submit tool name (default create_video)
+#   HEYGEN_MCP_TOKEN_URL  OAuth refresh-grant endpoint (default https://mcp.heygen.com/oauth/token)
 #   COMPOSE_CMD       replaces the recipe compose step (gets PRODUCTION_DIR, RECIPE,
 #                     RECIPE_DIR, RAW_AVATAR, OUT_MP4, OUT_COVER in the env)
 #   DRY_RUN=1         compose = ffmpeg passthrough of the raw avatar (no model)
@@ -58,7 +68,6 @@ RECIPE_SKILLS_DIR="${RECIPE_SKILLS_DIR:-$HOME/ecosystem/harness/skills}"
 EXPECT_WH="${DOZER_VIDEO_EXPECT_WH:-1080x1920}"
 DUR_TOL="${DOZER_VIDEO_DURATION_TOLERANCE:-1}"
 FINAL_MIN_S="${DOZER_FINAL_MIN_SECONDS:-18}"
-SOP_REF='brain: vasanth-hq/sops/content-production-pipeline.md (Phase 1 — HeyGen submit via Chrome)'
 
 log()  { echo "    [mktg/video] $*"; }
 # fail: the reason goes to stderr AND to $OUT/<id>.fail — the engine puts that file in
@@ -171,7 +180,7 @@ hg_get() {
   local path="$1" body="$HG_TMP/resp.json" http
   case "$path" in
     /v2/*) fail "refusing HeyGen $path — /v2/ endpoints sunset 2026-10-31; use /v1/video.list, /v1/video_status.get, /v3/…" ;;
-    *generate*|*submit*|*create*) fail "refusing HeyGen $path — submission is a human step (Phase 1), the crew never spends credits" ;;
+    *generate*|*submit*|*create*) fail "refusing HeyGen $path — this crew never spends credits over REST; submission goes through HeyGen's Remote MCP only (GSAI-233)" ;;
   esac
   http="$(curl -sS -m 60 -o "$body" -w '%{http_code}' -H "X-Api-Key: $HEYGEN_API_KEY" -H 'Accept: application/json' "$HEYGEN_API_BASE$path" 2>"$HG_TMP/curl.err")" \
     || fail "HeyGen $path unreachable: $(head -c 300 "$HG_TMP/curl.err")"
@@ -189,8 +198,28 @@ PY
   cat "$body"
 }
 
-# ── Phase 1 — SUBMIT is human. Find a COMPLETED render or block with the exact ask ─
+# ── Phase 1 — SUBMIT is automated via HeyGen's Remote MCP (GSAI-233) ──────────────
 SUB="$PROD_DIR/heygen/heygen-submission.json"; mkdir -p "$PROD_DIR/heygen"
+
+# Refresh the record (audit trail for cost + reproducibility). Merges into what exists.
+write_record() { # key=value pairs (JSON-typed where it matters)
+  python3 - "$SUB" "$@" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+d = {}
+if os.path.exists(p):
+    try: d = json.load(open(p))
+    except Exception: d = {}
+for kv in sys.argv[2:]:
+    k, v = kv.split("=", 1)
+    if v.startswith("json:"):
+        v = json.loads(v[5:])
+    d[k] = v
+tmp = p + ".tmp"
+json.dump(d, open(tmp, "w"), indent=2); open(tmp, "a").write("\n")
+os.replace(tmp, p)
+PY
+}
 sub_get() { # <key> -> value or empty (missing/invalid file => empty)
   [[ -f "$SUB" ]] || { printf ''; return 0; }
   python3 - "$SUB" "$1" <<'PY' 2>/dev/null || printf ''
@@ -200,20 +229,173 @@ except Exception: sys.exit(0)
 v = d.get(sys.argv[2]); print("" if v is None else v)
 PY
 }
+# resolve_avatar_voice: "<avatarId> <voiceId>" — the submission record first, else
+# .config/brand.yaml's heygen: block. Either may come back empty; the caller decides
+# whether that's fatal (auto_submit requires both, Phase 2's record-enrichment doesn't).
+resolve_avatar_voice() {
+  local a v yaml="$BRAND_DIR/.config/brand.yaml"
+  a="$(sub_get avatarId)"; v="$(sub_get voiceId)"
+  if [[ -f "$yaml" ]]; then
+    [[ -z "$a" ]] && a="$(grep -oE 'avatarId:[[:space:]]*"?[0-9a-f]{32}' "$yaml" | head -1 | grep -oE '[0-9a-f]{32}' || true)"
+    [[ -z "$v" ]]  && v="$(grep -oE 'voiceId:[[:space:]]*"?[0-9a-f]{32}' "$yaml" | head -1 | grep -oE '[0-9a-f]{32}' || true)"
+  fi
+  printf '%s %s\n' "$a" "$v"
+}
 WANT_TITLE="$(sub_get title)"; WANT_TITLE="${WANT_TITLE:-$SLUG}"
 SUB_VID="$(sub_get videoId)"
 
-submit_instruction() {
-  cat <<EOF
-SUBMIT NEEDED (human, in Chrome — the API key cannot fund renders):
-  1. app.heygen.com → New video (portrait 9:16, 1080p) → brand avatar + voice
-  2. Motion Engine: Avatar III (2 credits — never Avatar V at 9)
-  3. Script: paste the TTS block verbatim from $SCRIPT_REL (sha256 ${SCRIPT_SHA:0:12}…)
-  4. Generate → title EXACTLY: $WANT_TITLE   (watermark off, MP4)
-  5. Save $SUB with {"title":"$WANT_TITLE","status":"submitted","motionEngine":"Avatar III","creditsCost":2}
-Recipe on compose: $RECIPE. Then re-greenlight this issue (dozer:ready + lane:marketing).
-$SOP_REF
-EOF
+# ── HeyGen Remote MCP client — OAuth, web-plan credits (GSAI-233) ─────────────────
+# Populating HEYGEN_MCP_VAULT is a ONE-TIME human OAuth login outside this script (same
+# category as adding HEYGEN_API_KEY to the vault by hand) — video.sh is headless and
+# never performs an interactive login.
+HEYGEN_MCP_VAULT="${HEYGEN_MCP_VAULT:-$HOME/ecosystem/vault/heygen-mcp-oauth.env}"
+HEYGEN_MCP_URL="${HEYGEN_MCP_URL:-https://mcp.heygen.com/mcp/v1/}"
+HEYGEN_MCP_TOOL="${HEYGEN_MCP_TOOL:-create_video}"
+HEYGEN_MCP_TOKEN_URL="${HEYGEN_MCP_TOKEN_URL:-https://mcp.heygen.com/oauth/token}"
+
+mcp_tok_get() { # <key> -> value from the MCP OAuth vault, empty if missing
+  [[ -f "$HEYGEN_MCP_VAULT" ]] || { printf ''; return 0; }
+  grep -E "^(export[[:space:]]+)?$1=" "$HEYGEN_MCP_VAULT" | head -1 \
+    | sed "s/^export[[:space:]]*//; s/^$1=//; s/^\"//; s/\"\$//; s/^'//; s/'\$//"
+}
+# hg_mcp_refresh: one refresh-grant attempt. Rewrites the vault atomically (tmp+rename —
+# NOT write_record, that's a different file). Returns 1 on any failure; never partially
+# writes the vault.
+hg_mcp_refresh() {
+  local refresh cid resp http new_access new_refresh tmp
+  refresh="$(mcp_tok_get HEYGEN_MCP_REFRESH_TOKEN)"
+  [[ -n "$refresh" ]] || return 1
+  cid="$(mcp_tok_get HEYGEN_MCP_CLIENT_ID)"
+  resp="$HG_TMP/mcp-refresh.json"
+  if [[ -n "$cid" ]]; then
+    http="$(curl -sS -m 30 -o "$resp" -w '%{http_code}' -d grant_type=refresh_token -d "refresh_token=$refresh" -d "client_id=$cid" "$HEYGEN_MCP_TOKEN_URL" 2>"$HG_TMP/mcp-refresh.err")" || return 1
+  else
+    http="$(curl -sS -m 30 -o "$resp" -w '%{http_code}' -d grant_type=refresh_token -d "refresh_token=$refresh" "$HEYGEN_MCP_TOKEN_URL" 2>"$HG_TMP/mcp-refresh.err")" || return 1
+  fi
+  [[ "$http" == 2?? ]] || return 1
+  new_access="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("access_token") or "")
+except Exception: print("")' "$resp")"
+  [[ -n "$new_access" ]] || return 1
+  new_refresh="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("refresh_token") or "")
+except Exception: print("")' "$resp")"
+  [[ -z "$new_refresh" ]] && new_refresh="$refresh"   # not every grant rotates it
+  tmp="$HEYGEN_MCP_VAULT.tmp"
+  { grep -vE '^(export[[:space:]]+)?HEYGEN_MCP_(ACCESS|REFRESH)_TOKEN=' "$HEYGEN_MCP_VAULT" 2>/dev/null || true
+    printf 'HEYGEN_MCP_ACCESS_TOKEN=%s\n' "$new_access"
+    printf 'HEYGEN_MCP_REFRESH_TOKEN=%s\n' "$new_refresh"
+  } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$HEYGEN_MCP_VAULT"
+}
+# hg_mcp_call <tool> <json-args> -> the tool result's raw JSON-RPC response on stdout.
+# On a 401, refreshes exactly once and retries once, then fails hard — NEVER falls back
+# to HEYGEN_API_KEY (the api-key pool cannot fund real renders and is a different,
+# forbidden credential for spend; see hg_get above).
+hg_mcp_call() {
+  local tool="$1" args="$2" body="$HG_TMP/mcp-resp.json" http tok payload attempt rc
+  [[ -f "$HEYGEN_MCP_VAULT" ]] || fail "HeyGen Remote MCP not authorized: $HEYGEN_MCP_VAULT is missing — run the one-time HeyGen Remote MCP OAuth login, then re-greenlight"
+  tok="$(mcp_tok_get HEYGEN_MCP_ACCESS_TOKEN)"
+  [[ -n "$tok" ]] || fail "HeyGen Remote MCP not authorized: HEYGEN_MCP_ACCESS_TOKEN is empty in $HEYGEN_MCP_VAULT — run the one-time HeyGen Remote MCP OAuth login, then re-greenlight"
+  payload="$(python3 -c 'import json,sys; print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":sys.argv[1],"arguments":json.loads(sys.argv[2])}}))' "$tool" "$args")"
+  for attempt in 1 2; do
+    http="$(curl -sS -m 60 -o "$body" -w '%{http_code}' \
+      -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+      -H 'Accept: application/json, text/event-stream' \
+      -d "$payload" "$HEYGEN_MCP_URL" 2>"$HG_TMP/mcp-curl.err")" \
+      || fail "HeyGen Remote MCP unreachable ($HEYGEN_MCP_URL): $(head -c 300 "$HG_TMP/mcp-curl.err")"
+    if [[ "$http" == "401" && "$attempt" == "1" ]]; then
+      log "HeyGen Remote MCP: access token expired, refreshing…"
+      hg_mcp_refresh || fail "HeyGen Remote MCP refresh failed — the access token is expired and the refresh grant was rejected. Run the one-time HeyGen Remote MCP OAuth login again ($HEYGEN_MCP_VAULT), then re-greenlight"
+      tok="$(mcp_tok_get HEYGEN_MCP_ACCESS_TOKEN)"
+      continue
+    fi
+    break
+  done
+  case "$http" in
+    2??) ;;
+    401) fail "HeyGen Remote MCP rejected the access token even after a refresh — run the one-time OAuth login again ($HEYGEN_MCP_VAULT), then re-greenlight" ;;
+    *) fail "HeyGen Remote MCP $HEYGEN_MCP_URL returned HTTP $http: $(head -c 500 "$body")" ;;
+  esac
+  rc=0
+  python3 - "$body" <<'PY' || rc=$?
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(1 if d.get("error") else (2 if (d.get("result") or {}).get("isError") else 0))
+PY
+  case "$rc" in
+    1) fail "HeyGen Remote MCP tool '$tool' returned an error: $(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("error")))' "$body")" ;;
+    2) fail "HeyGen Remote MCP tool '$tool' failed: $(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])); c=(d.get("result") or {}).get("content") or []
+print(" ".join(x.get("text","") for x in c if isinstance(x,dict)))' "$body")" ;;
+  esac
+  cat "$body"
+}
+
+# auto_submit(): the ONLY place this crew spends credits — HeyGen's Remote MCP (OAuth,
+# web-plan credits), never a raw REST generate/submit path. Called when no usable render
+# exists: none found, or the found one is failed/rejected/cancelled/stale. Writes the
+# record BEFORE anything else so it agrees with HeyGen's own state even if the rest of
+# the run then fails, and always ends the run here — a freshly submitted render is never
+# instantly complete, so there is nothing left to do this invocation (GSAI-233).
+auto_submit() {
+  local avatar_id voice_id tts_text args result new_id credits
+  read -r avatar_id voice_id <<<"$(resolve_avatar_voice)"
+  [[ -n "$avatar_id" && -n "$voice_id" ]] || fail "cannot auto-submit: $BRAND_DIR/.config/brand.yaml has no heygen.avatarId/voiceId — required for an automatic HeyGen render (GSAI-233)"
+
+  tts_text="$(python3 - "$PROD_DIR/script/tts.md" "$SCRIPT_FILE" <<'PY' 2>/dev/null
+import re, sys, os
+tts_path, script_path = sys.argv[1], sys.argv[2]
+if os.path.isfile(tts_path):
+    t = open(tts_path, encoding="utf-8", errors="replace").read().strip()
+    if t: print(t); sys.exit(0)
+    sys.exit(1)
+s = open(script_path, encoding="utf-8", errors="replace").read()
+m = re.search(r'(?s)<!--\s*tts:start\s*-->(.*?)<!--\s*tts:end\s*-->', s)
+if not m:
+    m = re.search(r'(?im)^##[ \t]*TTS Script[ \t]*\n(.*?)(?=\n##[ \t]|\Z)', s, re.S)
+if not m:
+    sys.exit(1)
+t = m.group(1).strip()
+if not t: sys.exit(1)
+print(t)
+PY
+)" || fail "no extractable TTS text: $PROD_DIR/script/tts.md is absent and $SCRIPT_FILE has no <!-- tts:start -->/<!-- tts:end --> block or a '## TTS Script' heading — never guessing which part of a mixed file is speakable text on a paid call"
+
+  args="$(python3 -c '
+import json, sys
+print(json.dumps({
+  "type": "avatar", "avatar_id": sys.argv[1], "voice_id": sys.argv[2],
+  "script": sys.argv[3], "title": sys.argv[4],
+  "aspect_ratio": "9:16", "resolution": "1080p", "output_format": "mp4",
+  "engine": {"type": "avatar_iii"},
+}))' "$avatar_id" "$voice_id" "$tts_text" "$WANT_TITLE")"
+
+  log "auto-submit: \"$WANT_TITLE\" via HeyGen Remote MCP ($HEYGEN_MCP_TOOL, Avatar III, 1080x1920, watermark off)"
+  result="$(hg_mcp_call "$HEYGEN_MCP_TOOL" "$args")"
+  read -r new_id credits <<<"$(python3 - "$result" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+res = d.get("result") or {}
+data = res.get("structuredContent") or {}
+if not data:
+    for c in res.get("content") or []:
+        if c.get("type") == "text":
+            try: data = json.loads(c["text"]); break
+            except Exception: continue
+vid = (data or {}).get("video_id") or (data or {}).get("videoId") or (data or {}).get("id") or ""
+credits = (data or {}).get("credits_cost") or (data or {}).get("credits") or 2
+print(vid, credits)
+PY
+)"
+  [[ -n "$new_id" ]] || fail "HeyGen Remote MCP submit returned no video id — response: $(printf '%s' "$result" | head -c 500)"
+
+  write_record "issue=$ID" "production=$SLUG" "videoId=$new_id" "title=$WANT_TITLE" \
+    "avatarId=$avatar_id" "voiceId=$voice_id" "motionEngine=Avatar III" \
+    "creditsCost=json:$credits" "status=submitted" "scriptSource=$SCRIPT_REL" \
+    "scriptSha256=$SCRIPT_SHA" "submittedAt=$(date -u +%FT%TZ)" \
+    "submittedBy=dozer mktg-lane/video.sh (auto via Remote MCP)"
+  log "record: $SUB written (status=submitted, videoId=$new_id, $credits credits)"
+  fail "HeyGen render \"$WANT_TITLE\" ($new_id) was just submitted via Remote MCP and is processing — nothing to download yet. Re-greenlight (dozer:ready + lane:marketing) once it completes."
 }
 
 VIDEO_ID=""; RENDER_STATUS=""; RENDER_CREATED=""
@@ -237,19 +419,19 @@ PY
 )"
 fi
 
-if [[ -z "$VIDEO_ID" ]]; then
-  fail "$(printf 'no HeyGen render titled "%s" found in the last %s renders (and no videoId in %s).\n%s' "$WANT_TITLE" "$HEYGEN_LIST_LIMIT" "$SUB" "$(submit_instruction)")"
-fi
+# No usable render — not found, or dead (failed/rejected/cancelled/anything but
+# completed-or-in-flight) — auto-submit. auto_submit() never returns (GSAI-233: this
+# collapses the old NOSUBMIT + failed-status blocks into one path).
 case "$RENDER_STATUS" in
   completed) ;;
   processing|pending|waiting)
     fail "HeyGen render \"$WANT_TITLE\" ($VIDEO_ID) is still $RENDER_STATUS — nothing to download yet. Re-greenlight (dozer:ready + lane:marketing) once it completes." ;;
-  *)
-    fail "$(printf 'HeyGen render "%s" (%s) is %s, not completed — it must be re-rendered.\n%s' "$WANT_TITLE" "$VIDEO_ID" "${RENDER_STATUS:-unknown}" "$(submit_instruction)")" ;;
+  *) auto_submit ;;
 esac
 log "render: \"$WANT_TITLE\" → $VIDEO_ID (completed)"
 
-# ── Stale-render gate (hard). Script changed after the render => block, no compose ─
+# ── Stale-render gate (hard). A stale COMPLETED render is just another way to reach
+# "no usable render exists" -> auto-resubmit instead of blocking (GSAI-233).
 RENDERED_AT="$(sub_get renderedAt)"
 RENDERED_EPOCH="$(python3 - "$RENDER_CREATED" "$RENDERED_AT" "$(sub_get submittedAt)" <<'PY'
 import sys, datetime
@@ -271,9 +453,15 @@ PY
 )"
 REC_SHA="$(sub_get scriptSha256)"
 if [[ -n "$REC_SHA" ]]; then
-  [[ "$REC_SHA" == "$SCRIPT_SHA" ]] || fail "$(printf 'STALE RENDER: %s changed after the render was made (recorded sha256 %s…, current %s…). Not composing, not staging — re-render from the corrected script.\n%s' "$SCRIPT_REL" "${REC_SHA:0:12}" "${SCRIPT_SHA:0:12}" "$(submit_instruction)")"
+  if [[ "$REC_SHA" != "$SCRIPT_SHA" ]]; then
+    log "STALE RENDER: $SCRIPT_REL changed after the render was made (recorded sha256 ${REC_SHA:0:12}…, current ${SCRIPT_SHA:0:12}…) — auto-resubmitting"
+    auto_submit
+  fi
 elif [[ -n "$RENDERED_EPOCH" ]]; then
-  (( SCRIPT_MTIME <= RENDERED_EPOCH )) || fail "$(printf 'STALE RENDER: %s was modified (%s) after the render (%s) and the record carries no scriptSha256. Not composing, not staging — re-render from the corrected script.\n%s' "$SCRIPT_REL" "$(date -u -r "$SCRIPT_MTIME" +%FT%TZ 2>/dev/null || echo "$SCRIPT_MTIME")" "$(date -u -r "$RENDERED_EPOCH" +%FT%TZ 2>/dev/null || echo "$RENDERED_EPOCH")" "$(submit_instruction)")"
+  if (( SCRIPT_MTIME > RENDERED_EPOCH )); then
+    log "STALE RENDER: $SCRIPT_REL was modified after the render and the record carries no scriptSha256 — auto-resubmitting"
+    auto_submit
+  fi
 else
   fail "cannot tell whether the render is stale: $SUB has neither scriptSha256 nor renderedAt/submittedAt, and HeyGen returned no created_at for $VIDEO_ID"
 fi
@@ -323,30 +511,10 @@ python3 -c 'import sys; a,e,t=map(float,sys.argv[1:4]); sys.exit(0 if abs(a-e)<=
 log "assert: h264 $RAW_WH ${RAW_DUR}s (estimate ${EXPECT_DUR}s) ✓"
 
 # Refresh the record (audit trail for cost + reproducibility). Merges into what exists.
-write_record() { # key=value pairs (JSON-typed where it matters)
-  python3 - "$SUB" "$@" <<'PY'
-import json, os, sys
-p = sys.argv[1]
-d = {}
-if os.path.exists(p):
-    try: d = json.load(open(p))
-    except Exception: d = {}
-for kv in sys.argv[2:]:
-    k, v = kv.split("=", 1)
-    if v.startswith("json:"):
-        v = json.loads(v[5:])
-    d[k] = v
-tmp = p + ".tmp"
-json.dump(d, open(tmp, "w"), indent=2); open(tmp, "a").write("\n")
-os.replace(tmp, p)
-PY
-}
+# write_record + resolve_avatar_voice are defined above, near the SUB path (auto_submit
+# needs them earlier than this Phase 2 step does).
 BRAND_YAML="$BRAND_DIR/.config/brand.yaml"
-AVATAR_ID="$(sub_get avatarId)"; VOICE_ID="$(sub_get voiceId)"
-if [[ -f "$BRAND_YAML" ]]; then
-  [[ -z "$AVATAR_ID" ]] && AVATAR_ID="$(grep -oE 'avatarId:[[:space:]]*"?[0-9a-f]{32}' "$BRAND_YAML" | head -1 | grep -oE '[0-9a-f]{32}' || true)"
-  [[ -z "$VOICE_ID" ]]  && VOICE_ID="$(grep -oE 'voiceId:[[:space:]]*"?[0-9a-f]{32}' "$BRAND_YAML" | head -1 | grep -oE '[0-9a-f]{32}' || true)"
-fi
+read -r AVATAR_ID VOICE_ID <<<"$(resolve_avatar_voice)"
 MOTION="$(sub_get motionEngine)"; MOTION="${MOTION:-Avatar III}"
 CREDITS="$(sub_get creditsCost)"; CREDITS="${CREDITS:-2}"
 write_record "issue=$ID" "production=$SLUG" "videoId=$VIDEO_ID" "title=$WANT_TITLE" \

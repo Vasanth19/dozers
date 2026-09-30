@@ -116,9 +116,9 @@ fanout_by_group:
 release_budget: 3
 
 focus:
-  projects: ["CFW: Sellable V1", "CFW: Platform Publishers", "MGG: Reels"]
-  until: "2026-09-27"
-  note: "Week of 2026-09-20: first revenue (10 paying brands), publish path live, MGG content engine. Everything else waits."
+  projects: ["CFW: Cold Email", "CFW: Sellable V1", "CFW: Paste-to-install", "MGG: Reels"]
+  until: "2026-10-06"
+  note: "Week of 2026-09-29, re-set 2026-09-30 on Vasanth's answer to CFW-18 (#now 05:31:57 'let's go with your recommended answer' -> option (a): sell-first). Cold Email = the leads, Sellable V1 = the demo, Paste-to-install = the install after a yes: the whole path to a first invoice. FOUR, not three: MGG: Reels is retained because he pushed the HeyGen render gate forward in the SAME minute (#now 05:31:03) — 16 finished reels sit one auth away, and that project consumes a human login, not a crew slot, so it dilutes nothing. Dropped: CFW: Render Pipeline and CFW: Integration Uptime (CFW-300, CFW-271) — filed and triaged, deliberately un-greenlit. One word from Vas reverts any of this."
 
 # Only used when backend: github
 repo: "OWNER/REPO"             # e.g. acme/dozers

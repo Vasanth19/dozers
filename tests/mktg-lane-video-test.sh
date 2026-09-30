@@ -9,22 +9,31 @@
 # actually went over the wire, not on a grep.
 #
 # Cases:
-#   COPY      a brief without a production: line takes the copy path exactly as before
-#             (stub model runs, draft staged, HeyGen never contacted)
-#   NOSUBMIT  a video brief with no submitted render blocks with the exact submit
-#             instruction — the title, and "Motion Engine: Avatar III (2 credits — never
-#             Avatar V at 9)" — and never composes or stages
-#   STALE     the script changed after the render (sha mismatch) -> blocked as STALE
-#             RENDER, no download, no compose, no stage
-#   STALE-MT  no sha on record, script mtime newer than the render -> same block
-#   HAPPY     completed, in-sync render -> raw downloaded + ffprobe-asserted, final/short.mp4
-#             + cover.png, .dozers-review/<id>.md with a valid posts/quick payload (no
-#             bluesky, no linkedin for MGG), record refreshed, only /v1/ endpoints hit
-#   RERUN     the same brief again reuses the downloaded raw (idempotent)
-#   NOKEY     vault file missing -> fails fast naming the vault path; HeyGen never contacted;
-#             NO silent fallback to the copy path (no copy draft, model not run)
-#   UNAUTH    vault holds a rejected key -> fails naming the vault path
-#   NOV2      video.sh contains no /v2/ request path, and hg_get refuses one
+#   COPY        a brief without a production: line takes the copy path exactly as before
+#               (stub model runs, draft staged, HeyGen never contacted)
+#   AUTOSUBMIT  a video brief with no submitted render auto-submits via the HeyGen Remote
+#               MCP stub (GSAI-233): asserts the exact submit payload (avatar/voice ids,
+#               avatar_iii, title, script text, 9:16/1080p) and ends in the "processing,
+#               re-greenlight later" block — no human-instruction text, no compose/stage
+#   STALE       the script changed after the render (sha mismatch) -> auto-resubmits (new
+#               videoId), no download/compose/stage this run
+#   STALE-MT    no sha on record, script mtime newer than the render -> same auto-resubmit
+#   MCP-NOKEY   the Remote MCP OAuth vault (test-pointed) is missing -> fails naming the
+#               vault path; the MCP endpoint is never hit
+#   MCP-REFRESH the stored access token is rejected once (401) -> one transparent refresh
+#               -> retried submit succeeds; the vault is rewritten with the new token
+#   MCP-CREDITS the stub's submit response simulates HeyGen's insufficient-credits error
+#               -> fails with that exact text, no retry
+#   HAPPY       completed, in-sync render -> raw downloaded + ffprobe-asserted, final/short.mp4
+#               + cover.png, .dozers-review/<id>.md with a valid posts/quick payload (no
+#               bluesky, no linkedin for MGG), record refreshed, only /v1/ endpoints hit
+#   RERUN       the same brief again reuses the downloaded raw (idempotent)
+#   NOKEY       vault file missing -> fails fast naming the vault path; HeyGen never contacted;
+#               NO silent fallback to the copy path (no copy draft, model not run)
+#   UNAUTH      vault holds a rejected key -> fails naming the vault path
+#   NOV2        video.sh contains no /v2/ request path, hg_get refuses one, hg_get is only
+#               ever called with the known-safe REST reads, and the MCP submit tool has
+#               exactly one call site (inside auto_submit)
 #
 # Needs ffmpeg/ffprobe + python3 (the pipeline's own hard deps).
 # Run:  bash tests/mktg-lane-video-test.sh   (exits non-zero on any failure)
@@ -77,7 +86,7 @@ cat > "$PROD/brief.md" <<'EOF'
 # Test reel brief
 Recipe: p-reels-split-heygen
 EOF
-printf '# TTS Script\n\nThis is the test script for the reel.\n' > "$PROD/script.md"
+printf '## TTS Script\n\nThis is the test script for the reel.\n' > "$PROD/script.md"
 printf 'Know AI #1 — test caption.\nFollow @mr.growthguide\n' > "$PROD/publish/caption.txt"
 touch -t 202601010000 "$PROD/script.md"       # script authored long before any render
 SCRIPT_SHA="$(shasum -a 256 "$PROD/script.md" | cut -d' ' -f1)"
@@ -89,11 +98,16 @@ ffmpeg -y -v error -f lavfi -i "color=c=0x0F172A:s=1080x1920:r=10:d=20" -f lavfi
   || { echo "could not build the fixture mp4" >&2; exit 1; }
 
 # ── stubbed HeyGen: scenario file re-read on every request, request log ───────
-SCN="$TMP/scenario.json"; REQLOG="$TMP/requests.log"; PORTFILE="$TMP/port"
+# Also serves the Remote MCP submit tool (POST /mcp/v1/) and a token-refresh endpoint
+# (POST /oauth/token) — GSAI-233. MCPLOG gets one line per tools/call request body, so
+# tests assert on the exact payload that went over the wire, not a description of it.
+SCN="$TMP/scenario.json"; REQLOG="$TMP/requests.log"; MCPLOG="$TMP/mcp-requests.log"; PORTFILE="$TMP/port"
 GOOD_KEY="test-heygen-key-0000"
+MCP_GOOD_TOKEN="test-mcp-access-token"
+MCP_GOOD_REFRESH="test-mcp-refresh-token"
 cat > "$TMP/heygen-stub.py" <<'PY'
 import json, sys, http.server, socketserver
-SCN, PORTFILE, LOG = sys.argv[1:4]
+SCN, PORTFILE, LOG, MCPLOG = sys.argv[1:5]
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _json(self, code, body):
@@ -119,23 +133,64 @@ class H(http.server.BaseHTTPRequestHandler):
                 "duration": scn["duration"], "error": None,
                 "video_url": f"http://127.0.0.1:{self.server.server_address[1]}/files/raw.mp4"}})
         return self._json(404, {"code": 40404, "message": "no such route"})
+    def do_POST(self):
+        scn = json.load(open(SCN))
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        open(LOG, "a").write("POST " + self.path + "\n")
+        if self.path.startswith("/mcp/v1"):
+            open(MCPLOG, "a").write(raw.decode("utf-8", "replace") + "\n")
+            auth = self.headers.get("Authorization", "")
+            tok = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+            if tok != scn.get("mcp_valid_token"):
+                return self._json(401, {"error": "unauthorized"})
+            req = json.loads(raw)
+            rid = req.get("id")
+            if scn.get("mcp_credits_error"):
+                return self._json(200, {"jsonrpc": "2.0", "id": rid, "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": scn.get("mcp_credits_message", "Insufficient credits")}]}})
+            vid = scn.get("mcp_new_video_id", "vid-auto")
+            return self._json(200, {"jsonrpc": "2.0", "id": rid, "result": {
+                "isError": False,
+                "content": [{"type": "text", "text": json.dumps({"video_id": vid, "credits_cost": 2})}]}})
+        if self.path.startswith("/oauth/token"):
+            new_tok = scn.get("mcp_refreshed_token", "")
+            if not new_tok:
+                return self._json(400, {"error": "invalid_grant"})
+            return self._json(200, {"access_token": new_tok, "refresh_token": scn.get("mcp_refreshed_refresh", "")})
+        return self._json(404, {"code": 40404, "message": "no such route"})
 srv = socketserver.TCPServer(("127.0.0.1", 0), H)
 open(PORTFILE, "w").write(str(srv.server_address[1]))
 srv.serve_forever()
 PY
-scenario() {  # $1 = videos JSON array
-  python3 - "$SCN" "$GOOD_KEY" "$RAW_FIXTURE" "$1" <<'PY'
+scenario() {  # $1 = videos JSON array; extra KEY=VALUE... merged into the scenario (mcp_*)
+  local videos="$1"; shift || true
+  python3 - "$SCN" "$GOOD_KEY" "$RAW_FIXTURE" "$videos" "$MCP_GOOD_TOKEN" "$@" <<'PY'
 import json, sys
-json.dump({"key": sys.argv[2], "raw": sys.argv[3], "duration": 20.0, "videos": json.loads(sys.argv[4])}, open(sys.argv[1], "w"))
+scn, key, raw, videos, mcp_tok = sys.argv[1:6]
+d = {"key": key, "raw": raw, "duration": 20.0, "videos": json.loads(videos), "mcp_valid_token": mcp_tok}
+for kv in sys.argv[6:]:
+    k, v = kv.split("=", 1)
+    d[k] = v
+json.dump(d, open(scn, "w"))
 PY
 }
 scenario '[]'
-python3 "$TMP/heygen-stub.py" "$SCN" "$PORTFILE" "$REQLOG" &
+python3 "$TMP/heygen-stub.py" "$SCN" "$PORTFILE" "$REQLOG" "$MCPLOG" &
 SERVER_PID=$!
 for _ in $(seq 1 50); do [[ -s "$PORTFILE" ]] && break; sleep 0.1; done
 [[ -s "$PORTFILE" ]] || { echo "stub HeyGen did not start" >&2; exit 1; }
 API="http://127.0.0.1:$(cat "$PORTFILE")"
 RENDER_TS=1780000000   # 2026-05-28 — after the script's 2026-01-01 mtime
+
+# ── Remote MCP OAuth vault fixtures (GSAI-233) ────────────────────────────────
+MCP_VAULT="$TMP/heygen-mcp-oauth.env"
+printf 'HEYGEN_MCP_ACCESS_TOKEN=%s\nHEYGEN_MCP_REFRESH_TOKEN=%s\n' "$MCP_GOOD_TOKEN" "$MCP_GOOD_REFRESH" > "$MCP_VAULT"
+chmod 600 "$MCP_VAULT"
+MCP_VAULT_EXPIRED="$TMP/heygen-mcp-oauth-expired.env"
+printf 'HEYGEN_MCP_ACCESS_TOKEN=%s\nHEYGEN_MCP_REFRESH_TOKEN=%s\n' "expired-access-token" "$MCP_GOOD_REFRESH" > "$MCP_VAULT_EXPIRED"
+chmod 600 "$MCP_VAULT_EXPIRED"
 
 # ── stubs: model (copy path), compose (video path), vault ─────────────────────
 VAULT="$TMP/secrets.env"; printf 'HEYGEN_API_KEY=%s\n' "$GOOD_KEY" > "$VAULT"; chmod 600 "$VAULT"
@@ -171,12 +226,13 @@ run_crew() {  # $1 = id, $2 = brief file, $3 = log, $4.. = extra KEY=VAL
   env MODEL_RAN="$TMP/$id.model-ran" COMPOSE_RAN="$TMP/$id.compose-ran" \
       REPO_ROOT="$REPO" WORKDIR="$BRAND" DOZER_BRIEF="$bf" DOZER_PERSONA="test" \
       MODEL_CMD="bash $STUB_MODEL" COMPOSE_CMD="bash $STUB_COMPOSE" \
-      HEYGEN_VAULT="$VAULT" HEYGEN_API_BASE="$API" "$@" \
+      HEYGEN_VAULT="$VAULT" HEYGEN_API_BASE="$API" \
+      HEYGEN_MCP_VAULT="$MCP_VAULT" HEYGEN_MCP_URL="$API/mcp/v1/" HEYGEN_MCP_TOKEN_URL="$API/oauth/token" "$@" \
       bash "$CREW" "$id" "GSAI-7 test brief" >"$log" 2>&1
 }
 model_ran()   { [[ -e "$TMP/$1.model-ran" ]]; }
 compose_ran() { [[ -e "$TMP/$1.compose-ran" ]]; }
-reset_prod()  { rm -rf "$PROD/heygen" "$PROD/final" "$BRAND/.dozers-review" 2>/dev/null || true; : > "$REQLOG"; }
+reset_prod()  { rm -rf "$PROD/heygen" "$PROD/final" "$BRAND/.dozers-review" 2>/dev/null || true; : > "$REQLOG"; : > "$MCPLOG"; }
 sub_status()  { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$PROD/heygen/heygen-submission.json" "$1" 2>/dev/null || true; }
 
 echo "== mktg lane: video branch (GSAI-7) =="
@@ -189,50 +245,106 @@ if run_crew "$ID" "$(brief "$ID" "$COPY_BRIEF")" "$LOG"; then
   else no "COPY brief should stage a copy draft without touching HeyGen"; dump "$LOG"; fi
 else no "COPY brief should succeed (exit $?)"; dump "$LOG"; fi
 
-# ── NOSUBMIT: no submission record, no matching render -> block with the ask ─
-reset_prod; ID=VT-NOSUB; LOG="$TMP/$ID.log"; scenario '[{"video_id":"other","status":"completed","video_title":"unrelated","created_at":1780000000}]'
-if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then no "NOSUBMIT should block"; dump "$LOG"
+# ── AUTOSUBMIT: no submission record, no matching render -> auto-submit via Remote MCP ─
+reset_prod; ID=VT-AUTOSUB; LOG="$TMP/$ID.log"
+scenario '[{"video_id":"other","status":"completed","video_title":"unrelated","created_at":1780000000}]' mcp_new_video_id=vid-autosubmit
+if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then no "AUTOSUBMIT should end in the still-processing block"; dump "$LOG"
 else
   F="$ART/$ID.fail"
-  if has "$F" "Motion Engine: Avatar III (2 credits — never Avatar V at 9)" && has "$F" "title EXACTLY: $SLUG" \
-     && has "$F" "p-reels-split-heygen" && has "$F" "SUBMIT NEEDED"; then
-    ok "NOSUBMIT blocks with the exact submit instruction (title, recipe, Avatar III)"
-  else no "NOSUBMIT block reason lacks the submit instruction"; dump "$F"; fi
+  if has "$F" "processing" && has "$F" "vid-autosubmit" && ! has "$F" "SUBMIT NEEDED"; then
+    ok "AUTOSUBMIT ends in the 'processing, re-greenlight later' block, not a human-instruction block"
+  else no "AUTOSUBMIT block reason wrong"; dump "$F"; fi
+  if [[ -s "$MCPLOG" ]] && tail -1 "$MCPLOG" | python3 -c '
+import json,sys
+d = json.load(sys.stdin); a = d["params"]["arguments"]
+assert a["avatar_id"] == "9273e994f1ed484d9031afa3725676c5"
+assert a["voice_id"] == "6a9a4d08391e4321a48d019e192fa6fe"
+assert a["engine"] == {"type": "avatar_iii"}
+assert a["title"] == sys.argv[1]
+assert a["aspect_ratio"] == "9:16" and a["resolution"] == "1080p"
+assert "This is the test script for the reel." in a["script"]
+' "$SLUG" 2>/dev/null; then
+    ok "AUTOSUBMIT: exact submit payload (avatar/voice ids, avatar_iii, title, script, 9:16/1080p)"
+  else no "AUTOSUBMIT submit payload wrong"; dump "$MCPLOG"; fi
+  if [[ "$(sub_status status)" == "submitted" && "$(sub_status videoId)" == "vid-autosubmit" && "$(sub_status motionEngine)" == "Avatar III" ]]; then
+    ok "AUTOSUBMIT: submission record written (status=submitted, videoId, motionEngine)"
+  else no "AUTOSUBMIT submission record wrong"; cat "$PROD/heygen/heygen-submission.json" >&2 2>/dev/null || true; fi
   if ! compose_ran "$ID" && [[ ! -e "$PROD/final/short.mp4" && ! -e "$BRAND/.dozers-review/$ID.md" ]] && ! model_ran "$ID"; then
-    ok "NOSUBMIT: no compose, no stage, no copy-draft fallback"
-  else no "NOSUBMIT must not compose, stage, or fall back to copy"; dump "$LOG"; fi
-  has "$REQLOG" "/v1/video.list" && ok "NOSUBMIT looked at /v1/video.list" || no "NOSUBMIT should have listed renders"
+    ok "AUTOSUBMIT: no compose, no stage, no copy-draft fallback"
+  else no "AUTOSUBMIT must not compose, stage, or fall back to copy"; dump "$LOG"; fi
+  has "$REQLOG" "/v1/video.list" && ok "AUTOSUBMIT looked at /v1/video.list first (dedup search)" || no "AUTOSUBMIT should have listed renders first"
 fi
 
-# ── STALE: recorded sha differs from the current script -> hard block ────────
+# ── MCP-NOKEY: Remote MCP OAuth vault missing -> fail fast, MCP never contacted ─
+reset_prod; ID=VT-MCPNOKEY; LOG="$TMP/$ID.log"; scenario '[]'
+if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG" HEYGEN_MCP_VAULT="$TMP/does-not-exist-mcp.env"; then no "MCP-NOKEY should fail"; dump "$LOG"
+else
+  if has "$ART/$ID.fail" "$TMP/does-not-exist-mcp.env" && [[ ! -s "$MCPLOG" ]]; then
+    ok "MCP-NOKEY: fails naming the vault path; the Remote MCP is never contacted"
+  else no "MCP-NOKEY should name the vault and never hit the MCP endpoint"; dump "$ART/$ID.fail"; fi
+fi
+
+# ── MCP-REFRESH: stored access token rejected once -> transparent refresh -> submit OK ─
+reset_prod; ID=VT-MCPREFRESH; LOG="$TMP/$ID.log"
+cp "$MCP_VAULT_EXPIRED" "$TMP/$ID-mcp-vault.env"
+scenario '[]' mcp_valid_token=fresh-access-token mcp_new_video_id=vid-refreshed \
+  mcp_refreshed_token=fresh-access-token mcp_refreshed_refresh=fresh-refresh-token
+if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG" HEYGEN_MCP_VAULT="$TMP/$ID-mcp-vault.env"; then no "MCP-REFRESH should end in the still-processing block"; dump "$LOG"
+else
+  if has "$ART/$ID.fail" "vid-refreshed" && has "$LOG" "refreshing" && grep -q "fresh-access-token" "$TMP/$ID-mcp-vault.env"; then
+    ok "MCP-REFRESH: one transparent refresh, retried submit succeeds, vault rewritten with the new token"
+  else no "MCP-REFRESH failed to refresh/retry/rewrite correctly"; dump "$LOG"; fi
+fi
+
+# ── MCP-CREDITS: HeyGen reports insufficient web-plan credits -> fail, no retry ─
+reset_prod; ID=VT-MCPCREDITS; LOG="$TMP/$ID.log"
+scenario '[]' mcp_credits_error=1 mcp_credits_message='Insufficient credits: your plan has 0 credits remaining.'
+if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then no "MCP-CREDITS should fail"; dump "$LOG"
+else
+  MCPCALLS="$(grep -c '"jsonrpc"' "$MCPLOG" 2>/dev/null || echo 0)"
+  if has "$ART/$ID.fail" "Insufficient credits: your plan has 0 credits remaining." \
+     && [[ "$(sub_status status)" != "submitted" ]] && [[ "$MCPCALLS" -eq 1 ]]; then
+    ok "MCP-CREDITS: fails with HeyGen's exact error text, no retry, no record written"
+  else no "MCP-CREDITS should fail with the exact credits message and not retry"; dump "$ART/$ID.fail"; fi
+fi
+
+# ── STALE: recorded sha differs from the current script -> auto-resubmit ─────
 reset_prod; ID=VT-STALE; LOG="$TMP/$ID.log"
-scenario "[{\"video_id\":\"vid-stale\",\"status\":\"completed\",\"video_title\":\"$SLUG\",\"created_at\":$RENDER_TS}]"
+scenario "[{\"video_id\":\"vid-stale\",\"status\":\"completed\",\"video_title\":\"$SLUG\",\"created_at\":$RENDER_TS}]" mcp_new_video_id=vid-stale-resubmit
 mkdir -p "$PROD/heygen"
 printf '{"title":"%s","videoId":"vid-stale","status":"submitted","scriptSha256":"%s"}\n' "$SLUG" "0000000000000000000000000000000000000000000000000000000000000000" > "$PROD/heygen/heygen-submission.json"
-if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then no "STALE should block"; dump "$LOG"
+if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then no "STALE should end in the still-processing block"; dump "$LOG"
 else
   F="$ART/$ID.fail"
-  if has "$F" "STALE RENDER" && has "$F" "Motion Engine: Avatar III"; then ok "STALE (sha) blocks as STALE RENDER with the re-submit instruction"
-  else no "STALE block reason wrong"; dump "$F"; fi
-  if ! compose_ran "$ID" && [[ ! -e "$PROD/heygen/raw-avatar.mp4" && ! -e "$PROD/final/short.mp4" && ! -e "$BRAND/.dozers-review/$ID.md" ]] && ! has "$REQLOG" "/files/raw.mp4"; then
-    ok "STALE: no download, no compose, no stage"
-  else no "STALE must not download/compose/stage"; dump "$LOG"; fi
+  if has "$LOG" "STALE RENDER" && has "$LOG" "auto-resubmitting" && has "$F" "vid-stale-resubmit" && has "$F" "processing"; then
+    ok "STALE (sha): auto-resubmits (new videoId), ends in the processing block"
+  else no "STALE block reason wrong"; dump "$F"; dump "$LOG"; fi
+  if [[ "$(sub_status videoId)" == "vid-stale-resubmit" && "$(sub_status status)" == "submitted" ]] \
+     && ! compose_ran "$ID" && [[ ! -e "$PROD/heygen/raw-avatar.mp4" && ! -e "$PROD/final/short.mp4" && ! -e "$BRAND/.dozers-review/$ID.md" ]] \
+     && ! has "$REQLOG" "/files/raw.mp4"; then
+    ok "STALE: no download, no compose, no stage — record now points at the fresh submit"
+  else no "STALE must not download/compose/stage, and must record the new videoId"; dump "$LOG"; fi
 fi
 
-# ── STALE-MT: no sha on record, script touched after the render ──────────────
+# ── STALE-MT: no sha on record, script touched after the render -> auto-resubmit ─
 reset_prod; ID=VT-STALEMT; LOG="$TMP/$ID.log"
+scenario "[{\"video_id\":\"vid-stalemt\",\"status\":\"completed\",\"video_title\":\"$SLUG\",\"created_at\":$RENDER_TS}]" mcp_new_video_id=vid-stalemt-resubmit
 mkdir -p "$PROD/heygen"
 printf '{"title":"%s","status":"submitted","renderedAt":"2026-05-28T00:00:00Z"}\n' "$SLUG" > "$PROD/heygen/heygen-submission.json"
 touch "$PROD/script.md"   # now: newer than the 2026-05-28 render
-if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then no "STALE-MT should block"; dump "$LOG"
+if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then no "STALE-MT should end in the still-processing block"; dump "$LOG"
 else
-  has "$ART/$ID.fail" "STALE RENDER" && ! compose_ran "$ID" && [[ ! -e "$BRAND/.dozers-review/$ID.md" ]] \
-    && ok "STALE (mtime, no sha) blocks as STALE RENDER" || { no "STALE-MT block wrong"; dump "$ART/$ID.fail"; }
+  if has "$LOG" "STALE RENDER" && has "$LOG" "auto-resubmitting" && has "$ART/$ID.fail" "vid-stalemt-resubmit" \
+     && [[ "$(sub_status videoId)" == "vid-stalemt-resubmit" ]] && ! compose_ran "$ID" && [[ ! -e "$BRAND/.dozers-review/$ID.md" ]]; then
+    ok "STALE (mtime, no sha): auto-resubmits (new videoId), ends in the processing block"
+  else no "STALE-MT block wrong"; dump "$ART/$ID.fail"; dump "$LOG"; fi
 fi
+touch -t 202601010000 "$PROD/script.md"   # restore: in sync again
 touch -t 202601010000 "$PROD/script.md"   # restore: in sync again
 
 # ── HAPPY: completed + in-sync render -> download, compose, stage ─────────────
 reset_prod; ID=VT-HAPPY; LOG="$TMP/$ID.log"
+scenario "[{\"video_id\":\"vid-stale\",\"status\":\"completed\",\"video_title\":\"$SLUG\",\"created_at\":$RENDER_TS}]"
 mkdir -p "$PROD/heygen"
 printf '{"title":"%s","status":"submitted","motionEngine":"Avatar III","creditsCost":2,"durationEstimate":20}\n' "$SLUG" > "$PROD/heygen/heygen-submission.json"
 if run_crew "$ID" "$(brief "$ID" "$VIDEO_BRIEF")" "$LOG"; then
@@ -284,6 +396,15 @@ if ! grep -qE 'hg_get "/v2/|api\.heygen\.com/v2' "$VIDEO"; then ok "NOV2: video.
 else no "video.sh contains a /v2/ call"; fi
 if has "$VIDEO" 'refusing HeyGen $path — /v2/'; then ok "NOV2: hg_get refuses a /v2/ path outright"
 else no "hg_get should refuse /v2/"; fi
+# Broadened (GSAI-233): hg_get (the REST client) is only ever called with the two known-safe
+# reads — no raw REST generate/submit/create path exists anywhere in the file.
+UNEXPECTED_HG_GET="$(grep -oE 'hg_get "[^"]*"' "$VIDEO" | grep -vE '/v1/video\.list\?|/v1/video_status\.get\?' || true)"
+if [[ -z "$UNEXPECTED_HG_GET" ]]; then ok "NOV2: hg_get (REST) is only ever called with /v1/video.list or /v1/video_status.get"
+else no "video.sh calls hg_get with an unexpected REST path"; printf '%s\n' "$UNEXPECTED_HG_GET" >&2; fi
+# Only auto_submit() may create a render — one call site for the MCP submit tool.
+HG_MCP_CALL_SITES="$(grep -c 'hg_mcp_call "\$HEYGEN_MCP_TOOL"' "$VIDEO" || true)"
+if [[ "$HG_MCP_CALL_SITES" -eq 1 ]]; then ok "NOV2: the MCP submit tool has exactly one call site (inside auto_submit)"
+else no "expected exactly one hg_mcp_call \"\$HEYGEN_MCP_TOOL\" call site, found $HG_MCP_CALL_SITES"; fi
 
 echo
 if (( fail == 0 )); then echo "mktg-lane-video-test: PASS"; else echo "mktg-lane-video-test: FAIL" >&2; exit 1; fi
