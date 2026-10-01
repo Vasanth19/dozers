@@ -64,8 +64,11 @@ RC1="$ROOT/.artifacts/dev/MV-1.merge"
 grep -q '^branch=develop$' "$RC1" && ok "receipt names the integration branch" || no "receipt missing branch="
 SHA1="$(grep -E '^merge_sha=' "$RC1" | cut -d= -f2)"
 git -C "$P1" merge-base --is-ancestor "$SHA1" develop && ok "receipt SHA is on develop" || no "receipt SHA is NOT on develop"
+grep -q '^premerge_sha=' "$RC1" && ok "receipt names the pre-merge tip (GSAI-217)" || no "receipt missing premerge_sha="
+grep -q '^task_sha=' "$RC1" && ok "receipt names the task branch tip (GSAI-217)" || no "receipt missing task_sha="
 vout="$(REPO_ROOT="$ROOT" bash "$ROOT/dozers/verify-merge.sh" MV-1 "$P1" 2>&1)" && ok "verify-merge: $vout" || { no "verify-merge failed on a real merge: $vout"; }
 [[ "$vout" == ok* ]] && ok "verify output is a proof line: $vout" || no "verify output not a proof line"
+[[ "$vout" == *"moved from"* ]] && ok "proof line reports the pre-merge tip it moved from" || no "proof line missing 'moved from': $vout"
 
 # ── case 2: verify-merge.sh on claims that are NOT true ───────────────────────
 echo "case 2: verify-merge.sh rejects a phantom (missing receipt / reverted merge)"
@@ -74,6 +77,7 @@ P2="$TMP/p2"; mkproj "$P2"
 vout2="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/nowhere.merge" bash "$ROOT/dozers/verify-merge.sh" MV-2 "$P2" 2>&1)" && no "phantom WITHOUT receipt verified (!)" || true
 [[ "$vout2" == *"no merge receipt"* ]] && ok "missing receipt rejected with the phantom signature named" || no "wrong reason: $vout2"
 # 2b: a receipt whose merge was REVERTED — sha exists but is not an ancestor
+PREMERGE2="$(git -C "$P2" rev-parse develop)"
 ( cd "$P2"
   git checkout -q -b dozer/MV-2 develop
   printf 'x\n' >> feature.txt; git add -A; git commit -q -m "task"
@@ -81,10 +85,13 @@ vout2="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/nowhere.merge" bash "$ROOT/dozers/verif
   git merge -q --no-ff dozer/MV-2 -m "merge dozer/MV-2 into develop — #MV-2 test"
 )
 MSHA="$(git -C "$P2" rev-parse HEAD)"
+TASKSHA2="$(git -C "$P2" rev-parse dozer/MV-2)"
 git -C "$P2" checkout -q develop && git -C "$P2" reset --hard -q HEAD~1 >/dev/null 2>&1
 cat > "$TMP/reverted.merge" <<EOF
 branch=develop
 merge_sha=$MSHA
+premerge_sha=$PREMERGE2
+task_sha=$TASKSHA2
 EOF
 vout3="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/reverted.merge" bash "$ROOT/dozers/verify-merge.sh" MV-2 "$P2" 2>&1)" && no "reverted merge verified (!)" || true
 [[ "$vout3" == *"NOT an ancestor"* ]] && ok "reverted merge rejected with git evidence attached" || no "wrong reason: $vout3"
@@ -92,9 +99,81 @@ vout3="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/reverted.merge" bash "$ROOT/dozers/veri
 cat > "$TMP/wrongbranch.merge" <<EOF
 branch=vapour
 merge_sha=$MSHA
+premerge_sha=$PREMERGE2
+task_sha=$TASKSHA2
 EOF
 vout4="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/wrongbranch.merge" bash "$ROOT/dozers/verify-merge.sh" MV-2 "$P2" 2>&1)" && no "merge onto nonexistent branch verified (!)" || true
 [[ "$vout4" == *"no local branch 'vapour'"* ]] && ok "receipt naming a nonexistent branch rejected" || no "wrong reason: $vout4"
+
+# 2d: GSAI-211 shape — merge_sha equals the branch's PRE-EXISTING tip (a no-op pass:
+# `git merge --no-ff` found nothing to merge, so it committed nothing).
+echo "case 2d: verify-merge.sh rejects a no-op merge (GSAI-211 shape)"
+P5="$TMP/p5"; mkproj "$P5"
+DEVTIP5="$(git -C "$P5" rev-parse develop)"
+cat > "$TMP/noop.merge" <<EOF
+branch=develop
+merge_sha=$DEVTIP5
+premerge_sha=$DEVTIP5
+task_sha=$DEVTIP5
+EOF
+vout5="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/noop.merge" bash "$ROOT/dozers/verify-merge.sh" MV-5 "$P5" 2>&1)" && no "no-op merge verified (!)" || true
+[[ "$vout5" == *"PRE-EXISTING tip"* && "$vout5" == *"GSAI-211"* ]] && ok "no-op (GSAI-211 shape) rejected by name, not a generic error" || no "wrong reason: $vout5"
+
+# 2e: GSAI-213 shape — a real merge commit whose entire diff is Dozer's own paperwork.
+echo "case 2e: verify-merge.sh rejects a paperwork-only merge (GSAI-213 shape)"
+P6="$TMP/p6"; mkproj "$P6"
+PREMERGE6="$(git -C "$P6" rev-parse develop)"
+( cd "$P6"
+  git checkout -q -b dozer/MV-6 develop
+  printf '# design\n' > DOZER-DESIGN-GSAI-TEST.md
+  printf '# review\n' > DOZER-REVIEW-GSAI-TEST.md
+  git add -A && git commit -q -m "paperwork only"
+  git checkout -q develop
+  git merge -q --no-ff dozer/MV-6 -m "merge dozer/MV-6 into develop — #MV-6 paperwork"
+)
+MSHA6="$(git -C "$P6" rev-parse HEAD)"
+TASKSHA6="$(git -C "$P6" rev-parse dozer/MV-6)"
+cat > "$TMP/paperwork.merge" <<EOF
+branch=develop
+merge_sha=$MSHA6
+premerge_sha=$PREMERGE6
+task_sha=$TASKSHA6
+EOF
+vout6="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/paperwork.merge" bash "$ROOT/dozers/verify-merge.sh" MV-6 "$P6" 2>&1)" && no "paperwork-only merge verified (!)" || true
+[[ "$vout6" == *"ONLY Dozer paperwork"* && "$vout6" == *"GSAI-213"* ]] && ok "paperwork-only merge (GSAI-213 shape) rejected by name" || no "wrong reason: $vout6"
+
+# 2f: the same paperwork-only diff, but design_only=1 — the explicit opt-out passes.
+echo "case 2f: design-only opt-out (design_only=1) lets a paperwork-only merge pass"
+cat > "$TMP/paperwork-optout.merge" <<EOF
+branch=develop
+merge_sha=$MSHA6
+premerge_sha=$PREMERGE6
+task_sha=$TASKSHA6
+design_only=1
+EOF
+vout7="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/paperwork-optout.merge" bash "$ROOT/dozers/verify-merge.sh" MV-6 "$P6" 2>&1)" && ok "design-only opt-out passes: $vout7" || no "design-only opt-out wrongly rejected: $vout7"
+
+# 2g: a REAL docs change (README.md, not Dozer's own paperwork filenames) must be
+# unaffected by hatch 2 — the glob is deliberately narrow.
+echo "case 2g: a legitimate docs-only merge (not Dozer paperwork) is unaffected"
+P7="$TMP/p7"; mkproj "$P7"
+PREMERGE7="$(git -C "$P7" rev-parse develop)"
+( cd "$P7"
+  git checkout -q -b dozer/MV-7 develop
+  printf '# docs\n' > README.md
+  git add -A && git commit -q -m "docs"
+  git checkout -q develop
+  git merge -q --no-ff dozer/MV-7 -m "merge dozer/MV-7 into develop — #MV-7 docs"
+)
+MSHA7="$(git -C "$P7" rev-parse HEAD)"
+TASKSHA7="$(git -C "$P7" rev-parse dozer/MV-7)"
+cat > "$TMP/readme.merge" <<EOF
+branch=develop
+merge_sha=$MSHA7
+premerge_sha=$PREMERGE7
+task_sha=$TASKSHA7
+EOF
+vout8="$(REPO_ROOT="$ROOT" RECEIPT="$TMP/readme.merge" bash "$ROOT/dozers/verify-merge.sh" MV-7 "$P7" 2>&1)" && ok "legit README-only merge passes: $vout8" || no "legit README-only merge wrongly rejected: $vout8"
 
 # ── case 3: the ENGINE labels only on proof (files backend, full run_one) ─────
 # A whole engine copy so the phantom case can swap the dev crew for an exit-0 stub
@@ -140,6 +219,36 @@ grep -q "could NOT be verified" "$BOARD/blocked/MV-4.md" 2>/dev/null && ok "bloc
 grep -q "no merge receipt" "$BOARD/blocked/MV-4.md" 2>/dev/null && ok "block comment names the phantom signature" || no "block comment missing the receipt detail"
 PRE4="$(git -C "$P4" rev-parse develop)"
 [[ "$(git -C "$P4" rev-parse develop)" == "$PRE4" ]] && [[ -z "$(git -C "$P4" log --format=%s --grep='MV-4' develop)" ]] && ok "develop untouched by the phantom" || no "phantom moved develop"
+
+# 3c no-op: swap the dev crew for a stub that reproduces the GSAI-211 SHAPE exactly —
+# `git merge --no-ff` on a task branch identical to develop finds nothing to merge, so
+# it writes a receipt whose merge_sha IS the pre-existing tip. -> blocked, not done.
+cat > "$ENG/dozers/dev-lane/crew.sh" <<'EOX'
+#!/usr/bin/env bash
+set -uo pipefail
+id="$1"
+cd "$WORKDIR"
+git checkout -q develop
+PREMERGE="$(git rev-parse HEAD)"
+git checkout -q -b "dozer/$id" develop >/dev/null 2>&1
+git checkout -q develop
+git merge --no-ff "dozer/$id" -m "merge dozer/$id into develop — #$id noop" >/dev/null 2>&1 || true
+MERGE_SHA="$(git rev-parse HEAD)"   # unchanged by the no-op merge — still == PREMERGE
+TASK_SHA="$(git rev-parse "dozer/$id")"
+mkdir -p "$REPO_ROOT/.artifacts/dev"
+printf 'branch=develop\nmerge_sha=%s\npremerge_sha=%s\ntask_sha=%s\n' \
+  "$MERGE_SHA" "$PREMERGE" "$TASK_SHA" > "$REPO_ROOT/.artifacts/dev/$id.merge"
+exit 0
+EOX
+chmod +x "$ENG/dozers/dev-lane/crew.sh"
+P4B="$TMP/p4b"; mkproj "$P4B"
+printf 'title: %s\nlane: dev\n' "noop" > "$BOARD/ready/MV-4B.md"
+L4B="$TMP/e4b.log"; rc=0
+WORKDIR_DEFAULT="$P4B" run_engine "$L4B" || rc=$?
+[[ $rc -eq 0 ]] && ok "engine exited clean on a no-op crew" || { no "engine exited $rc"; dump "$L4B"; }
+[[ -f "$BOARD/blocked/MV-4B.md" ]] && ok "no-op (GSAI-211 shape) -> blocked, NOT done" || no "no-op ended up somewhere other than blocked/"
+[[ ! -f "$BOARD/done/MV-4B.md" ]] && ok "no-op never labelled done/merged" || no "no-op landed in done/ — GSAI-211 is back"
+grep -q "GSAI-211" "$BOARD/blocked/MV-4B.md" 2>/dev/null && ok "block comment names the GSAI-211 no-op reason" || no "block comment missing the GSAI-211 reason"
 
 # ── case 4: audit-merged.sh repairs phantom labels, strips closed ones ────────
 echo "case 4: one-shot audit — verify, strip+requeue phantoms, strip closed"

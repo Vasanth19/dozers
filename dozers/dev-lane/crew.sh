@@ -1182,8 +1182,34 @@ fi
 # written only here — after the merge landed AND the green-gate passed — so an exit 0
 # from any earlier point (or a receipt missing/stale) blocks the issue instead of
 # labeling it merged, which is how phantom merges reached the Ship gate (CFW-215/252).
+#
+# GSAI-217: "this sha is reachable from this branch" is necessary but not sufficient —
+# it rubber-stamped a no-op (GSAI-211: the sha was already on $INTEG before this pass
+# ran — `git merge --no-ff` found nothing to merge) and a docs-only merge (GSAI-213:
+# a real merge commit whose entire diff was the crew's own DOZER-DESIGN/REVIEW
+# paperwork). Two more facts close both holes: premerge_sha (was this sha NEW?) and
+# task_sha (does the merge actually contain dozer/$ID's own tip?). $WT is untouched
+# between the merge above and here (even on the rebase fallback, whose rebase already
+# happened before any merge attempt succeeded), so this is the tip that landed.
+TASK_TIP="$(git -C "$WT" rev-parse HEAD)"     # tip of dozer/$ID at merge time — the only
+                                               # surviving reference once $WT/$BRANCH are
+                                               # deleted on cleanup a few lines below
 MERGE_SHA="$(git -C "$MW" rev-parse HEAD)"
-printf 'branch=%s\nmerge_sha=%s\n' "$INTEG" "$MERGE_SHA" > "$OUT/$ID.merge" 2>/dev/null \
+
+# Design-only opt-out (spec: "never by default"). Same data source/pattern as the
+# lite_when_label check above: DOZER_CREW_META's `label` lines + org/config.yaml's
+# `crews:` block, plus a one-run env override mirroring DOZER_CREW/TEST_GATE=off.
+# The inbound env value is captured BEFORE resetting the same-named var, so the
+# override actually takes effect instead of being clobbered by its own reset.
+_design_only_env="${DESIGN_ONLY:-0}"
+DESIGN_ONLY=0
+[[ "$_design_only_env" == "1" ]] && DESIGN_ONLY=1
+dlabel="$(crews_get design_only_label)"; dlabel="${dlabel:-design-only}"
+while IFS= read -r l; do [[ "$l" == "$dlabel" ]] && DESIGN_ONLY=1; done \
+  < <(crew_meta_field label)
+
+printf 'branch=%s\nmerge_sha=%s\npremerge_sha=%s\ntask_sha=%s\ndesign_only=%s\n' \
+  "$INTEG" "$MERGE_SHA" "$PREMERGE" "$TASK_TIP" "$DESIGN_ONLY" > "$OUT/$ID.merge" 2>/dev/null \
   || fail "merge landed but the receipt could not be written ($OUT/$ID.merge) — NOT labeling merged; investigate .artifacts/dev writability and re-greenlight"
 echo "    [dev] merge receipt: $(git -C "$MW" rev-parse --short HEAD) on $INTEG"
 # GSAI-173: same count fail() would have written, on the success path.
