@@ -348,6 +348,10 @@ crews:
   lite_when_lanes: "ops"                          # comma-separated lane names
   lite_when_label: "crew:lite"                    # one label, on the issue itself
   lite_when_projects: "GSAI: Factory housekeeping"  # `|`-separated — project names carry commas AND colons
+  # GSAI-217: opts an issue INTO shipping only DOZER-DESIGN-*.md/DOZER-REVIEW-*.md —
+  # verify-merge.sh blocks a paperwork-only merge by default (GSAI-213 escape hatch).
+  # One label, on the issue itself; DESIGN_ONLY=1 forces it for a single crew.sh run.
+  design_only_label: "design-only"
   # A turn cap can only be handed to a CLI that has the flag (claude, and the ollama
   # routes, which are Claude Code repointed). `codex exec` has none, so a capped pass
   # routed there is bounded by wall clock instead — this many seconds, never more than
