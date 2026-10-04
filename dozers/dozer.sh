@@ -12,7 +12,8 @@
 #   dozers/dozer.sh loop      # keep draining every POLL_SECONDS (default 30)
 #
 # Config (org/config.yaml or env): linear_teams ("CFW,LL"), fanout (1..8),
-#   workdir_default, workdirs (team/repo -> path). One process can serve all teams.
+#   max_per_repo (crews per checkout, GSAI-112), workdir_default, workdirs (team/repo -> path).
+#   One process can serve all teams.
 set -euo pipefail
 # 2026-09-05 crash loop: launchd's com.dozers.loop resolved a stale Homebrew
 # `claude` (2.1.201) ahead of ~/.npm-global/bin/claude (2.1.261), crashing crews.
@@ -71,6 +72,13 @@ focus_tick() {   # ...and once an hour thereafter
 
 POLL_SECONDS="${POLL_SECONDS:-30}"
 FANOUT="${FANOUT:-$(cfg fanout)}"; FANOUT="${FANOUT:-1}"; (( FANOUT < 1 )) && FANOUT=1
+# Crews allowed on ONE checkout at a time (GSAI-112, see the per-repo cap below). Fail fast
+# on a bad value, per CLAUDE.md: a typo must never quietly become "no cap". Default 2.
+MAX_PER_REPO="${MAX_PER_REPO:-$(cfg max_per_repo)}"; MAX_PER_REPO="${MAX_PER_REPO:-2}"
+if [[ ! "$MAX_PER_REPO" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[dozer] max_per_repo must be a positive integer, got \"$MAX_PER_REPO\" (org/config.yaml: max_per_repo)" >&2
+  exit 1
+fi
 LOCK_DIR="${LOCK_DIR:-$HOME/.dozers/locks}"; mkdir -p "$LOCK_DIR"
 
 # ── Per-team crew-slot caps (GSAI-169) ─────────────────────────────────────────
@@ -159,6 +167,75 @@ group_live_counts() {
   done
   shopt -u nullglob
   printf '%s' "${gn[*]}"
+}
+
+# ── Per-repo crew cap (GSAI-112) ───────────────────────────────────────────────
+# `fanout` and the group caps both count CREWS, and neither knows which checkout a crew
+# cuts its worktree from. Live case: nine repo:cfw-social issues went dozer:ready together,
+# all five slots filled from that one repo, and every crew cut dozer/<id> off the same
+# develop — so the merges that followed were stale-base merges against each other.
+#
+# So a third claim-time gate caps crews PER CHECKOUT (max_per_repo, org/config.yaml). The
+# key is the RESOLVED checkout path, not the repo: label — two routes can name one
+# checkout, and the shared develop is what the cap protects. It is a skip, never a wait:
+# a refused issue keeps its labels and the drain walks on, so other repos keep their slots.
+#
+# An issue with no identity (no repo: and no team) has no checkout to contend for, and an
+# unresolvable one is blocked by run_one before any worktree exists — both are uncapped.
+#
+# Live counts come from the `repo=` line run_one writes into each lock's owner file, read
+# the same way group_live_counts reads `task=`. A lock from before this change has no
+# repo= line; its checkout is re-derived from its task, so a deploy never hides a crew.
+# Parallel indexed arrays, like the group arrays above — macOS /bin/bash is 3.2.
+RKEYS=(); RCOUNT=()
+
+repo_key_of() {  # <id> -> the resolved checkout path this task would run in, or "" (uncapped)
+  local id="$1" hint team workdir
+  hint="$(task_repo "$id" 2>/dev/null || true)"
+  team="$(task_team "$id" 2>/dev/null || true)"
+  [[ -n "$hint$team" ]] || return 0
+  # Resolver stderr is discarded on purpose: run_one resolves again and blocks the task with
+  # the real reason, so the error is reported once, in the place that owns it.
+  workdir="$(resolve_workdir "$hint" "$team" 2>/dev/null)" || return 0
+  printf '%s' "$workdir"
+}
+
+# One line per LIVE crew lock: the checkout that crew runs in. Same three exclusions as
+# group_live_counts (director locks, owner-less locks, dead pids).
+repo_live_counts() {
+  local lock pid id key
+  shopt -s nullglob
+  for lock in "$LOCK_DIR"/*.lock; do
+    case "${lock##*/}" in director-*.lock) continue ;; esac
+    [[ -f "$lock/owner" ]] || continue
+    pid="$( { grep -E '^pid=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+    { [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; } || continue
+    if grep -qE '^repo=' "$lock/owner"; then
+      key="$( { grep -E '^repo=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+    else
+      id="$( { grep -E '^task=' "$lock/owner" 2>/dev/null || true; } | head -1 | cut -d= -f2-)"
+      [[ -n "$id" ]] || id="$(basename "$lock" .lock)"
+      key="$(repo_key_of "$id")"
+    fi
+    if [[ -n "$key" ]]; then printf '%s\n' "$key"; fi
+  done
+  shopt -u nullglob
+}
+
+repo_bump() {  # <key> -> one more crew on that checkout
+  local k="$1" i
+  for (( i = 0; i < ${#RKEYS[@]}; i++ )); do
+    [[ "${RKEYS[i]}" == "$k" ]] && { RCOUNT[i]=$(( RCOUNT[i] + 1 )); return 0; }
+  done
+  RKEYS+=("$k"); RCOUNT+=(1)
+}
+
+repo_count_of() {  # <key> -> live crews on that checkout, 0 if none
+  local k="$1" i
+  for (( i = 0; i < ${#RKEYS[@]}; i++ )); do
+    [[ "${RKEYS[i]}" == "$k" ]] && { printf '%s' "${RCOUNT[i]}"; return 0; }
+  done
+  printf '0'
 }
 
 load_groups
@@ -398,8 +475,8 @@ resolve_workdir() {
 }
 
 # Always invoked backgrounded (own subshell), so the EXIT trap + lock are scoped.
-run_one() { # <id> <lane> <title> [priority] [kr-due]
-  local id="$1" lane="$2" title="$3" prio="${4:-}" kr="${5:-}"
+run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
+  local id="$1" lane="$2" title="$3" prio="${4:-}" kr="${5:-}" rkey="${6:-}"
   # atomic local mutex so parallel Dozers never double-grab the same task
   local lock="$LOCK_DIR/${id//\//_}.lock"
   if ! mkdir "$lock" 2>/dev/null; then echo "  ~ #$id locked locally, skipping"; return 0; fi
@@ -410,9 +487,11 @@ run_one() { # <id> <lane> <title> [priority] [kr-due]
   # `director-<role>.lock`), and the reaper uses "has an owner file" to tell a run-lock
   # of ours from someone else's mutex (GSAI-96). An owner-less lock here would be both
   # invisible to the reaper and unreapable forever, so fail the run instead.
-  if ! printf 'pid=%s\nhost=%s\ntask=%s\nlane=%s\nts=%s\n' \
+  # repo= (GSAI-112) is the checkout this crew runs in, read by repo_live_counts. It is
+  # written even when empty, so a present repo= line always means "post-GSAI-112 lock".
+  if ! printf 'pid=%s\nhost=%s\ntask=%s\nlane=%s\nts=%s\nrepo=%s\n' \
     "$BASHPID" "$(hostname -s 2>/dev/null || echo local)" "$id" "$lane" \
-    "$(date -u +%FT%TZ 2>/dev/null || date)" > "$lock/owner" 2>/dev/null; then
+    "$(date -u +%FT%TZ 2>/dev/null || date)" "$rkey" > "$lock/owner" 2>/dev/null; then
     echo "  x could not write $lock/owner - releasing lock, skipping #$id" >&2; return 1
   fi
 
@@ -598,11 +677,14 @@ drain() {  # fill the free slots from the ready list; returns immediately, never
   # The ready list arrives in claim order (GSAI-172: the KR's target date, then backend
   # priority, then oldest first — see tasks/adapter.sh); claiming top-down orders the fleet.
   local free=$(( FANOUT - ${#CREWS[@]} )) launched=0 queued=0 seen=0 capped=0
-  local id lane title prio kr team gi cap
+  local id lane title prio kr team gi cap rkey rcount rk
   # GSAI-169: per-group live counts, taken ONCE at the top of the drain and then
   # incremented as this drain launches, because a crew's lock is written by the
   # backgrounded subshell and is not guaranteed to exist yet when the next row is read.
   local -a gcount gskip=(); read -r -a gcount <<<"$(group_live_counts)"
+  # GSAI-112: the same snapshot-then-increment, per checkout. Reset first: RKEYS is global.
+  RKEYS=(); RCOUNT=()
+  while IFS= read -r rk; do repo_bump "$rk"; done < <(repo_live_counts)
   while IFS=$'\t' read -r id lane title prio kr; do
     [[ -z "$id" ]] && continue; seen=$((seen+1))
     # Already in flight on this host (its crew holds a slot): the backend just hasn't
@@ -618,8 +700,21 @@ drain() {  # fill the free slots from the ready list; returns immediately, never
       [[ -n "${gskip[gi]:-}" ]] || { gskip[gi]=1; echo "  ~ skip: group-cap $team ${gcount[gi]:-0}/$cap"; }
       continue
     fi
-    run_one "$id" "$lane" "$title" "$prio" "$kr" &
+    # GSAI-112: the per-checkout cap — skip PAST a full checkout, exactly as the group cap
+    # does. Resolved only after the cheap checks above, so a queued or group-capped issue
+    # costs no Linear or resolver call. An empty key (no identity, or unresolvable) is
+    # uncapped here; run_one blocks an unresolvable one with the real reason.
+    rkey="$(repo_key_of "$id")"
+    if [[ -n "$rkey" ]]; then
+      rcount="$(repo_count_of "$rkey")"
+      if (( rcount >= MAX_PER_REPO )); then
+        echo "  ~ repo cap: ${rkey##*/} at ${rcount}/${MAX_PER_REPO}, skipping $id"
+        continue
+      fi
+    fi
+    run_one "$id" "$lane" "$title" "$prio" "$kr" "$rkey" &
     CREWS+=("$!"); launched=$((launched+1)); gcount[gi]=$(( ${gcount[gi]:-0} + 1 ))
+    if [[ -n "$rkey" ]]; then repo_bump "$rkey"; fi
   done < <(task_list_ready)
   if (( seen == 0 )); then echo "  (nothing ready)"
   else
