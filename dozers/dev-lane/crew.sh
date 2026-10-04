@@ -545,10 +545,15 @@ branch_has_output() {  # $1 = dir, $2 = pinned base sha
 # outside DEP_ENTRIES (node_modules, .env*), at ANY depth — the dep symlinks link_deps
 # plants and the secrets a crew must never commit are not "work". Fail-closed: a
 # failing `git status` counts as dirty, never a silent "clean".
+# The `.env*` glob covers every env file (.env.production, .env.test, …), not just the
+# names link_deps plants: a secret file must never be snapshotted into a wip commit.
+# The pass artifacts ($DESIGN_FILE / $REVIEW_FILE) are not deliverables either, so they
+# are excluded the same way branch_has_output excludes them.
 DEP_PATHSPEC=()
-for _dep in "${DEP_ENTRIES[@]}"; do
+for _dep in "${DEP_ENTRIES[@]}" '.env*'; do
   DEP_PATHSPEC+=( ":(exclude,glob)**/$_dep" ":(exclude,glob)**/$_dep/**" )
 done
+DEP_PATHSPEC+=( ":(exclude)$DESIGN_FILE" ":(exclude)$REVIEW_FILE" )
 wt_unsaved() {  # $1 = dir
   local out
   out="$(git -C "$1" status --porcelain --untracked-files=normal -- . "${DEP_PATHSPEC[@]}")" || return 0

@@ -246,6 +246,9 @@ WTE="$WT_ROOT/projE-TEST-DRE1"
 printf 'UNSAVED EDIT\n' >> "$WTE/task.txt"          # the real dirt
 printf 'scratch\n' > "$WTE/scratch.txt"
 printf 'SECRET=do-not-commit\n' > "$WTE/.env"
+printf 'PROD_SECRET=do-not-commit\n' > "$WTE/.env.production"   # not planted by link_deps: the .env* glob must cover it
+printf 'TEST_SECRET=do-not-commit\n' > "$WTE/.env.test"
+printf '# DOZER-DESIGN (planted)\n' > "$WTE/DOZER-DESIGN-TEST-DRE1.md"   # a pass artifact, not a deliverable
 mkdir -p "$WTE/node_modules/pkg" && printf 'module.exports = 1\n' > "$WTE/node_modules/pkg/index.js"
 # the stub's own build commit runs `git add -A` and would sweep these in, so the
 # assertion is on the WIP commit, which is made before the stub runs again.
@@ -261,9 +264,12 @@ if [[ -n "$WIPE" ]]; then
   git -C "$PROJE" show --name-only --format= "$WIPE" | grep -qx "scratch.txt" \
     && ok "the untracked scratch file is in the wip commit" \
     || no "untracked scratch file missing from the wip commit"
-  git -C "$PROJE" show --name-only --format= "$WIPE" | grep -Eq '(^|/)(\.env|node_modules)(/|$)' \
-    && no ".env or node_modules was COMMITTED in the wip commit (secret/bloat leak)" \
-    || ok ".env and node_modules are NOT in the wip commit"
+  git -C "$PROJE" show --name-only --format= "$WIPE" | grep -Eq '(^|/)(\.env[^/]*|node_modules)(/|$)' \
+    && no ".env*/node_modules was COMMITTED in the wip commit (secret/bloat leak)" \
+    || ok ".env, .env.production, .env.test and node_modules are NOT in the wip commit"
+  git -C "$PROJE" show --name-only --format= "$WIPE" | grep -qx "DOZER-DESIGN-TEST-DRE1.md" \
+    && no "a pass artifact was COMMITTED in the wip commit" \
+    || ok "pass artifacts are not part of the wip commit"
 fi
 
 PROJE2="$(new_project projE2)"
@@ -273,6 +279,8 @@ rc=0; run_crew "$PROJE2" TEST-DRE2 "deps only" "$TMP/crewE2a.log" || rc=$?
 WTE2="$WT_ROOT/projE2-TEST-DRE2"
 [[ -d "$WTE2" ]] || { no "attempt 1 did not leave a worktree"; sed 's/^/    | /' "$TMP/crewE2a.log" >&2; }
 printf 'SECRET=do-not-commit\n' > "$WTE2/.env"
+printf 'PROD_SECRET=do-not-commit\n' > "$WTE2/.env.production"
+printf 'TEST_SECRET=do-not-commit\n' > "$WTE2/.env.test"
 mkdir -p "$WTE2/node_modules/pkg" && printf 'module.exports = 1\n' > "$WTE2/node_modules/pkg/index.js"
 rc=0; run_crew "$PROJE2" TEST-DRE2 "deps only" "$TMP/crewE2b.log" || rc=$?
 grep -q "rescued uncommitted output" "$TMP/crewE2b.log" \
