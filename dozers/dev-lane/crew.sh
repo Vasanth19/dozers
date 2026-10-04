@@ -541,6 +541,39 @@ branch_has_output() {  # $1 = dir, $2 = pinned base sha
     ':(exclude)'"$DESIGN_FILE" ':(exclude)'"$REVIEW_FILE" 2>/dev/null
 }
 
+# wt_unsaved <dir> — GSAI-152 / GSAI-157: 0 when the worktree holds uncommitted output
+# outside DEP_ENTRIES (node_modules, .env*), at ANY depth — the dep symlinks link_deps
+# plants and the secrets a crew must never commit are not "work". Fail-closed: a
+# failing `git status` counts as dirty, never a silent "clean".
+DEP_PATHSPEC=()
+for _dep in "${DEP_ENTRIES[@]}"; do
+  DEP_PATHSPEC+=( ":(exclude,glob)**/$_dep" ":(exclude,glob)**/$_dep/**" )
+done
+wt_unsaved() {  # $1 = dir
+  local out
+  out="$(git -C "$1" status --porcelain --untracked-files=normal -- . "${DEP_PATHSPEC[@]}")" || return 0
+  [[ -n "$out" ]]
+}
+
+# wip_snapshot <dir> <id> — GSAI-157: commit the worktree's unsaved output as
+# `wip(<id>)` on $BRANCH so a resume can rebase and reuse it. Prints the short SHA;
+# rc≠0 on any failure, with nothing discarded. It never finishes or aborts a rebase or
+# merge a crashed run left behind — that is the Director's call, so it fails closed.
+wip_snapshot() {  # $1 = dir, $2 = issue id
+  local d="$1" id="$2" cur gd
+  gd="$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  if [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" || -f "$gd/MERGE_HEAD" ]]; then
+    echo "a rebase or merge is already in progress in $d" >&2; return 1
+  fi
+  cur="$(git -C "$d" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+  if [[ "$cur" != "$BRANCH" ]]; then
+    git -C "$d" switch -q -c "$BRANCH" >/dev/null 2>&1 || return 1
+  fi
+  git -C "$d" add -A -- . "${DEP_PATHSPEC[@]}" >/dev/null 2>&1 || return 1
+  git -C "$d" commit -q -m "wip($id): preserve uncommitted crew output (GSAI-157)" >/dev/null 2>&1 || return 1
+  git -C "$d" rev-parse --short HEAD 2>/dev/null
+}
+
 # run_model_pass <pass> <prompt> [proof] — one agent run under its own route, its own
 # timebox. <proof> (GSAI-147, build form GSAI-149) names the pass's deliverable and
 # is consulted ONLY when the session exits non-zero AND it was not a timeout: the exit
@@ -777,6 +810,23 @@ echo "    [dev] cwd=$(pwd)  integration=$INTEG  branch=$BRANCH"
 if git show-ref --verify --quiet "refs/heads/$INTEG"; then base="$INTEG"; else base="HEAD"; fi
 
 # ── 1. isolate — or RESUME (Seance) if a prior attempt left committed work ──────
+# GSAI-152 (GSAI-157 rescue): a worktree holding UNCOMMITTED output is snapshotted to a
+# wip(<ID>) commit BEFORE the RESUMING decision. Otherwise the stale-base rebase below
+# refuses the dirty tree ("cannot rebase: You have unstaged changes") and a resumable
+# task dies as if its base had conflicted. Once the snapshot lands, the existing resume
+# branch fires and the rebase runs on a clean tree. Nothing is discarded: the wip commit
+# stays on $BRANCH, and a conflicting rebase still aborts with its "stale base" report.
+if [[ -d "$WT" ]] && wt_unsaved "$WT"; then
+  if [[ "${WT_FORCE_REMOVE:-}" == 1 ]]; then
+    echo "    [dev] ⚠ $WT holds uncommitted changes — WT_FORCE_REMOVE=1, removing it for a clean restart"
+    git worktree remove --force "$WT" >/dev/null 2>&1 || true
+  elif _wip="$(wip_snapshot "$WT" "$ID")"; then
+    echo "    [dev] ⚠ rescued uncommitted output in $WT as wip($ID) at $_wip — resuming from it"
+  else
+    fail "worktree $WT holds uncommitted changes that could not be snapshotted — NOT removing it; inspect and clean it deliberately, then re-greenlight"
+  fi
+fi
+
 RESUMING=0; attempt=1
 if [[ -d "$WT" ]] && git -C "$WT" rev-parse --verify -q "refs/heads/$BRANCH" >/dev/null 2>&1 \
    && [[ -n "$(git -C "$WT" log --oneline "$base..$BRANCH" 2>/dev/null)" ]]; then
