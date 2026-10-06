@@ -547,8 +547,10 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
   if ! workdir="$(resolve_workdir "$hint" "$team" 2>"$wd_errf")"; then
     wd_err="$(head -c 2000 "$wd_errf" 2>/dev/null || true)"; rm -f "$wd_errf" 2>/dev/null || true
     [[ -n "$wd_err" ]] || wd_err="workdir resolution failed without a reason"
-    task_block "$id"
+    # GSAI-252: the reason is posted BEFORE the block, so a block that reaches the release
+    # cap raises its board-ask WITH this reason in it (block() reads the comments).
     task_comment "$id" "$(printf 'Dozer blocked BEFORE any work - could not resolve a working directory, so no crew ran, no worktree was created and no branch was cut.\n  repo hint: %s\n  team: %s\nReason: %s' "${hint:-<none>}" "${team:-<none>}" "$wd_err")"
+    task_block "$id" || echo "  ! #$id could not be blocked — left in-progress for the reaper (reason above)" >&2
     echo "  x #$id unroutable: $wd_err  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=0" >&2
     return 0
   fi
@@ -615,8 +617,8 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
       # step at the wrong artifacts dir — the exact silent-fallback class this fix kills.
       vout="$(REPO_ROOT="$ROOT" "$ROOT/dozers/verify-merge.sh" "$id" "$workdir" 2>&1)" || vrc=$?
       if (( vrc != 0 )); then
-        task_block "$id"
         task_comment "$id" "$(printf 'Dozer blocked AFTER the crew reported success — the claimed merge could NOT be verified against %s, so the issue is NOT labeled dozer:merged-develop (GSAI-119).\n\nReason: %s' "$workdir" "$vout")"
+        task_block "$id" || echo "  ! #$id could not be blocked — left in-progress for the reaper (reason above)" >&2
         echo "  x #$id crew succeeded but the merge did not verify — blocked: ${vout%%$'\n'*}  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
         return 0
       fi
@@ -639,8 +641,8 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
     local reason
     if [[ -s "$fail_file" ]]; then reason="$(head -c 2000 "$fail_file")"
     else reason="crew exited without recording a reason — see the Dozer loop log (~/.dozers/logs/loop.err.log)"; fi
-    task_block "$id"
     task_comment "$id" "$(printf 'Dozer blocked in lane:%s - needs a look.\nReason: %s' "$lane" "$reason")"
+    task_block "$id" || echo "  ! #$id could not be blocked — left in-progress for the reaper (reason above)" >&2
     echo "  x #$id failed: $reason  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
   fi
 }

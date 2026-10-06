@@ -37,7 +37,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP" 2>/dev/null || true' EXIT
 
-out="$(cd "$ROOT/tasks" && LINEAR_API_KEY=test-not-used LINEAR_TEAMS=T TMPDIR_T="$TMP" \
+out="$(cd "$ROOT/tasks" && LINEAR_API_KEY=test-not-used LINEAR_TEAMS=T TMPDIR_T="$TMP" DOZER_STATE_DIR="$TMP" \
       python3 - <<'PY'
 import importlib.util, os, sys, io, contextlib
 spec = importlib.util.spec_from_file_location("lin", "_linear_api.py")
