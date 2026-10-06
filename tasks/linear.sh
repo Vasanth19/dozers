@@ -64,6 +64,11 @@ task_board_answer()  { python3 "$_LIN" board-answer "$1"; }
 # lives inside claim(); this is only the window onto it.
 task_release_count() { python3 "$_LIN" release-count "$1"; }
 
+# release-cap sweep (GSAI-252) — every dozer:blocked issue at the cap must carry a board-ask
+# and board:to_review. Run by dozers/reaper.sh. --dry-run lists the set and writes nothing;
+# --force bypasses the throttle (BUDGET_SWEEP_EVERY, default 1800s).
+task_budget_sweep()  { python3 "$_LIN" budget-sweep "$@"; }
+
 # weekly focus (GSAI-176) — one human line describing the active focus window. No Linear
 # call: it reads org/config.yaml only, so dozer.sh can print it in its startup banner and
 # once an hour without spending a round-trip. A backend with no notion of focus simply

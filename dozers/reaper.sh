@@ -149,5 +149,16 @@ for lock in "$LOCK_DIR"/*.lock; do
 done
 shopt -u nullglob
 
+# ── 3. Release-cap sweep (GSAI-252) — an exhausted issue must never sit without a board-ask.
+# Throttled inside the verb (BUDGET_SWEEP_EVERY), so calling it on every reaper pass is cheap.
+# A failure is reported, not fatal: the reaper's requeue and lock work above already ran.
+if declare -F task_budget_sweep >/dev/null; then
+  if [[ "$DRY_RUN" == 1 ]]; then
+    task_budget_sweep --dry-run || echo "  ! budget sweep reported failures (see above)" >&2
+  else
+    task_budget_sweep || echo "  ! budget sweep reported failures (see above)" >&2
+  fi
+fi
+
 printf '[reaper] %srequeued=%d reaped-locks=%d healthy=%d foreign-skipped=%d\n' \
   "$([[ "$DRY_RUN" == 1 ]] && echo '(dry) ')" "$requeued" "$reaped" "$healthy" "$foreign"
