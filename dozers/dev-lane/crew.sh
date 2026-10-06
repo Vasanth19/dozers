@@ -525,20 +525,26 @@ resolve_pass() {  # $1 = pass (architect|build|review) → sets _PASS_BLOCK/_DES
   _PASS_TURNS_UNSUPPORTED="${_PASS_TURNS_UNSUPPORTED:-0}"
 }
 
-# branch_has_output <dir> <sha> — the gate's question (GSAI-149): "does the branch
-# hold anything to merge?" — is there ANY diff vs the pinned base SHA beyond the pass
-# artifacts ($DESIGN_FILE / $REVIEW_FILE — committed by the crew's backstops, and a
-# design file is not a deliverable to merge). The ONE definition of "the build did
-# something", shared by build_once's no-commit gate and run_model_pass's changes:
-# proof — no two versions of it (spec point 5). Uncommitted working-tree changes
-# count as output, exactly as they did against the old per-attempt anchor.
-# The LEGACY root names stay excluded too (GSAI-148): a pre-fix resumed branch carries
-# its committed design at the old fixed path, and scoring that as output would let
-# such a branch pass the gate on a design file alone.
+# ARTIFACT_PATHSPEC — the pass artifacts that are never a deliverable: the per-issue
+# $DESIGN_FILE / $REVIEW_FILE (GSAI-148) AND the LEGACY root names, so a pre-fix resumed
+# branch whose committed design sits at the old fixed path is not scored as output.
+# ONE list, shared by branch_has_output (committed scoring) and DEP_PATHSPEC (the
+# snapshot/dirty check) — two lists would drift and a stray legacy file would be
+# snapshotted as "output" (GSAI-251).
+ARTIFACT_PATHSPEC=( ':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md'
+  ":(exclude)$DESIGN_FILE" ":(exclude)$REVIEW_FILE" )
+
+# branch_has_output <dir> <sha> — the gate's question (GSAI-149): "does the COMMITTED
+# branch hold anything to merge?" — is there a diff between the pinned base SHA and
+# HEAD beyond the pass artifacts (ARTIFACT_PATHSPEC)? The ONE definition of "the build
+# did something", shared by build_once's no-commit gate and run_model_pass's changes:
+# proof — no two versions of it (spec point 5).
+# GSAI-251: scored against HEAD, NOT the working tree. Uncommitted output used to count
+# as the build's deliverable, so the gates passed on code the merge never shipped (the
+# merge takes committed history only). Uncommitted output is now judged by its own
+# explicit check, wt_unsaved, and build_backstop commits it before this runs.
 branch_has_output() {  # $1 = dir, $2 = pinned base sha
-  ! git -C "$1" diff --quiet "$2" -- . \
-    ':(exclude)DOZER-DESIGN.md' ':(exclude)DOZER-REVIEW.md' \
-    ':(exclude)'"$DESIGN_FILE" ':(exclude)'"$REVIEW_FILE" 2>/dev/null
+  ! git -C "$1" diff --quiet "$2" HEAD -- . "${ARTIFACT_PATHSPEC[@]}" 2>/dev/null
 }
 
 # wt_unsaved <dir> — GSAI-152 / GSAI-157: 0 when the worktree holds uncommitted output
@@ -553,7 +559,7 @@ DEP_PATHSPEC=()
 for _dep in "${DEP_ENTRIES[@]}" '.env*'; do
   DEP_PATHSPEC+=( ":(exclude,glob)**/$_dep" ":(exclude,glob)**/$_dep/**" )
 done
-DEP_PATHSPEC+=( ":(exclude)$DESIGN_FILE" ":(exclude)$REVIEW_FILE" )
+DEP_PATHSPEC+=( "${ARTIFACT_PATHSPEC[@]}" )
 wt_unsaved() {  # $1 = dir
   local out
   out="$(git -C "$1" status --porcelain --untracked-files=normal -- . "${DEP_PATHSPEC[@]}")" || return 0
@@ -574,9 +580,39 @@ wip_snapshot() {  # $1 = dir, $2 = issue id
   if [[ "$cur" != "$BRANCH" ]]; then
     git -C "$d" switch -q -c "$BRANCH" >/dev/null 2>&1 || return 1
   fi
-  git -C "$d" add -A -- . "${DEP_PATHSPEC[@]}" >/dev/null 2>&1 || return 1
-  git -C "$d" commit -q -m "wip($id): preserve uncommitted crew output (GSAI-157)" >/dev/null 2>&1 || return 1
+  # GSAI-251: a failing step names itself and its git message (a pre-commit hook's
+  # rejection, a missing identity) on stderr, instead of vanishing into /dev/null — the
+  # callers' "could not be committed" reason is only actionable if it says why.
+  local _err
+  if ! _err="$(git -C "$d" add -A -- . "${DEP_PATHSPEC[@]}" 2>&1)"; then
+    echo "git add failed in $d: $(printf '%s\n' "$_err" | tail -n 5)" >&2; return 1
+  fi
+  if ! _err="$(git -C "$d" commit -q -m "wip($id): preserve uncommitted crew output (GSAI-157)" 2>&1)"; then
+    echo "git commit failed in $d: $(printf '%s\n' "$_err" | tail -n 5)" >&2; return 1
+  fi
   git -C "$d" rev-parse --short HEAD 2>/dev/null
+}
+
+# build_backstop <id> — GSAI-251: the commit backstop. The build pass may write real
+# source and leave it uncommitted; the merge takes committed history only, so anything
+# left in $WT is committed as wip(<id>) HERE, before any gate reads the tree. Called
+# after the build pass (before install_deps/run_tests, so the tests judge the exact tree
+# that will merge), on the build's non-zero-exit proof path, and once more in the refinery
+# before the merge (defence in depth). A clean tree, or one dirty only with dependency /
+# secret / pass-artifact paths, is a no-op (wt_unsaved). Returns 1 — and sets
+# BACKSTOP_WHY to the git message — when the output could not be committed: the caller
+# fails closed. Never a silent skip.
+build_backstop() {  # $1 = issue id
+  BACKSTOP_WHY=""
+  wt_unsaved "$WT" || return 0
+  local n _sha
+  n="$(git -C "$WT" status --porcelain --untracked-files=all -- . "${DEP_PATHSPEC[@]}" | wc -l | tr -d ' ')"
+  if _sha="$(wip_snapshot "$WT" "$1" 2>&1)"; then
+    echo "    [dev] build pass left $n uncommitted files; committed as wip($1) before merge"
+    return 0
+  fi
+  BACKSTOP_WHY="$_sha"
+  return 1
 }
 
 # run_model_pass <pass> <prompt> [proof] — one agent run under its own route, its own
@@ -769,6 +805,12 @@ taken as its verdict (worktree kept for resume)"
         return 0
       fi ;;
     changes:*)
+      # GSAI-251: a build that wrote code and then died before committing is rescued
+      # by committing that output FIRST — branch_has_output now judges committed history
+      # only. If the commit itself fails, that is the reason, not "failed".
+      if ! build_backstop "$ID"; then
+        fail "$1 agent exited $rc and left uncommitted changes in $WT that could not be committed — NOT merging (worktree kept). git said: $BACKSTOP_WHY"
+      fi
       if branch_has_output "$WT" "${3#changes:}"; then
         echo "    [dev] ⚠ $1 agent exited $rc but $BRANCH holds changes past ${3#changes:} — continuing from its work"
         return 0
@@ -1027,6 +1069,9 @@ $1"
     # rescued by the prior work already on the branch where the per-attempt
     # commits:$anchor proof killed the crew before the gate could judge.
     run_model_pass build "$prompt" "changes:$BASE_SHA"
+    # GSAI-251: commit what the build left in the tree BEFORE anything reads it. Placed
+    # ahead of install_deps and run_tests so the tests judge the exact tree that merges.
+    build_backstop "$ID" || fail "build pass left uncommitted changes in $WT that could not be committed — NOT merging (worktree kept). git said: $BACKSTOP_WHY"
     # no-op if the agent (or link_deps) already provided node_modules
     install_deps "$WT" "task worktree" || fail "$DEPS_FAIL_MSG"
     resolve_test_cmd "$WT" "task worktree" || fail "$NO_TEST_MSG"
@@ -1168,6 +1213,13 @@ else
   git worktree add "$MW" "$INTEG" >/dev/null 2>&1 \
     || git worktree add -B "$INTEG" "$MW" "$base" >/dev/null 2>&1 \
     || fail "could not create merge worktree $MW on $INTEG"
+fi
+# GSAI-251: the merge takes COMMITTED history only, so output left in the task worktree
+# would ship as nothing. Defence in depth for any path that reaches the merge without
+# passing build_once's backstop (a review-FAIL loop exit, the lite profile). Commit it or
+# fail closed here — never merge past it. The rebase fallback below needs a clean tree too.
+if ! build_backstop "$ID"; then
+  fail "worktree $WT holds uncommitted changes that could not be committed before the merge — NOT merging (worktree kept). git said: $BACKSTOP_WHY"
 fi
 PREMERGE="$(git -C "$MW" rev-parse HEAD)"
 if git -C "$MW" merge --no-ff "$BRANCH" -m "merge $BRANCH into $INTEG — #$ID $TITLE" >/dev/null 2>&1; then

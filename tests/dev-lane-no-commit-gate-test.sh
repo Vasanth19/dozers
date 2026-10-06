@@ -51,6 +51,20 @@
 #               byte-identical message: the legacy scheme stays excluded, so a pre-fix
 #               resumed branch is still scored "design is not a deliverable".
 #
+# GSAI-251 — the build pass had no commit backstop: uncommitted output counted as
+# output, and the merge shipped only the DOZER-*.md paperwork. Cases:
+#   UNCOMMITTED-BUILD  build edits a tracked file + adds src/, both UNCOMMITTED → the
+#               backstop commits them as wip(<id>) and the merge carries them. Pre-fix
+#               this is the exact bug: gates pass, merge is paperwork only.
+#   COMMIT-OR-FAIL     a pre-commit hook refuses the backstop commit → fails closed with
+#               the hook's own message; develop untouched, worktree kept.
+#   LEGACY-UNCOMMITTED an uncommitted legacy-named design is neither snapshotted nor
+#               counted → still the byte-identical no-commit failure.
+#   CRASH-RESCUE  build writes code then exits 1 without committing → the proof path
+#               commits it first and the work merges.
+#   REFINERY-GUARD a stray file dirtied AFTER the build (by review) → the refinery's
+#               pre-merge guard commits it, so it reaches develop.
+#
 # Run:  bash tests/dev-lane-no-commit-gate-test.sh   (exits non-zero on failure)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -105,6 +119,19 @@ case "$pass" in
   build)
     case "${BUILD_MODE:-work}" in
       nothing) : ;;                                     # the resume / first-noop pin
+      # GSAI-251: real source + a secret + a dependency dir, all UNCOMMITTED. The
+      # backstop must commit the source and nothing else.
+      dirty|dirty-crash)
+        # A TRACKED edit (feature.txt) is the real bug's fingerprint: `git diff` sees it,
+        # so the pre-fix gate passed on it and the merge shipped only paperwork. The new
+        # src/ file is untracked, which `git diff` never saw.
+        printf 'dirty build edit %s\n' "$n" >> feature.txt
+        mkdir -p src && printf 'export const feature = %s\n' "$n" > src/feature.ts
+        printf 'PROD_SECRET=do-not-commit\n' > .env.production
+        mkdir -p node_modules/pkg && printf 'module.exports = 1\n' > node_modules/pkg/index.js
+        [[ "${BUILD_MODE}" == dirty-crash ]] && exit 1   # wrote code, then died before committing
+        : ;;
+      legacy) printf '# legacy design\n' > DOZER-DESIGN.md ;;   # uncommitted, legacy name
       *) printf 'dozer change %s\n' "$n" >> feature.txt
          git add -A && git commit -q -m "build $n" ;;
     esac ;;
@@ -114,7 +141,11 @@ case "$pass" in
     else
       printf 'VERDICT: PASS\nall good\n' > "DOZER-REVIEW-$TASK_ID.md"
     fi
-    git add -A && git commit -q -m "review $n" || true ;;
+    # Commit ONLY the verdict, as the real review pass does. `git add -A` here would sweep
+    # any uncommitted build output into a review commit and hide the GSAI-251 bug.
+    # REVIEW_DIRTY=1 leaves a stray uncommitted file behind, for the refinery-guard case.
+    [[ "${REVIEW_DIRTY:-0}" == 1 ]] && printf 'left by review\n' > scratch-review.txt
+    git add "DOZER-REVIEW-$TASK_ID.md" && git commit -q -m "review $n" || true ;;
 esac
 exit 0
 EOS
@@ -257,6 +288,123 @@ git -C "$PD" cat-file -e "dozer/$ID_D:DOZER-DESIGN.md" 2>/dev/null \
   || no "LEGACY-EXCLUDED: stub never committed DOZER-DESIGN.md — the case proves nothing"
 [[ "$(dev_head "$PD")" == "init" ]] && ok "LEGACY-EXCLUDED: develop untouched" \
   || no "LEGACY-EXCLUDED: develop advanced to '$(dev_head "$PD")'"
+
+# ── UNCOMMITTED-BUILD (GSAI-251 headline): written-but-uncommitted code must ship ──
+# Before the fix the build's source sat uncommitted; branch_has_output scored the dirty
+# tree as output, the gates passed, and the merge shipped only the design + review
+# commits. The review stub commits ONLY its verdict now, so nothing else can sweep the
+# source into a commit by accident. The build also leaves a secret and a dependency dir.
+echo "── UNCOMMITTED-BUILD: uncommitted build output is committed by the backstop and merged"
+PE="$TMP/uncommitted-build"; mkproj "$PE"; ID_E="TEST-NG-E"
+
+LOG="$TMP/e.log"; rc=0
+run_crew "$PE" "$ID_E" "$LOG" COUNT_FILE="$TMP/e.count" BUILD_MODE=dirty REVIEW_MODE=pass || rc=$?
+[[ $rc -eq 0 ]] && ok "UNCOMMITTED-BUILD: the crew merges (exit 0)" \
+  || { no "UNCOMMITTED-BUILD: the crew exited $rc"; dump "$LOG"; }
+grep -qE "build pass left [0-9]+ uncommitted files; committed as wip\($ID_E\) before merge" "$LOG" \
+  && ok "UNCOMMITTED-BUILD: the spec's backstop log line is printed" \
+  || { no "UNCOMMITTED-BUILD: no 'build pass left N uncommitted files; committed as wip(…)' line"; dump "$LOG"; }
+git -C "$PE" show "develop:feature.txt" 2>/dev/null | grep -q "dirty build edit" \
+  && ok "UNCOMMITTED-BUILD: the build's tracked edit reached develop (not only DOZER-*.md paperwork)" \
+  || no "UNCOMMITTED-BUILD: feature.txt edit is NOT on develop — the merge shipped paperwork only"
+git -C "$PE" show "develop:src/feature.ts" 2>/dev/null | grep -q "export const feature" \
+  && ok "UNCOMMITTED-BUILD: the build's new source file reached develop" \
+  || no "UNCOMMITTED-BUILD: new src/feature.ts is NOT on develop"
+git -C "$PE" log develop --format=%s | grep -q "^wip($ID_E)" \
+  && ok "UNCOMMITTED-BUILD: the work landed as a wip($ID_E) commit" \
+  || no "UNCOMMITTED-BUILD: no wip($ID_E) commit on develop"
+git -C "$PE" ls-tree -r --name-only develop | grep -Eq '(^|/)(\.env[^/]*|node_modules)(/|$)' \
+  && no "UNCOMMITTED-BUILD: a .env* or node_modules path was committed" \
+  || ok "UNCOMMITTED-BUILD: .env.production and node_modules were NOT committed"
+
+# ── COMMIT-OR-FAIL: the backstop cannot commit → fail closed, never merge past it ──
+# A pre-commit hook refuses any commit that stages src/. The build's source cannot be
+# committed, so the crew must fail with the named reason and the hook's own message —
+# develop untouched, worktree kept, nothing discarded.
+echo "── COMMIT-OR-FAIL: a rejected backstop commit fails the crew with the git reason"
+PF="$TMP/commit-or-fail"; mkproj "$PF"; ID_F="TEST-NG-F"
+cat > "$PF/.git/hooks/pre-commit" <<'HOOK'
+#!/usr/bin/env bash
+if git diff --cached --name-only | grep -q '^src/'; then
+  echo "hook: src/ commits refused (test)" >&2; exit 1
+fi
+HOOK
+chmod +x "$PF/.git/hooks/pre-commit"
+
+LOG="$TMP/f.log"; rc=0
+run_crew "$PF" "$ID_F" "$LOG" COUNT_FILE="$TMP/f.count" BUILD_MODE=dirty REVIEW_MODE=pass || rc=$?
+[[ $rc -ne 0 ]] && ok "COMMIT-OR-FAIL: the crew fails (exit $rc)" \
+  || { no "COMMIT-OR-FAIL: the crew merged despite an uncommittable build"; dump "$LOG"; }
+r="$(reason "$ID_F")"
+[[ "$r" == *"could not be committed"* && "$r" == *"hook: src/ commits refused"* ]] \
+  && ok "COMMIT-OR-FAIL: the reason is named and carries the hook's own message" \
+  || { no "COMMIT-OR-FAIL: wrong reason: '$r'"; dump "$LOG"; }
+[[ "$(dev_head "$PF")" == "init" ]] && ok "COMMIT-OR-FAIL: develop untouched" \
+  || no "COMMIT-OR-FAIL: develop advanced to '$(dev_head "$PF")'"
+[[ -d "$WT_ROOT/$(basename "$PF")-$ID_F" ]] && ok "COMMIT-OR-FAIL: worktree kept" \
+  || no "COMMIT-OR-FAIL: worktree removed"
+git -C "$PF" cat-file -e "dozer/$ID_F:src/feature.ts" 2>/dev/null \
+  && no "COMMIT-OR-FAIL: src/feature.ts reached the branch despite the refused commit" \
+  || ok "COMMIT-OR-FAIL: nothing was committed behind the refusal"
+rm -f "$PF/.git/hooks/pre-commit"
+
+# ── LEGACY-UNCOMMITTED: a legacy-named file left UNcommitted is not output either ──
+# The backstop must not snapshot DOZER-DESIGN.md at the root (ARTIFACT_PATHSPEC), and a
+# paperwork-only branch must still fail the no-commit gate with the exact old message.
+echo "── LEGACY-UNCOMMITTED: an uncommitted legacy design is not snapshotted or counted"
+PG="$TMP/legacy-uncommitted"; mkproj "$PG"; ID_G="TEST-NG-G"
+
+LOG="$TMP/g.log"; rc=0
+run_crew "$PG" "$ID_G" "$LOG" COUNT_FILE="$TMP/g.count" BUILD_MODE=legacy || rc=$?
+[[ $rc -ne 0 ]] && ok "LEGACY-UNCOMMITTED: blocked (exit $rc)" \
+  || { no "LEGACY-UNCOMMITTED: an uncommitted legacy design PASSED the gate"; dump "$LOG"; }
+r="$(reason "$ID_G")"
+[[ "$r" == "build agent produced no commits on dozer/$ID_G" ]] \
+  && ok "LEGACY-UNCOMMITTED: blocked with the byte-identical no-commit message" \
+  || { no "LEGACY-UNCOMMITTED: wrong reason: '$r'"; dump "$LOG"; }
+grep -q "build pass left" "$LOG" \
+  && no "LEGACY-UNCOMMITTED: the backstop snapshotted a legacy-named file" \
+  || ok "LEGACY-UNCOMMITTED: the backstop did not snapshot the legacy file"
+[[ "$(git -C "$PG" log --format=%s "dozer/$ID_G" | grep -c '^wip(')" == 0 ]] \
+  && ok "LEGACY-UNCOMMITTED: no wip commit on the branch" \
+  || no "LEGACY-UNCOMMITTED: a wip commit was made for a legacy-only file"
+
+# ── CRASH-RESCUE: the build wrote code, then died before committing → rescued ────
+# The non-zero-exit proof path (changes:) must commit first, then judge. Without the
+# backstop there, branch_has_output (committed-only now) would fail a real deliverable.
+echo "── CRASH-RESCUE: uncommitted code from a crashed build is committed and merged"
+PH="$TMP/crash-rescue"; mkproj "$PH"; ID_H="TEST-NG-H"
+
+LOG="$TMP/h.log"; rc=0
+run_crew "$PH" "$ID_H" "$LOG" COUNT_FILE="$TMP/h.count" BUILD_MODE=dirty-crash REVIEW_MODE=pass || rc=$?
+[[ $rc -eq 0 ]] && ok "CRASH-RESCUE: the crashed build is rescued and the crew merges" \
+  || { no "CRASH-RESCUE: the crew exited $rc — the crash discarded real work"; dump "$LOG"; }
+grep -qE "build agent exited 1 but dozer/$ID_H holds changes past" "$LOG" \
+  && ok "CRASH-RESCUE: the rescue is logged loudly" \
+  || { no "CRASH-RESCUE: no rescue line"; dump "$LOG"; }
+grep -qE "build pass left [0-9]+ uncommitted files; committed as wip\($ID_H\)" "$LOG" \
+  && ok "CRASH-RESCUE: the uncommitted code was committed before the judgment" \
+  || no "CRASH-RESCUE: no backstop commit line"
+git -C "$PH" show "develop:src/feature.ts" 2>/dev/null | grep -q "export const feature" \
+  && ok "CRASH-RESCUE: the crashed build's source reached develop" \
+  || no "CRASH-RESCUE: the crashed build's source is NOT on develop"
+
+# ── REFINERY-GUARD: a tree dirtied AFTER the build still cannot ship uncommitted ──
+# The review pass leaves a stray file behind, after the build backstop has already run.
+# Only the refinery's pre-merge guard can catch it: it must commit it or fail closed.
+echo "── REFINERY-GUARD: output dirtied after the build is committed before the merge"
+PI="$TMP/refinery-guard"; mkproj "$PI"; ID_I="TEST-NG-I"
+
+LOG="$TMP/i.log"; rc=0
+run_crew "$PI" "$ID_I" "$LOG" COUNT_FILE="$TMP/i.count" BUILD_MODE=work REVIEW_MODE=pass REVIEW_DIRTY=1 || rc=$?
+[[ $rc -eq 0 ]] && ok "REFINERY-GUARD: the crew merges (exit 0)" \
+  || { no "REFINERY-GUARD: the crew exited $rc"; dump "$LOG"; }
+grep -qE "build pass left [0-9]+ uncommitted files; committed as wip\($ID_I\)" "$LOG" \
+  && ok "REFINERY-GUARD: the refinery guard commits the stray file (same log line)" \
+  || { no "REFINERY-GUARD: no backstop line for the post-build dirt"; dump "$LOG"; }
+git -C "$PI" show "develop:scratch-review.txt" 2>/dev/null | grep -q "left by review" \
+  && ok "REFINERY-GUARD: the stray file reached develop" \
+  || no "REFINERY-GUARD: the stray file did NOT reach develop"
 
 if [[ $fail == 0 ]]; then echo "dev-lane-no-commit-gate-test: PASS"
 else echo "dev-lane-no-commit-gate-test: FAIL" >&2; exit 1; fi
