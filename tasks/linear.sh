@@ -66,7 +66,10 @@ LINEAR_WRITE_BACKOFF_S="${LINEAR_WRITE_BACKOFF_S:-5}"
 _linear_write_retry() {  # <verb> <id> — bounded retry around `python3 _LIN <verb> <id>`
   local verb="$1" id="$2" attempt=1 rc=0
   while true; do
-    if python3 "$_LIN" "$verb" "$id"; then return 0; fi
+    # `&& return 0` then `rc=$?`, NOT `if …; then return 0; fi; rc=$?`: when the `if`'s
+    # condition fails and no branch runs, the `if` itself exits 0 — that would make the
+    # final attempt's failure return 0 to the caller, i.e. report a dead write as success.
+    python3 "$_LIN" "$verb" "$id" && return 0
     rc=$?
     if (( attempt >= LINEAR_WRITE_RETRIES )); then return "$rc"; fi
     echo "  ! linear $verb $id failed (attempt $attempt/$LINEAR_WRITE_RETRIES, rc=$rc) - retrying in ${LINEAR_WRITE_BACKOFF_S}s" >&2

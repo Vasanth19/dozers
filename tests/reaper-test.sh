@@ -28,8 +28,8 @@ LIVEPID=""
 cleanup() {
   [[ -n "$LIVEPID" ]] && kill "$LIVEPID" 2>/dev/null || true
   rm -f "$BOARD"/wip/RTEST-*.md "$BOARD"/ready/RTEST-*.md "$BOARD"/done/RTEST-*.md "$BOARD"/blocked/RTEST-*.md 2>/dev/null || true
-  rm -f "$ARTDIR"/RTEST-*.merge "$ARTDIR"/RTEST-*.linear-write-failed 2>/dev/null || true
-  rm -rf "$TMPLOCK" 2>/dev/null || true
+  rm -f "$ARTDIR"/RTEST-*.merge "$ARTDIR"/RTEST-*.linear-write-failed "$ARTDIR"/RTEST-*.legacy-proof-noted 2>/dev/null || true
+  rm -rf "$TMPLOCK" "${GITREPO:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -49,10 +49,37 @@ mkfile RTEST-CRASH  "crashed task"  dev
 mkfile RTEST-ORPHAN "lockless task" marketing
 mkfile RTEST-LIVE   "healthy task"  dev
 # GSAI-213: an orphan whose work is ALREADY DONE — a leftover merge receipt (the
-# bare/legacy case, no write-failure marker at all) must retry task_merged instead
-# of requeuing the whole crew.
+# bare case, no write-failure marker at all) must retry task_merged instead of
+# requeuing the whole crew. The reaper re-proves it against git first, so the merge is
+# a REAL one in a throwaway repo: a task branch --no-ff merged into develop.
+GITREPO="$(mktemp -d)"
+git -C "$GITREPO" init -q -b develop
+gitc() { git -C "$GITREPO" -c user.email=test@test -c user.name=test "$@"; }
+echo base > "$GITREPO/base.txt"; gitc add base.txt; gitc commit -q -m base
+BASE_SHA="$(gitc rev-parse HEAD)"
+gitc checkout -q -b dozer/RTEST-PROOF
+echo feature > "$GITREPO/feature.txt"; gitc add feature.txt; gitc commit -q -m "RTEST-PROOF: feature"
+TASK_SHA="$(gitc rev-parse HEAD)"
+gitc checkout -q develop
+gitc merge -q --no-ff -m "merge dozer/RTEST-PROOF" dozer/RTEST-PROOF
+MERGE_SHA="$(gitc rev-parse HEAD)"
+# A receipt in the current format: branch, merge sha, premerge sha, task sha, and the
+# workdir the merge landed in (written by dev-lane/crew.sh since GSAI-213).
+receipt_for() {  # <id> <merge_sha> [workdir]
+  printf 'branch=develop\nmerge_sha=%s\npremerge_sha=%s\ntask_sha=%s\ndesign_only=0\n' "$2" "$BASE_SHA" "$TASK_SHA" > "$ARTDIR/$1.merge"
+  [[ -n "${3:-}" ]] && printf 'workdir=%s\n' "$3" >> "$ARTDIR/$1.merge"
+  return 0
+}
 mkfile RTEST-PROOF  "finished but unlabeled" dev
-echo 'merge_sha=deadbeef' > "$ARTDIR/RTEST-PROOF.merge"
+receipt_for RTEST-PROOF "$MERGE_SHA" "$GITREPO"
+# A receipt with NO workdir= is a legacy receipt: it can't be re-verified, so the
+# reaper must HOLD it in-progress — never requeue it, never retry it.
+mkfile RTEST-LEGACY "legacy receipt" dev
+receipt_for RTEST-LEGACY "$MERGE_SHA"
+# A receipt whose merge sha is not in the repo fails verify-merge: the merge did not
+# land, so the ordinary requeue is correct.
+mkfile RTEST-VFAIL  "receipt names a merge that never landed" dev
+receipt_for RTEST-VFAIL "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "$GITREPO"
 # GSAI-213: an orphan carrying a write-failure marker that NAMES the verb that
 # failed (task_block, here — the write that failed was a block, not a merge) must
 # retry exactly that verb, not default to merged.
@@ -100,6 +127,17 @@ fail=0; ok() { echo "  ✓ $1"; }; no() { echo "  ✗ $1" >&2; fail=1; }
   || no "RTEST-PROOF was not retried via its merge receipt: $(ls "$BOARD"/*/RTEST-PROOF.md 2>/dev/null || echo missing)"
 [[ ! -f "$BOARD/ready/RTEST-PROOF.md" ]] && ok "proof-of-completion task was NOT requeued (crew not re-run)" \
   || no "RTEST-PROOF was requeued despite a local merge receipt — the crew will re-run on finished work"
+# GSAI-213: a legacy receipt (no workdir=) cannot be verified, so it is HELD — not
+# retried, and not requeued. Requeueing it is the BRD-96 failure.
+[[ -f "$BOARD/wip/RTEST-LEGACY.md" && ! -f "$BOARD/ready/RTEST-LEGACY.md" && ! -f "$BOARD/done/RTEST-LEGACY.md" ]] \
+  && ok "legacy receipt (no workdir=) held in-progress: not requeued, not retried" \
+  || no "RTEST-LEGACY was not held in-progress: $(ls "$BOARD"/*/RTEST-LEGACY.md 2>/dev/null || echo missing)"
+[[ "$OUT" == *"RTEST-LEGACY held in-progress"* ]] && ok "legacy hold is logged with its reason" \
+  || no "legacy hold not logged: $OUT"
+# GSAI-213: a receipt whose merge did not land fails verify-merge, so it falls through
+# to the ordinary requeue.
+[[ -f "$BOARD/ready/RTEST-VFAIL.md" ]] && ok "receipt that fails verify-merge was requeued (the merge never landed)" \
+  || no "RTEST-VFAIL was not requeued: $(ls "$BOARD"/*/RTEST-VFAIL.md 2>/dev/null || echo missing)"
 # GSAI-213: a write-failure marker naming task_block must retry THAT verb, not
 # default to merged — it lands in blocked/, not done/ and not ready/.
 [[ -f "$BOARD/blocked/RTEST-WFAIL.md" ]] && ok "write-failure marker's recorded verb (task_block) was retried, not merged/requeued" \

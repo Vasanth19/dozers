@@ -489,18 +489,28 @@ resolve_workdir() {
 #     releasing the lock normally. The git work is already done and (dev) verified;
 #     dozers/reaper.sh's reconciliation pre-step finds this marker and retries just the
 #     write next sweep, instead of blindly requeueing the whole crew.
-_terminal_write() {  # <id> <verb-fn> <verb-label> <art-dir> [extra-context]
-  local id="$1" fn="$2" label="$3" art="$4" extra="${5:-}" rc=0 errf
+#
+# GSAI-213 (reaper proof): the marker also records `workdir=` (the checkout the work landed
+# in, so the reaper can re-verify it against git) and `merge_sha=` (copied from the dev
+# receipt when there is one). Both are optional; the reaper treats a marker without a
+# workdir as unprovable and does not requeue on it.
+_terminal_write() {  # <id> <verb-fn> <verb-label> <art-dir> [extra-context] [workdir]
+  local id="$1" fn="$2" label="$3" art="$4" extra="${5:-}" wd="${6:-}" rc=0 errf msha=""
   errf="$(mktemp "${TMPDIR:-/tmp}/dozer-write.XXXXXX" 2>/dev/null)" || errf="/tmp/dozer-write.$BASHPID"
-  if "$fn" "$id" 2>"$errf"; then rm -f "$errf" 2>/dev/null || true; return 0; fi
+  # `&& return 0` then `rc=$?`, not `if …; fi; rc=$?`: an `if` whose condition fails exits 0,
+  # so the rc would read 0 and a failed write would be reported to the caller as success.
+  "$fn" "$id" 2>"$errf" && { rm -f "$errf" 2>/dev/null || true; return 0; }
   rc=$?
   local marker="$art/$id.linear-write-failed"
   mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+  msha="$(grep -E '^merge_sha=' "$art/$id.merge" 2>/dev/null | head -1 | cut -d= -f2- || true)"
   {
     printf 'verb=%s\n' "$fn"
     printf 'label=%s\n' "$label"
     printf 'ts=%s\n' "$(date -u +%FT%TZ 2>/dev/null || date)"
     printf 'rc=%s\n' "$rc"
+    [[ -n "$wd" ]] && printf 'workdir=%s\n' "$wd"
+    [[ -n "$msha" ]] && printf 'merge_sha=%s\n' "$msha"
     [[ -n "$extra" ]] && printf 'verify_proof=%s\n' "$extra"
     echo "--- stderr ---"
     cat "$errf" 2>/dev/null
@@ -586,7 +596,7 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
     # GSAI-252: the reason is posted BEFORE the block, so a block that reaches the release
     # cap raises its board-ask WITH this reason in it (block() reads the comments).
     task_comment "$id" "$(printf 'Dozer blocked BEFORE any work - could not resolve a working directory, so no crew ran, no worktree was created and no branch was cut.\n  repo hint: %s\n  team: %s\nReason: %s' "${hint:-<none>}" "${team:-<none>}" "$wd_err")"
-    task_block "$id" || echo "  ! #$id could not be blocked — left in-progress for the reaper (reason above)" >&2
+    _terminal_write "$id" task_block "blocked" "$art" || echo "  ! #$id could not be blocked — write-failure marker left for the reaper (reason above)" >&2
     echo "  x #$id unroutable: $wd_err  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=0" >&2
     return 0
   fi
@@ -609,7 +619,9 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
   # file (an older crew, or a lane that added none of this) logs requests= empty; see
   # run_log_requests below.
   local requests_file="$art/$id.requests"
-  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" "$meta_file" "$requests_file" 2>/dev/null || true
+  # GSAI-213: a write-failure marker from a previous run is stale for the same reason.
+  rm -f "$summary_file" "$fail_file" "$handoff_file" "$merge_file" "$meta_file" "$requests_file" \
+    "$art/$id.linear-write-failed" 2>/dev/null || true
 
   # The brief (GSAI-7): the task's description, handed to the crew as a FILE so a lane
   # can route on what the Director wrote — the marketing lane treats a `production:`
@@ -639,7 +651,7 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
      DOZER_LANE="$lane" DOZER_CREW_META="$meta_file" "$crew" "$id" "$title"; then
     local verb VERIFY_PROOF=""
     if [[ "$lane" == "marketing" ]]; then
-      _terminal_write "$id" task_review "staged for review" "$art" || return 0
+      _terminal_write "$id" task_review "staged for review" "$art" "" "$workdir" || return 0
       verb="staged for review"
     elif [[ "$lane" == "dev" ]]; then
       # GSAI-119: label on PROOF, not the exit code. Crew success and merge success are
@@ -655,12 +667,12 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
       vout="$(REPO_ROOT="$ROOT" "$ROOT/dozers/verify-merge.sh" "$id" "$workdir" 2>&1)" || vrc=$?
       if (( vrc != 0 )); then
         task_comment "$id" "$(printf 'Dozer blocked AFTER the crew reported success — the claimed merge could NOT be verified against %s, so the issue is NOT labeled dozer:merged-develop (GSAI-119).\n\nReason: %s' "$workdir" "$vout")"
-        task_block "$id" || echo "  ! #$id could not be blocked — left in-progress for the reaper (reason above)" >&2
+        _terminal_write "$id" task_block "blocked" "$art" "" "$workdir" || echo "  ! #$id could not be blocked — write-failure marker left for the reaper (reason above)" >&2
         echo "  x #$id crew succeeded but the merge did not verify — blocked: ${vout%%$'\n'*}  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
         return 0
       fi
       echo "    verify-merge: $vout"
-      _terminal_write "$id" task_merged "merged to develop" "$art" "$vout" || return 0
+      _terminal_write "$id" task_merged "merged to develop" "$art" "$vout" "$workdir" || return 0
       verb="merged to develop"
       # The proof rides the merged comment — "merged to develop" without it is the
       # exact claim that could not be trusted before.
@@ -681,7 +693,7 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
     if [[ -s "$fail_file" ]]; then reason="$(head -c 2000 "$fail_file")"
     else reason="crew exited without recording a reason — see the Dozer loop log (~/.dozers/logs/loop.err.log)"; fi
     task_comment "$id" "$(printf 'Dozer blocked in lane:%s - needs a look.\nReason: %s' "$lane" "$reason")"
-    task_block "$id" || echo "  ! #$id could not be blocked — left in-progress for the reaper (reason above)" >&2
+    _terminal_write "$id" task_block "blocked" "$art" "" "$workdir" || echo "  ! #$id could not be blocked — write-failure marker left for the reaper (reason above)" >&2
     echo "  x #$id failed: $reason  $(run_log_fields "$rl_team" "$rl_milestone" "$rl_project" "$rl_profile") duration_s=$(( SECONDS - rl_t0 )) requests=$(run_log_requests "$requests_file")" >&2
   fi
 }

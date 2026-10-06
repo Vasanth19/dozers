@@ -33,6 +33,9 @@ def run(name, verb, success):
     calls = {"n": 0}
     def fake_gql(q, v=None):
         calls["n"] += 1
+        # GSAI-252: block() reads the issue's comments for the release-budget gate first.
+        if "comments(" in q:
+            return {"issue": {"comments": {"nodes": []}}}
         return {"issueUpdate": {"success": success}}
     lin.gql = fake_gql
     outcome = "returned"
