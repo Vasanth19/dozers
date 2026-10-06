@@ -42,13 +42,53 @@ task_milestone()     { python3 "$_LIN" milestone "$1"; }   # KR name (Milestone)
 task_project()       { python3 "$_LIN" project "$1"; }     # Objective name (Project), or empty (GSAI-173)
 task_description()   { python3 "$_LIN" description "$1"; }   # the issue body — the brief (GSAI-7)
 task_crew_meta()     { python3 "$_LIN" crew-meta "$1"; }  # project + labels, for the crew-profile pick (GSAI-170)
-task_review()        { python3 "$_LIN" review "$1"; }   # mktg: stage for human approval (dozer:needs-review)
-task_merged()        { python3 "$_LIN" merged "$1"; }   # dev: merged to develop (dozer:merged-develop)
-task_block()         { python3 "$_LIN" block "$1"; }    # failure off-ramp (dozer:blocked)
+
+# GSAI-213: bounded retry around the TERMINAL writes only — merged()/review()/block()
+# run after a crew's real, expensive, (for dev) git-verified work. A transient blip on
+# the one write that matters most used to either strand the issue at dozer:in-progress
+# (set_labels_and_state's success check now closes the quiet-rejection half) or trip
+# `set -e` and vanish the run with no retry at all (dozer.sh's _terminal_write closes
+# the loud-exception half). This loop is the highest-leverage fix for the common case:
+# a network blip right after a merge usually just needs attempt 2.
+#
+# task_claim/task_requeue are DELIBERATELY not wrapped: claim() is cheap and safe to
+# fail outright (nothing expensive has happened yet), and wrapping requeue would make
+# the reaper's own repair path retry-inside-a-retry.
+if [[ -z "${LINEAR_WRITE_RETRIES:-}" ]]; then
+  LINEAR_WRITE_RETRIES="$(grep -E '^[[:space:]]*linear_write_retries:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*linear_write_retries:[[:space:]]*//; s/#.*//; s/[[:space:]]//g')"
+fi
+LINEAR_WRITE_RETRIES="${LINEAR_WRITE_RETRIES:-3}"
+if [[ -z "${LINEAR_WRITE_BACKOFF_S:-}" ]]; then
+  LINEAR_WRITE_BACKOFF_S="$(grep -E '^[[:space:]]*linear_write_backoff_s:' "$ROOT/org/config.yaml" 2>/dev/null | head -1 | sed 's/.*linear_write_backoff_s:[[:space:]]*//; s/#.*//; s/[[:space:]]//g')"
+fi
+LINEAR_WRITE_BACKOFF_S="${LINEAR_WRITE_BACKOFF_S:-5}"
+
+_linear_write_retry() {  # <verb> <id> — bounded retry around `python3 _LIN <verb> <id>`
+  local verb="$1" id="$2" attempt=1 rc=0
+  while true; do
+    # `&& return 0` then `rc=$?`, NOT `if …; then return 0; fi; rc=$?`: when the `if`'s
+    # condition fails and no branch runs, the `if` itself exits 0 — that would make the
+    # final attempt's failure return 0 to the caller, i.e. report a dead write as success.
+    python3 "$_LIN" "$verb" "$id" && return 0
+    rc=$?
+    if (( attempt >= LINEAR_WRITE_RETRIES )); then return "$rc"; fi
+    echo "  ! linear $verb $id failed (attempt $attempt/$LINEAR_WRITE_RETRIES, rc=$rc) - retrying in ${LINEAR_WRITE_BACKOFF_S}s" >&2
+    sleep "$LINEAR_WRITE_BACKOFF_S"
+    attempt=$((attempt+1))
+  done
+}
+
+task_review()        { _linear_write_retry review "$1"; }   # mktg: stage for human approval (dozer:needs-review)
+task_merged()        { _linear_write_retry merged "$1"; }   # dev: merged to develop (dozer:merged-develop)
+task_block()         { _linear_write_retry block "$1"; }    # failure off-ramp (dozer:blocked)
 
 # recovery verbs (used by dozers/reaper.sh)
 task_list_inflight() { python3 "$_LIN" list-inflight; }  # claimed (started), not needs-review/done
 task_requeue()       { python3 "$_LIN" requeue "$1"; }   # re-add ready + back to unstarted
+
+# stranded-finish repair (GSAI-213, used by dozers/reaper.sh's pre-step)
+task_list_stale_offramp() { python3 "$_LIN" list-stale-offramp; }  # in-progress + an off-ramp label together
+task_finish_repair()      { python3 "$_LIN" finish-repair "$1"; }  # strip the stale dozer:in-progress only
 
 # audit verbs (used by dozers/audit-merged.sh, GSAI-119)
 task_list_merged_dev() { python3 "$_LIN" list-merged-dev; }  # every issue on dozer:merged-develop

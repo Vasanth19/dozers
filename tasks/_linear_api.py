@@ -189,11 +189,23 @@ _COLOR = {READY: "#16a05a", INPROG: "#fbca04", NEEDSREVIEW: "#d876e3",
 
 
 def set_labels_and_state(iss, label_ids, state_id_=None):
+    # GSAI-213: gql() only raises on a transport exception or a GraphQL `errors` array —
+    # an HTTP-200 `{"issueUpdate":{"success": false}}` (a transient backend rejection, an
+    # optimistic-lock conflict) used to pass through silently, so merged()/review()/
+    # block() all reported success to their bash caller while the issue's labels never
+    # changed. A "quiet" Linear-side rejection must surface exactly like a network
+    # exception does — same die(), same fail-fast contract as every other call in this
+    # file. Every _relabel() caller (claim/merged/review/block/requeue/done/mark_ready/
+    # finish_repair/...) routes through this one choke point, so the check is free for
+    # all of them.
     inp = {"labelIds": label_ids}
     if state_id_:
         inp["stateId"] = state_id_
-    gql('mutation($id:String!,$in:IssueUpdateInput!){ issueUpdate(id:$id,input:$in){ success } }',
-        {"id": iss["id"], "in": inp})
+    d = gql('mutation($id:String!,$in:IssueUpdateInput!){ issueUpdate(id:$id,input:$in){ success } }',
+            {"id": iss["id"], "in": inp})
+    if not d["issueUpdate"]["success"]:
+        die(f"issueUpdate reported success:false for {iss.get('identifier', iss.get('id'))} "
+            f"— the Linear write did not apply (labelIds={label_ids}, stateId={state_id_})")
 
 
 def _relabel(iss, add=(), remove=(), state_type=None):
@@ -776,6 +788,34 @@ def audit_strip(identifier):
     PROMOTE row. Drops the label, never touches state."""
     _relabel(issue(identifier), remove=[MERGEDDEV])
     print(f"{identifier} -> {MERGEDDEV} stripped (closed-issue hygiene)")
+
+
+# --- GSAI-213: repair a finished issue stranded at dozer:in-progress --------------
+# set_labels_and_state()'s success check (above) closes the gap for every FUTURE
+# write, but an issue that already landed an off-ramp label (merged-develop /
+# needs-review / blocked) alongside a lingering dozer:in-progress — the exact
+# MERGED-2 shape tests/linear-inflight-test.sh already asserts the reaper must never
+# requeue (GSAI-119: the work is finished; requeueing would re-run a done crew) — has
+# no label-write path left in this engine that strips the stale label. This verb is
+# that path: label hygiene ONLY, same "never touch state" contract as audit_strip().
+def finish_repair(identifier):
+    iss = issue(identifier)
+    labels = iss["labels"]["nodes"]
+    if not _has(labels, INPROG):
+        print(f"{identifier}: no stale {INPROG} label — nothing to repair")
+        return
+    _relabel(iss, remove=[INPROG])
+    print(f"{identifier} -> {INPROG} stripped (stale off-ramp repair, GSAI-213)")
+
+
+def list_stale_offramp():
+    """Every issue carrying dozer:in-progress together with an off-ramp label — the
+    reaper's pre-step reads this instead of blindly requeueing (which would re-run a
+    crew whose work is already finished and labeled)."""
+    for i in _all_issues():
+        labels = i["labels"]["nodes"]
+        if _has(labels, INPROG) and any(_has(labels, off) for off in (NEEDSREVIEW, MERGEDDEV, BLOCKED)):
+            print(f'{i["identifier"]}\t{_lane_of(labels)}\t{i["title"]}')
 
 
 def requeue(identifier):
@@ -1492,6 +1532,8 @@ OPS = {
     "list-merged-dev": lambda a: list_merged_dev(),
     "audit-requeue": lambda a: audit_requeue(a[0]),
     "audit-strip": lambda a: audit_strip(a[0]),
+    "finish-repair": lambda a: finish_repair(a[0]),          # GSAI-213: strip stale dozer:in-progress
+    "list-stale-offramp": lambda a: list_stale_offramp(),     # GSAI-213: the reaper's pre-step input
     "alarm-probe": lambda a: alarm_probe(a[0]),
     "alarm-raise": lambda a: alarm_raise(a[0], a[1]),
     "alarm-clear": lambda a: alarm_clear(a[0], a[1]),

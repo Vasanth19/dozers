@@ -1,178 +1,186 @@
 # DOZER-DESIGN-GSAI-213
 
+Architect pass, 2026-10-06. Supersedes the pass-1 design (same file, `b3e1c78`). Written against
+`develop` at `aa0723f` (GSAI-252 merged). The pass-2 crew output is preserved at
+`rescue/GSAI-213-wip-2026-10-06` (`0784ed8`); this design reuses most of it and corrects three things.
+
 ## Task
-A finished issue can be stranded at `dozer:in-progress` when the Linear write fails.
+A finished issue can be stranded at `dozer:in-progress` when the Linear write fails. BRD-96 (2026-09-28)
+merged and went green, then the terminal Linear write hit a read timeout and a 503. The issue stayed
+`dozer:in-progress`, and the reaper later requeued it, which spent a release on already-merged work.
 
-## Root cause (two distinct gaps, same symptom)
+## What the code does today (verified on `aa0723f`)
 
-**1. `gql()` doesn't verify the mutation actually applied.**
-`tasks/_linear_api.py:47-59` — `gql()` only raises on a transport exception or a
-GraphQL-level `errors` array. It never inspects the mutation's own `success` field.
-`set_labels_and_state()` (`_linear_api.py:191-196`) fires
-`issueUpdate(id:$id,input:$in){ success }` and discards the returned `success` value
-entirely. If Linear answers HTTP 200 with `{"issueUpdate":{"success": false}}` (a
-transient backend rejection, a stale/conflicting revision, whatever), `gql()` returns
-normally, `_relabel()` returns normally, and `merged()`/`review()`/`block()` all report
-success to their bash caller — even though the issue's labels never changed. In
-`dozers/dozer.sh:545/550` (`task_merged "$id"; verb="merged to develop"`), the engine
-then posts a "Dozer merged to develop" comment and logs `ok #$id merged to develop`
-while Linear still shows `dozer:in-progress`, state `started`, no off-ramp label. There
-is no second look — the issue is stranded, and the comment trail actively hides it
-("the task looks finished, why is it still in Running?").
+**1. A quiet Linear rejection counts as success.** `set_labels_and_state()` (`tasks/_linear_api.py:191-196`)
+sends `issueUpdate{ success }` and drops the value. HTTP 200 with `success:false` returns normally, so
+`merged()`/`review()`/`block()` report success while the labels never changed.
 
-**2. A write that genuinely throws is handled by `set -e`, not by a plan.**
-`dozers/dozer.sh` runs under `set -euo pipefail`. `run_one()` (the same function) calls
-`task_merged "$id"` / `task_review "$id"` / `task_block "$id"` as bare statements
-(dozer.sh:525, 545, 550, 557, 563) with no `if`/`||` around them. When the underlying
-`python3 _linear_api.py merged <id>` call genuinely fails (network blip, 30s timeout,
-GraphQL error — `_linear_api.py:54-59`), that nonzero return trips `set -e` and
-`run_one()` (running in the background per task, `dozers/dozer.sh:621`) exits
-immediately via its `EXIT` trap, which only removes the local lock
-(`dozers/dozer.sh:406`). Nothing retries the write, nothing records that the crew
-already did the (expensive, verified) work, and no comment is posted — the run just
-vanishes from the log.
-What happens next depends entirely on `dozers/reaper.sh`'s `_is_inflight()`
-(`_linear_api.py:690-708`), which is intentionally strict: an issue that already
-carries an off-ramp label (`dozer:merged-develop` / `dozer:needs-review` /
-`dozer:blocked`) is treated as finished, full stop — `tests/linear-inflight-test.sh`'s
-`MERGED-2` fixture (`dozer:in-progress` **and** `dozer:merged-develop` together) is
-already asserted to be excluded from reaping, on purpose (GSAI-119 history: the reaper
-must never re-run already-merged work). That is the correct call for *not re-running
-the crew*, but nothing today ever goes back and strips the lingering
-`dozer:in-progress` label in that state, so the issue sits in the `Running` Linear view
-forever even though it is done. And if the write failure left *no* off-ramp label at
-all (case 1's `success:false`, or a genuine exception before any label changed), the
-issue *is* still `_is_inflight()`-true — but the crew already completed real work
-(a verified git merge, per `dozers/verify-merge.sh` and its `.artifacts/dev/<id>.merge`
-receipt), so blindly `task_requeue`-ing it means the ENTIRE crew (architect → build →
-test → merge) reruns on a task that is already merged: wasted spend at best, a bogus
-second merge attempt or a false `dozer:blocked` (verify-merge finds no *new* commit) at
-worst.
+**2. A loud failure kills the run silently.** `gql()` (`_linear_api.py:47-59`) calls `die()`, which is
+`sys.exit(1)`, on a timeout, a 503 or a GraphQL error. Nothing retries it. `run_one()` in `dozers/dozer.sh`
+calls `task_merged` / `task_review` as bare statements under `set -euo pipefail`. The backgrounded run exits
+on the first failed write. There is no `ok` line, no comment and no marker. Only the EXIT trap runs. This
+matches the BRD-96 log: `done #BRD-96` and `verify-merge: ok` appear, then the Linear errors, and no `ok` line.
 
-Net: the failure mode isn't one bug, it's a missing verify-and-repair step for the one
-write that matters most — the terminal state transition after real work has already
-happened.
+**3. The reaper cannot tell finished work from a crash.** `reaper.sh` §1 requeues every `_is_inflight()`
+issue with no live lock (`_linear_api.py:720`). An issue stranded at `started` + `dozer:in-progress` with no
+off-ramp label matches that, so a finished merge gets requeued and the whole crew reruns. Its git receipt is
+never consulted. The crew writes that receipt at `.artifacts/dev/<id>.merge` (`dev-lane/crew.sh:1376`) with
+`branch=`, `merge_sha=`, `premerge_sha=`, `task_sha=`, and no workdir.
+
+**4. The "unbound variable" defect is NOT reproduced.** The BRD-96 log shows `lock: unbound variable`.
+I ran the real code under `set -euo pipefail` with two fixtures, an empty `LOCK_DIR` and a lock dir holding
+only a `pid` file. `group_live_counts`, `inflight_count` and `repo_live_counts` (`dozers/dozer.sh`) all return
+cleanly in both cases. A real `dozers/reaper.sh --dry-run` also exits cleanly on both fixtures (no
+`LINEAR_API_KEY`, so the Linear list was not exercised). The `lock` reads are all inside loop bodies, and
+`group_live_counts`/`repo_live_counts` were added later (GSAI-112, GSAI-169). The line is probably from an
+older engine, but I did not bisect that. Per the spec's "confirm which before fixing", this design does not
+invent a fix for it. See Approach §5.
+
+## Verified against the rescue commit
+- `git merge-tree --write-tree --merge-base 0784ed8~1 HEAD 0784ed8` (read-only dry run of cherry-picking the
+  rescue onto `develop`): **one conflict, `dozers/reaper.sh`**. The other seven files auto-merge.
+- The auto-merged `tasks/_linear_api.py` keeps `import ... time` in the merged tree. GSAI-252's budget lock
+  still calls `time.monotonic()` and `time.time()`, so the merge does not break it.
+- The rescue's reaper trusts `.merge` alone. It never checks that `merge_sha` is on the integration branch.
+  That is the GSAI-119 failure this task must not repeat.
 
 ## Approach
 
-### 1. Make the Linear write self-verifying (`tasks/_linear_api.py`)
-- `set_labels_and_state()`: capture the mutation's return value and `die()` if
-  `success` is falsy — a "quiet" Linear-side rejection must surface exactly like a
-  network exception does today. This alone closes gap #1: `task_merged` can no longer
-  return 0 unless Linear actually shows the new label.
-- Add a cheap read-after-write assertion in `merged()`/`review()`/`block()`: after
-  `_relabel()` returns, use the label set `_relabel` computed (not a fresh fetch — no
-  extra round trip needed for the common case) to confirm the target label is in
-  `keep`. This is defense-in-depth for the case where `success:true` is returned but
-  the field-level change didn't apply (seen with optimistic-lock races on other Linear
-  objects) — same "label on PROOF, not the API's optimism" principle already used for
-  merges (GSAI-119).
+### 1. Self-verifying Linear write (`tasks/_linear_api.py`) — keep from rescue
+`set_labels_and_state()` checks `d["issueUpdate"]["success"]` and calls `die()` when it is falsy. Every
+`_relabel()` caller goes through it, so claim, merged, review, block, requeue, done, mark_ready and finish_repair
+all get the check. No read-back round trip: Linear's `success:true` is trusted, and the quiet-rejection case is
+what the check exists to catch.
 
-### 2. Bounded retry around the terminal write only (`tasks/linear.sh` / `dozer.sh`)
-Add `task_merged`/`task_review`/`task_block` retry INSIDE the adapter (not the crew):
-wrap the existing `python3 "$_LIN" <verb> "$id"` call in a small retry loop (3
-attempts, short backoff — mirrors the `timeout_*` convention already in
-`org/config.yaml`, so add `linear_write_retries: 3` / `linear_write_backoff_s: 5`
-there). This is the highest-leverage fix for the common case (a transient network
-blip right after a real merge) — most "stranded" issues never even reach the harder
-reconciliation path below if the write just succeeds on attempt 2.
-`dozer.sh` itself does not need new retry logic; it keeps calling `task_merged` once
-and the adapter absorbs the retry.
+### 2. Bounded retry for the terminal writes only (`tasks/linear.sh`) — keep from rescue
+`task_merged` / `task_review` / `task_block` call `_linear_write_retry`: 3 attempts total, 5 s apart, read from
+`org/config.yaml` (`linear_write_retries`, `linear_write_backoff_s`). `task_claim` and `task_requeue` are not
+wrapped. Retry is safe on the terminal writes:
+- `merged()`/`review()` are set-label calls, so a second attempt after a timed-out write that actually landed
+  is a no-op.
+- `block()` goes through `ensure_budget_ask`, which is idempotent by ask marker.
 
-### 3. Explicit handling in `run_one()` for a write that still fails after retries
-Replace the bare `task_merged "$id"; verb=...` / `task_review "$id"; verb=...` /
-`task_block "$id"` statements (dozer.sh:525, 545, 550, 557, 563) with an explicit
-check. On failure of the *terminal* write (crew already succeeded, merge already
-verified):
-- Do **not** let `set -e` silently kill the run — catch the nonzero return.
-- Write a durable local marker next to the existing merge receipt:
-  `$art/$id.linear-write-failed` containing the verb attempted, the verify-merge
-  proof, and the adapter's stderr. This is the same artifact-first discipline the
-  engine already uses for `.merge`/`.fail`/`.handoff`.
-- Log loudly to `~/.dozers/logs/loop.err.log` with the id, verb, and reason (fail-fast:
-  report the exact error, never a silent drop).
-- Still release the lock normally (nothing to gain by holding it — the git work is
-  already safely merged and won't be redone by a Linear-side requeue as long as step 4
-  is in place).
+### 3. Record a failed terminal write with its proof (`dozers/dozer.sh`, `run_one`)
+Replace the bare `task_merged` / `task_review` calls with a `_terminal_write` helper (rescue version), called as
+`_terminal_write <id> <verb-fn> <label> "$art" "$vout"` followed by `|| return 0`. The new behaviour, versus the
+rescue, is this: the marker also records `workdir=` and `merge_sha=`. `run_one` already holds `$workdir`, and
+`$vout` carries the verified SHA. The marker lives at `$art/$id.linear-write-failed` and is written atomically.
+On a failed write the helper logs to `loop.err.log` and returns the rc. The lock is released as before. A marker
+is evidence, not a verdict. The reaper still re-proves the work from git.
 
-### 4. Reconciliation instead of blind requeue (extend `dozers/reaper.sh`)
-Add a small pre-step to the reaper, run before the existing orphan-requeue sweep:
-- **Stale off-ramp label**: for every issue carrying an off-ramp label
-  (`dozer:merged-develop` / `dozer:needs-review` / `dozer:blocked`) **and** still
-  carrying `dozer:in-progress` (the `MERGED-2`-shaped state the reaper already
-  refuses to requeue) — call a new adapter verb, `finish_repair(id)`
-  (`_linear_api.py`), which is exactly `audit_strip()`'s pattern generalized: strip
-  `dozer:in-progress` only, touch nothing else. No git work, no state change beyond
-  the one stray label.
-- **Genuine in-flight with local proof of completion**: for every issue
-  `_is_inflight()` reports with no live lock (today's orphan case), check for a
-  leftover `$art/$id.merge` receipt or the new `.linear-write-failed` marker for that
-  id *before* calling `task_requeue`. If a receipt exists, retry only the label write
-  (`task_merged`/`task_review`/`task_block`, whichever the marker recorded) instead of
-  requeuing — never re-run the crew when git already proves the work is done. Fall
-  back to the existing `task_requeue` path only when no such proof exists (the
-  genuine-crash case this reaper already handles correctly).
-- Both repairs post a comment on the issue (`task_comment`, stamped
-  `DOZER_COMMENT_BY="dozer-reaper"` as the reaper already does) so the fix is visible
-  in the task's own history, not just the loop log.
+### 4. Receipt carries its repo (`dozers/dev-lane/crew.sh:1376`)
+Add `workdir=<the checkout the merge landed in>` to the `.merge` receipt. This is one extra `printf` field. It
+lets the reaper verify a merge without moving `resolve_workdir` out of `dozer.sh`. Legacy receipts (written
+before this change) have no `workdir=` line. See Edge cases.
+
+### 5. Reconcile before requeue (`dozers/reaper.sh`) — rescue's shape, git-verified
+Insert a new **§0** before the existing orphan sweep, and tighten §1 as follows.
+
+**§0 — stale off-ramp labels.** `task_list_stale_offramp` (in-progress plus merged-develop, needs-review or blocked)
+feeds `task_finish_repair`, which strips `dozer:in-progress` and nothing else. It only runs when `_lock_state(id)`
+is not `live`. Same as the rescue.
+
+**§1 — proof before requeue.** For each in-flight issue with no live lock, `_proof_verb_for`:
+1. Reads the marker, or the receipt if no marker exists. It gets the verb (`task_merged`, `task_review`,
+   `task_block`) and the `workdir`.
+2. **Verifies the proof against git before trusting it.** For a dev receipt it runs
+   `REPO_ROOT="$ROOT" dozers/verify-merge.sh <id> <workdir>`, which checks that `merge_sha` is an ancestor of the
+   integration branch and that `premerge_sha` / `task_sha` are consistent. This is the same gate `run_one`
+   uses. Only if it passes does the reaper retry the recorded verb and post a comment.
+3. A failed verification, a missing marker and a missing receipt all fall through to today's `task_requeue`.
+   A merge that did not land is still requeued, which is correct.
+4. A receipt with no `workdir=` (legacy) is **not** requeued. The reaper posts one comment saying it cannot
+   verify the merge and leaves the issue in-progress. A Director resolves it. A silent requeue is the BRD-96
+   failure, so it is not an option here.
+
+The marker, when present, names the verb to retry. The receipt alone (crash after the merge, before run_one wrote
+anything) means the verb is `task_merged` and the receipt is the proof. This covers the kill -9 window that no
+marker can cover.
+
+Marketing lane: no receipt exists. A marker with `verb=task_review` is the only trigger, and it is retried only
+when the staged file `<workdir>/.dozers-review/<id>.md` is also present. Otherwise it requeues as before.
+
+### 6. The unbound-variable defect — test first, fix only if it reproduces
+Write `tests/dozer-lock-counts-unbound-test.sh`. It sources the real `group_live_counts`, `inflight_count`,
+`repo_live_counts`, the doctor loop and `reaper.sh` (dry run), and runs each under `set -euo pipefail` against
+an empty `LOCK_DIR`, a pid-only lock and an owner-less lock. It asserts no `unbound variable` on stderr and
+the correct in-flight count. If it passes on the branch, the build pass says so in the review: the defect was
+not reproduced on `develop` at `aa0723f`, and no code change is made for it. If it fails, fix only the line
+that fails and say which one.
 
 ## Files to touch
-- `tasks/_linear_api.py` — `set_labels_and_state()` success check; read-after-write
-  assertion in `merged`/`review`/`block`; new `finish_repair()` verb; OPS dispatch
-  entry.
-- `tasks/linear.sh` — retry wrapper around `task_merged`/`task_review`/`task_block`;
-  new `task_finish_repair()` wrapper.
-- `dozers/dozer.sh` — explicit (non-bare-`set -e`) handling of the terminal write in
-  `run_one()`; write the `$id.linear-write-failed` marker artifact.
-- `dozers/reaper.sh` — new pre-step: stale-off-ramp-label repair, and
-  proof-before-requeue check ahead of the existing orphan sweep.
-- `org/config.yaml` — `linear_write_retries` / `linear_write_backoff_s` (documented
-  next to `timeout_*`).
-- Tests (new, following the existing `tests/linear-*-test.sh` stub-module pattern):
-  - `tests/linear-write-verify-test.sh` — a fake `gql`/`urlopen` returning
-    `success:false` must make `merged()`/`review()`/`block()`/`claim()` raise, not
-    return 0.
-  - `tests/linear-finish-repair-test.sh` — `finish_repair()` on an issue carrying both
-    `dozer:in-progress` and an off-ramp label strips only `dozer:in-progress`; leaves
-    an issue with just the off-ramp label untouched (no-op, idempotent).
-  - `tests/reaper-test.sh` (extend existing) — add a case: an inflight issue with a
-    leftover `.merge` receipt gets its label write retried, not requeued; an inflight
-    issue with no receipt still requeues (existing behavior, must not regress).
-  - `tests/linear-inflight-test.sh` — no change needed; its `MERGED-2` fixture already
-    documents the state this design repairs — it stays the proof that the reaper must
-    never *requeue* that shape, only *relabel* it.
+- `tasks/_linear_api.py` — `set_labels_and_state()` success check; `finish_repair()`, `list_stale_offramp()`,
+  and the OPS dispatch entries for both. (Rescue has these.)
+- `tasks/linear.sh` — `_linear_write_retry`; the retry wrappers for merged/review/block; `task_finish_repair`
+  and `task_list_stale_offramp`. (Rescue has these.)
+- `org/config.yaml` — `linear_write_retries: 3`, `linear_write_backoff_s: 5`. (Rescue has these.)
+- `dozers/dozer.sh` — `_terminal_write` (rescue, plus `workdir=` and `merge_sha=` in the marker); `run_one`'s
+  terminal calls go through it.
+- `dozers/dev-lane/crew.sh` — one `workdir=` field in the `.merge` receipt, line ~1376.
+- `dozers/reaper.sh` — `_proof_verb_for` (**rewritten**: verify before trusting; legacy receipt case); §0
+  finish-repair; §1 proof-before-requeue. Rescue's `reaper.sh` is the one file that conflicts on cherry-pick. Resolve it by
+  keeping **both** GSAI-252's `task_budget_sweep` block and this issue's §0/§1.
+- Tests (new, stub-module style of `tests/linear-*-test.sh`, `tests/run-all.sh` picks them up):
+  - `tests/linear-write-verify-test.sh` — `success:false` makes `set_labels_and_state()` exit non-zero.
+  - `tests/linear-terminal-retry-test.sh` — stubbed python fails twice (503, then timeout) then succeeds ⇒
+    3 attempts, rc 0. Always failing ⇒ rc non-zero after exactly 3 attempts. `LINEAR_WRITE_BACKOFF_S=0`.
+  - `tests/linear-finish-repair-test.sh` (rescue) — strips only `dozer:in-progress`; idempotent on a clean issue.
+  - `tests/dev-lane-terminal-write-test.sh` — the BRD-96 end-to-end case. Stub `merged` fails 503 then timeout on
+    every attempt. `run_one` ends with the marker written, `ok` not printed, and the issue never left at
+    `dozer:in-progress` without a marker or receipt. Then a reaper pass with the stub listing the issue as in-flight
+    and a real receipt: the reaper calls `task_merged` (the verb from the marker), does not requeue, and the
+    `merged` stub is called with the id.
+  - `tests/reaper-test.sh` (extend) — receipt + `verify-merge` pass ⇒ retry, no requeue; receipt + verify fail ⇒
+    requeue (existing behaviour); no receipt ⇒ requeue (existing); legacy receipt (no `workdir=`) ⇒ no requeue,
+    one comment; §0 strips in-progress only.
+  - `tests/dozer-lock-counts-unbound-test.sh` — §6 above.
+- `tests/linear-inflight-test.sh` — no change. Its `MERGED-2` fixture is still the rule: the reaper may **relabel** a
+  finished issue but never **requeue** it.
 
 ## Edge cases
-- **`finish_repair()` racing a live crew**: guarded the same way the orphan sweep
-  already is — only acts when `_lock_state(id)` is not `live` (no worker currently
-  holds the id).
-- **Both a stale in-progress label and a genuinely unverifiable merge** (label lingers
-  but there's no `.merge` receipt at all — e.g. `dozer:blocked` was reached without
-  ever attempting a merge): `finish_repair()` only strips the label; it never invents
-  a receipt or asserts a merge happened, so this case is still just hygiene, matching
-  `audit_strip()`'s existing "never touch state" contract.
-- **Retry exhaustion during `claim()`**: `claim()` is cheap and safe to fail outright
-  (nothing expensive has happened yet) — it is deliberately excluded from the retry
-  wrapper; a claim failure should keep behaving exactly as today (falls through to
-  "already claimed"/budget-exhausted handling), not attempt writes-retry machinery
-  meant for the *terminal* transition.
-- **Multi-team / multi-host races**: `finish_repair()` and the proof-check reuse the
-  same `LOCK_DIR`/`_lock_state` liveness probe the reaper already trusts across hosts
-  (it's a shared filesystem namespace, per `reaper.sh`'s existing comments), so no new
-  cross-host assumption is introduced.
-- **`.artifacts/` is host-local**: the proof-before-requeue check only works on the
-  same Dozer host that ran the crew. A truly cross-host stranding (crew ran on host A,
-  reaper runs on host B) still falls back to `task_requeue` today — that gap is
-  pre-existing (the whole `.artifacts` scheme is host-local) and out of scope for this
-  fix; noting it rather than silently pretending it's solved.
+- **Retry plus a write that actually landed.** The second attempt is a no-op. The label set is the same.
+- **Block failure during a budget cap** (GSAI-252). `block()` raises the ask before the labels, and the retry is
+  idempotent by ask marker. The marker path records `task_block`, and the reaper retries `block`, not `merged`.
+- **Marker says `task_merged` but verify-merge fails.** The merge did not land, so requeue. This is the one case
+  where the marker is wrong about the work, and the git check catches it.
+- **Receipt from a previous run.** `run_one` deletes `.merge` at the start of every claim, so a receipt only exists
+  for the run that wrote it. The verify step still runs, because a receipt can name a SHA that was reverted.
+- **Finish-repair racing a live crew.** Guarded by `_lock_state(id) != live`, as in the orphan sweep. Claim order
+  already takes the lock before claim, so a freshly re-claimed issue is never stripped.
+- **`.artifacts/` is host-local.** The proof check only works on the host that ran the crew, which is the same
+  limit as today. A cross-host stranding falls through to a requeue (current behaviour). Noted, not fixed.
+- **Legacy stranded issues (BRD-96-shaped, already in production).** Their receipts have no `workdir=`. They need
+  a one-time manual repair by a Director, or one Director comment with the workdir. Listing them: `list-stale-offramp`
+  covers the in-progress + off-ramp shape. A pure in-progress + legacy-receipt issue is found by grepping
+  `.artifacts/dev/*.merge` for the id and has to be done by hand. This is a deploy note, not code.
+- **Marketing lane.** The marker alone is the trigger, gated on the staged file. Everything else is unchanged.
 
 ## How it gets tested
-- Unit-level, module-import style exactly like the existing `tests/linear-*-test.sh`
-  (stub `lin._all_issues`/`gql` via `importlib`, no real network/API key needed;
-  `LINEAR_API_KEY=test-not-used` is already the convention).
-- `tests/run-all.sh` picks up the new `tests/*-test.sh` files automatically (matches
-  existing naming), so no harness change needed beyond adding the files.
-- Manual/integration check before merge: run `dozers/reaper.sh --dry-run` against a
-  hand-built fixture issue carrying `dozer:in-progress` + `dozer:merged-develop` and
-  confirm the dry-run reports the intended `finish_repair` action without mutating
-  anything (mirrors how `dozers/audit-merged.sh --dry-run` is already verified).
+- Stub-module tests in the `linear-*-test.sh` style (`LINEAR_API_KEY=test-not-used`, no network).
+- The BRD-96 shape end-to-end, with a stubbed Linear and a real `verify-merge.sh` against a throwaway git repo
+  (a merge commit on a branch, plus a receipt that names it). A real repo is needed so the git check is exercised,
+  not stubbed.
+- Full gate: `make test` (or `tests/run-all.sh`) green before merge. Known risk: the full `repo:dozers` suite
+  already ran 1804 s against `timeout_test` 1800 s (see GSAI-213 comment, 2026-10-04). If it times out again, the
+  build pass runs the scoped new tests plus `reaper-test.sh`, and reports the timeout. It does not raise the
+  timeout silently.
+- Manual check before promote: `dozers/reaper.sh --dry-run` against the live board. Expect `[dry] would retry
+  terminal write` for any BRD-96-shaped issue, and no requeue of a verified merge.
+
+## Build order (for the build pass)
+1. `git cherry-pick 0784ed8`. Resolve `dozers/reaper.sh` (keep both sides). Stage and commit the resolution
+   as its own commit.
+2. Apply §3 (`workdir=`/`merge_sha=` in the marker), §4 (crew.sh receipt) and the §5 reaper rewrite.
+3. Write the new tests first for §6 (unbound) and the BRD-96 end-to-end case, and confirm they fail or pass as
+   described above.
+4. Run the full gate. Commit the code. The merge diff must contain `dozers/*.sh` and `tasks/*` changes, not only
+   `DOZER-*.md` (the pass-1 failure mode).
+
+## Open choices (for Guzz / Vasanth to confirm; the build pass proceeds on the defaults marked ✓)
+- ✓ Receipt gets `workdir=` (crew.sh) rather than moving `resolve_workdir` out of `dozer.sh`. Cheaper and keeps the
+  routing code in one place.
+- ✓ A legacy receipt with no `workdir=` is left in-progress with a comment, never requeued. The alternative is to move
+  `resolve_workdir` into a shared file so the reaper can resolve it. That is a bigger change to routing code.
+- ✓ The unbound-variable item is a test plus a report, with no code change unless the test fails.
+- Pass-2 rescue commit is 27 commits behind `develop` at the time of writing. The cherry-pick is clean except
+  `reaper.sh`, so the build pass rebases nothing and starts from current `develop`.

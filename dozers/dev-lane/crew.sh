@@ -1373,8 +1373,11 @@ dlabel="$(crews_get design_only_label)"; dlabel="${dlabel:-design-only}"
 while IFS= read -r l; do [[ "$l" == "$dlabel" ]] && DESIGN_ONLY=1; done \
   < <(crew_meta_field label)
 
-printf 'branch=%s\nmerge_sha=%s\npremerge_sha=%s\ntask_sha=%s\ndesign_only=%s\n' \
-  "$INTEG" "$MERGE_SHA" "$PREMERGE" "$TASK_TIP" "$DESIGN_ONLY" > "$OUT/$ID.merge" 2>/dev/null \
+# GSAI-213: workdir= is the checkout the merge landed in. The reaper re-verifies a stranded
+# merge against it (dozers/reaper.sh) without re-deriving routing; a receipt without it
+# is a legacy receipt and is never requeued on.
+printf 'branch=%s\nmerge_sha=%s\npremerge_sha=%s\ntask_sha=%s\ndesign_only=%s\nworkdir=%s\n' \
+  "$INTEG" "$MERGE_SHA" "$PREMERGE" "$TASK_TIP" "$DESIGN_ONLY" "$WORKDIR" > "$OUT/$ID.merge" 2>/dev/null \
   || fail "merge landed but the receipt could not be written ($OUT/$ID.merge) — NOT labeling merged; investigate .artifacts/dev writability and re-greenlight"
 echo "    [dev] merge receipt: $(git -C "$MW" rev-parse --short HEAD) on $INTEG"
 # GSAI-173: same count fail() would have written, on the success path.
