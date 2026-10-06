@@ -12,16 +12,23 @@
 # Director's lock — letting a second pass start on top of the running one. Foreign locks
 # (no `owner`) are now never touched, alive or not.
 #
+# GSAI-213: an orphaned (lockless) task whose work is ALREADY DONE — a leftover merge
+# receipt, or a write-failure marker naming the exact verb that failed — must have
+# that one write retried, never the whole crew requeued. ORPHAN (above) is the
+# regression guard that a receipt-less orphan still requeues exactly as before.
+#
 # Run:  bash tests/reaper-test.sh   (exits non-zero on any failure)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BOARD="$ROOT/tasks/board"; mkdir -p "$BOARD"/{ready,wip}
+BOARD="$ROOT/tasks/board"; mkdir -p "$BOARD"/{ready,wip,done,blocked}
+ARTDIR="$ROOT/.artifacts/dev"; mkdir -p "$ARTDIR"
 TMPLOCK="$(mktemp -d)"
 LIVEPID=""
 
 cleanup() {
   [[ -n "$LIVEPID" ]] && kill "$LIVEPID" 2>/dev/null || true
-  rm -f "$BOARD"/wip/RTEST-*.md "$BOARD"/ready/RTEST-*.md 2>/dev/null || true
+  rm -f "$BOARD"/wip/RTEST-*.md "$BOARD"/ready/RTEST-*.md "$BOARD"/done/RTEST-*.md "$BOARD"/blocked/RTEST-*.md 2>/dev/null || true
+  rm -f "$ARTDIR"/RTEST-*.merge "$ARTDIR"/RTEST-*.linear-write-failed 2>/dev/null || true
   rm -rf "$TMPLOCK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -41,13 +48,38 @@ mkdirectorlock() { mkdir -p "$TMPLOCK/director-$1.lock"; printf '%s\n' "$2" > "$
 mkfile RTEST-CRASH  "crashed task"  dev
 mkfile RTEST-ORPHAN "lockless task" marketing
 mkfile RTEST-LIVE   "healthy task"  dev
+# GSAI-213: an orphan whose work is ALREADY DONE — a leftover merge receipt (the
+# bare/legacy case, no write-failure marker at all) must retry task_merged instead
+# of requeuing the whole crew.
+mkfile RTEST-PROOF  "finished but unlabeled" dev
+echo 'merge_sha=deadbeef' > "$ARTDIR/RTEST-PROOF.merge"
+# GSAI-213: an orphan carrying a write-failure marker that NAMES the verb that
+# failed (task_block, here — the write that failed was a block, not a merge) must
+# retry exactly that verb, not default to merged.
+mkfile RTEST-WFAIL  "block write failed" dev
+printf 'verb=task_block\nlabel=blocked\nts=now\nrc=1\n' > "$ARTDIR/RTEST-WFAIL.linear-write-failed"
 sleep 300 & LIVEPID=$!
 mklock RTEST-CRASH 999999       # dead pid  -> stale
 mklock RTEST-LIVE  "$LIVEPID"   # alive     -> healthy
-# RTEST-ORPHAN: no lock
+# RTEST-ORPHAN, RTEST-PROOF, RTEST-WFAIL: no lock
 mkdirectorlock rtest-live "$LIVEPID"   # a Director mid-pass  -> must survive
 mkdirectorlock rtest-dead 999999       # a Director's leftover -> still not ours to reap
 mkdir -p "$TMPLOCK/legacy-crew.lock"   # pid-less foreign residue -> doctor must report, not abort
+
+# GSAI-213 step 0: the stale-off-ramp pre-step (MERGED-2 shape — dozer:in-progress
+# lingering next to an off-ramp label — tests/linear-inflight-test.sh's MERGED-2
+# fixture is the standing proof this shape must never be REQUEUED). The files
+# backend has no notion of this Linear-only shape, so it's exercised here by
+# exporting stub task_list_stale_offramp/task_finish_repair functions that a real
+# Linear backend would provide — files.sh never defines those names, so the stubs
+# survive `source tasks/adapter.sh` untouched. One id is behind a live lock (must be
+# skipped); one is not (must be repaired).
+export REPAIRED_LOG="$(mktemp)"
+task_list_stale_offramp() { printf 'STALE-LIVE\tdev\tt\nSTALE-DEAD\tdev\tt\n'; }
+task_finish_repair() { echo "$1" >> "$REPAIRED_LOG"; }
+export -f task_list_stale_offramp task_finish_repair
+mklock STALE-LIVE "$LIVEPID"   # alive -> must be left alone, not touched by finish_repair
+# STALE-DEAD: no lock -> not live -> must be repaired
 
 # Note the Director locks are in place for THIS run: before the fix, reading their
 # missing `owner` under `set -e` aborted the sweep at exit 2 (swallowed by dozer.sh's
@@ -62,11 +94,31 @@ fail=0; ok() { echo "  ✓ $1"; }; no() { echo "  ✗ $1" >&2; fail=1; }
 [[ -f "$BOARD/ready/RTEST-CRASH.md"  ]] && ok "crash task requeued"        || no "crash task not requeued"
 [[ -f "$BOARD/ready/RTEST-ORPHAN.md" ]] && ok "orphan task requeued"       || no "orphan task not requeued"
 [[ -f "$BOARD/wip/RTEST-LIVE.md"     ]] && ok "healthy task left running"  || no "healthy task wrongly touched"
+# GSAI-213: a bare merge receipt (no write-failure marker) retries task_merged — the
+# work is already done, so it must land in done/, never get requeued back to ready/.
+[[ -f "$BOARD/done/RTEST-PROOF.md"   ]] && ok "proof-of-completion task retried merged (done/), not requeued" \
+  || no "RTEST-PROOF was not retried via its merge receipt: $(ls "$BOARD"/*/RTEST-PROOF.md 2>/dev/null || echo missing)"
+[[ ! -f "$BOARD/ready/RTEST-PROOF.md" ]] && ok "proof-of-completion task was NOT requeued (crew not re-run)" \
+  || no "RTEST-PROOF was requeued despite a local merge receipt — the crew will re-run on finished work"
+# GSAI-213: a write-failure marker naming task_block must retry THAT verb, not
+# default to merged — it lands in blocked/, not done/ and not ready/.
+[[ -f "$BOARD/blocked/RTEST-WFAIL.md" ]] && ok "write-failure marker's recorded verb (task_block) was retried, not merged/requeued" \
+  || no "RTEST-WFAIL was not retried via its recorded verb: $(ls "$BOARD"/*/RTEST-WFAIL.md 2>/dev/null || echo missing)"
+[[ ! -f "$BOARD/ready/RTEST-WFAIL.md" ]] && ok "RTEST-WFAIL was NOT requeued" \
+  || no "RTEST-WFAIL was requeued despite a local write-failure marker"
 [[ ! -e "$TMPLOCK/RTEST-CRASH.lock"  ]] && ok "stale lock reaped"          || no "stale lock survived"
 [[ -e "$TMPLOCK/RTEST-LIVE.lock"     ]] && ok "live lock preserved"        || no "live lock wrongly reaped"
 [[ -e "$TMPLOCK/director-rtest-live.lock" ]] && ok "live Director lock preserved"   || no "live Director lock reaped (GSAI-96)"
 [[ -e "$TMPLOCK/director-rtest-dead.lock" ]] && ok "foreign lock never reaped"      || no "foreign lock reaped — not ours to delete"
 kill -0 "$LIVEPID" 2>/dev/null && ok "Director process left running" || no "Director process was killed"
+
+# GSAI-213 step 0 assertions: the stale-off-ramp pre-step repaired the non-live id
+# and left the live one alone — it must never race a worker that still holds the id.
+REPAIRED="$(cat "$REPAIRED_LOG" 2>/dev/null)"; rm -f "$REPAIRED_LOG"
+grep -qx "STALE-DEAD" <<<"$REPAIRED" && ok "MERGED-2-shaped (non-live) id was finish-repaired" \
+  || no "STALE-DEAD was not finish-repaired: $REPAIRED"
+grep -qx "STALE-LIVE" <<<"$REPAIRED" && no "finish-repair touched a LIVE id — must never race a running worker" \
+  || ok "finish-repair correctly skipped the live id"
 
 # GSAI-96 review: `doctor` must not abort on a foreign lock with no `pid` file.
 # `head` exits 1 on the missing file; under pipefail + set -e that used to kill the

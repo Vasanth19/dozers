@@ -84,6 +84,35 @@ _lock_state() {
   if _alive "$pid" && (( age < REAPER_MAX_AGE )); then echo live; else echo stale; fi
 }
 
+# GSAI-213: where a lane's crew leaves its artifacts, mirroring dozer.sh's own
+# art_dir mapping (the marketing crew writes to "mktg", not "marketing").
+_art_dir_for_lane() { case "$1" in marketing) echo mktg ;; *) echo "$1" ;; esac; }
+
+# Local, git-backed proof that this id's work is already done, from a PREVIOUS run on
+# THIS host: either the new write-failure marker (_terminal_write in dozer.sh, which
+# names the exact verb that failed) or — the legacy/bare case — a dev-lane merge
+# receipt with no marker at all. Prints the verb-fn to retry ("task_merged" etc.) on
+# stdout, or nothing when there is no such proof. GSAI-213 edge case: .artifacts/ is
+# host-local, so a crew that ran on a DIFFERENT host than this reaper is invisible
+# here and correctly falls through to the ordinary requeue path below.
+# Always returns 0 — this runs under `set -euo pipefail`, and its result is captured
+# via `verb="$(_proof_verb_for ...)"`, where a NONZERO exit from the substitution
+# (not just from a command inside an `if`/`||`) aborts the whole sweep. A bare
+# `[[ test ]] && echo ...` returns the test's OWN exit status when it's false — the
+# bug this guards against directly.
+_proof_verb_for() {  # <id> <lane>
+  local id="$1" lane="$2" art v=""
+  art="$ROOT/.artifacts/$(_art_dir_for_lane "$lane")"
+  local marker="$art/$id.linear-write-failed"
+  if [[ -s "$marker" ]]; then
+    v="$(grep -E '^verb=' "$marker" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  elif [[ -s "$art/$id.merge" ]]; then
+    v="task_merged"
+  fi
+  printf '%s' "$v"
+  return 0
+}
+
 declare -A REAPED=()
 _reap_lock() {   # kill a runaway worker (if still alive) + remove its stale lock
   local id="$1" lock; lock="$(_lockdir "$id")"
@@ -100,7 +129,34 @@ _reap_lock() {   # kill a runaway worker (if still alive) + remove its stale loc
   else rm -rf "$lock" && echo "  reaped stale lock: $id"; fi
 }
 
-reaped=0 requeued=0 healthy=0 foreign=0
+reaped=0 requeued=0 healthy=0 foreign=0 relabeled=0 rewritten=0
+
+# ── 0. Reconcile stale off-ramp labels (GSAI-213) ───────────────────────────────
+# An issue carrying dozer:in-progress TOGETHER WITH an off-ramp label
+# (merged-develop/needs-review/blocked) already finished — tests/linear-inflight-
+# test.sh's MERGED-2 fixture is the standing proof the sweep below must never requeue
+# that shape (GSAI-119: the work is done; requeueing would re-run a finished crew).
+# Until now nothing ever went back and stripped the lingering in-progress label, so
+# the issue sat in the Linear "Running" view forever even though it was done. Run
+# BEFORE the orphan sweep, guarded the same way: only acts when no live worker holds
+# the id.
+if declare -F task_list_stale_offramp >/dev/null && declare -F task_finish_repair >/dev/null; then
+  while IFS=$'\t' read -r id lane title; do
+    [[ -z "$id" ]] && continue
+    [[ "$(_lock_state "$id")" == "live" ]] && continue   # a worker is still on it — leave it
+    if [[ "$DRY_RUN" == 1 ]]; then
+      echo "  [dry] would finish-repair $id (lane:${lane:-?}): stale dozer:in-progress next to an off-ramp label"
+    elif task_finish_repair "$id"; then
+      task_comment "$id" "♻️ Reaper stripped a lingering dozer:in-progress label — this task already finished (it carries an off-ramp label); the in-progress label just never cleared." 2>/dev/null || true
+      echo "  finish-repaired $id (lane:${lane:-?}): stale dozer:in-progress stripped"
+    else
+      echo "  ! could not finish-repair $id (backend refused)" >&2; continue
+    fi
+    relabeled=$((relabeled+1))
+  done < <(task_list_stale_offramp 2>/dev/null || true)
+else
+  echo "  (backend '$BACKEND' has no task_list_stale_offramp/task_finish_repair — stale off-ramp repair skipped)" >&2
+fi
 
 # ── 1. Requeue orphaned in-flight tasks (claimed, but no live worker) ───────────
 if declare -F task_list_inflight >/dev/null; then
@@ -114,6 +170,25 @@ if declare -F task_list_inflight >/dev/null; then
       # and requeueing while the lock stands would just loop (drain skips locked ids).
       foreign) echo "  ! $id is locked by a non-Dozer holder — left alone" >&2; continue ;;
     esac
+    # GSAI-213: local, git-backed proof this id's work is already done (a merge
+    # receipt, or a write-failure marker naming the exact verb that failed) must be
+    # checked BEFORE requeueing — otherwise the ENTIRE crew (architect→build→test→
+    # merge) reruns on a task whose work is already merged and verified. Retry just
+    # the recorded Linear write instead. Falls back to the ordinary requeue path
+    # when no such proof exists (the genuine-crash case this reaper already handles).
+    verb="$(_proof_verb_for "$id" "$lane")"
+    if [[ -n "$verb" ]]; then
+      if [[ "$DRY_RUN" == 1 ]]; then
+        echo "  [dry] would retry terminal write '$verb' for $id instead of requeuing (local proof of completed work found)"
+        rewritten=$((rewritten+1)); continue
+      elif "$verb" "$id"; then
+        task_comment "$id" "♻️ Reaper found local proof this task's work was already done (a merge receipt / prior write-failure marker) and retried the Linear write ($verb) instead of requeueing the whole crew." 2>/dev/null || true
+        echo "  retried terminal write '$verb' for $id (lane:${lane:-?}) instead of requeuing"
+        rewritten=$((rewritten+1)); continue
+      else
+        echo "  ! retry of '$verb' for $id still failed — falling back to requeue" >&2
+      fi
+    fi
     if [[ "$DRY_RUN" == 1 ]]; then
       echo "  [dry] would requeue orphaned task: $id (lane:${lane:-?}) ${title:-}"
     elif task_requeue "$id"; then
@@ -160,5 +235,5 @@ if declare -F task_budget_sweep >/dev/null; then
   fi
 fi
 
-printf '[reaper] %srequeued=%d reaped-locks=%d healthy=%d foreign-skipped=%d\n' \
-  "$([[ "$DRY_RUN" == 1 ]] && echo '(dry) ')" "$requeued" "$reaped" "$healthy" "$foreign"
+printf '[reaper] %srequeued=%d reaped-locks=%d healthy=%d foreign-skipped=%d relabeled=%d rewritten=%d\n' \
+  "$([[ "$DRY_RUN" == 1 ]] && echo '(dry) ')" "$requeued" "$reaped" "$healthy" "$foreign" "$relabeled" "$rewritten"

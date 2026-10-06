@@ -474,6 +474,42 @@ resolve_workdir() {
   printf '%s' "$path"
 }
 
+# GSAI-213: a terminal Linear write (merged()/review()/block()) that still fails after
+# tasks/linear.sh's bounded retry must NEVER be treated as success — doing exactly that
+# is how a finished issue gets stranded at dozer:in-progress forever, with a "Dozer
+# merged to develop" comment on it actively hiding the problem. Called as
+# `_terminal_write <id> <verb-fn> <verb-label> <art-dir> [extra-context]` from inside
+# an `if`/`||` so a failure never trips `set -e` and vanishes the run. On success,
+# returns 0 and the caller proceeds exactly as before. On failure (retries exhausted):
+#   - writes a durable local marker next to the existing artifacts ($art/$id.linear-
+#     write-failed) with the verb, a timestamp, any extra context (the dev lane's
+#     verify-merge proof) and the write's own stderr
+#   - logs loudly to stderr — never silently
+#   - returns the write's rc so the caller skips its success comment/log and returns,
+#     releasing the lock normally. The git work is already done and (dev) verified;
+#     dozers/reaper.sh's reconciliation pre-step finds this marker and retries just the
+#     write next sweep, instead of blindly requeueing the whole crew.
+_terminal_write() {  # <id> <verb-fn> <verb-label> <art-dir> [extra-context]
+  local id="$1" fn="$2" label="$3" art="$4" extra="${5:-}" rc=0 errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/dozer-write.XXXXXX" 2>/dev/null)" || errf="/tmp/dozer-write.$BASHPID"
+  if "$fn" "$id" 2>"$errf"; then rm -f "$errf" 2>/dev/null || true; return 0; fi
+  rc=$?
+  local marker="$art/$id.linear-write-failed"
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+  {
+    printf 'verb=%s\n' "$fn"
+    printf 'label=%s\n' "$label"
+    printf 'ts=%s\n' "$(date -u +%FT%TZ 2>/dev/null || date)"
+    printf 'rc=%s\n' "$rc"
+    [[ -n "$extra" ]] && printf 'verify_proof=%s\n' "$extra"
+    echo "--- stderr ---"
+    cat "$errf" 2>/dev/null
+  } > "$marker" 2>/dev/null || true
+  rm -f "$errf" 2>/dev/null || true
+  echo "  x #$id Linear write '$label' ($fn) failed after retries (rc=$rc) - the work is done$([[ -n "$extra" ]] && echo " and git-verified") but the terminal label did NOT land on Linear. Marker: $marker" >&2
+  return "$rc"
+}
+
 # Always invoked backgrounded (own subshell), so the EXIT trap + lock are scoped.
 run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
   local id="$1" lane="$2" title="$3" prio="${4:-}" kr="${5:-}" rkey="${6:-}"
@@ -603,7 +639,8 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
      DOZER_LANE="$lane" DOZER_CREW_META="$meta_file" "$crew" "$id" "$title"; then
     local verb VERIFY_PROOF=""
     if [[ "$lane" == "marketing" ]]; then
-      task_review "$id"; verb="staged for review"
+      _terminal_write "$id" task_review "staged for review" "$art" || return 0
+      verb="staged for review"
     elif [[ "$lane" == "dev" ]]; then
       # GSAI-119: label on PROOF, not the exit code. Crew success and merge success are
       # two different facts — an exit-0 with no merge behind it used to earn
@@ -623,12 +660,14 @@ run_one() { # <id> <lane> <title> [priority] [kr-due] [checkout]
         return 0
       fi
       echo "    verify-merge: $vout"
-      task_merged "$id"; verb="merged to develop"
+      _terminal_write "$id" task_merged "merged to develop" "$art" "$vout" || return 0
+      verb="merged to develop"
       # The proof rides the merged comment — "merged to develop" without it is the
       # exact claim that could not be trusted before.
       VERIFY_PROOF="$vout"
     else
-      task_merged "$id"; verb="merged to develop"
+      _terminal_write "$id" task_merged "merged to develop" "$art" || return 0
+      verb="merged to develop"
     fi
     local body
     if [[ -s "$summary_file" ]]; then body="$(head -n 10 "$summary_file")"; else body="- completed via lane:$lane"; fi

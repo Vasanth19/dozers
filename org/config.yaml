@@ -199,6 +199,14 @@ timeout_deps: 900       # a lockfile install (npm ci / pnpm / yarn)
 timeout_push: 300       # git push of the integration branch (only when push: "true")
 timeout_compose: 1800   # the video lane's COMPOSE_CMD pipeline (its model compose uses timeout_model)
 
+# ── Linear terminal-write retry (GSAI-213) ──────────────────────────────────
+# merged()/review()/block() run AFTER a crew's real, expensive (dev: git-verified)
+# work — the one write that must not be allowed to silently strand an issue at
+# dozer:in-progress. Bounded retry, short fixed backoff, inside tasks/linear.sh.
+# task_claim/task_requeue are deliberately NOT covered by this knob.
+linear_write_retries: 3      # attempts total, including the first
+linear_write_backoff_s: 5    # seconds between attempts
+
 # ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
 # Before merging, if the branch touches a DB schema file but ships no matching
 # migration, the merge is BLOCKED and sent back — a schema drift with no
