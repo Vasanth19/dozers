@@ -124,8 +124,8 @@ release_budget: 3
 
 focus:
   projects: ["CFW: Cold Email", "CFW: Sellable V1", "CFW: Paste-to-install", "MGG: Reels"]
-  until: "2026-10-06"
-  note: "Week of 2026-09-29, re-set 2026-09-30 on Vasanth's answer to CFW-18 (#now 05:31:57 'let's go with your recommended answer' -> option (a): sell-first). Cold Email = the leads, Sellable V1 = the demo, Paste-to-install = the install after a yes: the whole path to a first invoice. FOUR, not three: MGG: Reels is retained because he pushed the HeyGen render gate forward in the SAME minute (#now 05:31:03) — 16 finished reels sit one auth away, and that project consumes a human login, not a crew slot, so it dilutes nothing. Dropped: CFW: Render Pipeline and CFW: Integration Uptime (CFW-300, CFW-271) — filed and triaged, deliberately un-greenlit. One word from Vas reverts any of this."
+  until: "2026-10-13"
+  note: "Extended by Fizz 2026-10-06, same sell-first list, through 2026-10-13 (#now thread 99b4c192). Why: the path to a first invoice is not done — CFW-327 (Sellable V1) is frozen and Cold Email still waits on asks; widening to LL/DLY while 12 tasks are frozen only lengthens the line. LL-33 + DLY-4 go first when the window opens. Original basis: Vasanth chose sell-first on CFW-18 (#now 2026-09-30 05:31:57, option (a)); MGG: Reels kept because its blocker is a human login, not a crew slot."
 
 # Only used when backend: github
 repo: "OWNER/REPO"             # e.g. acme/dozers
@@ -198,6 +198,14 @@ timeout_test: 900       # one test run — task worktree and green-gate alike
 timeout_deps: 900       # a lockfile install (npm ci / pnpm / yarn)
 timeout_push: 300       # git push of the integration branch (only when push: "true")
 timeout_compose: 1800   # the video lane's COMPOSE_CMD pipeline (its model compose uses timeout_model)
+
+# ── Linear terminal-write retry (GSAI-213) ──────────────────────────────────
+# merged()/review()/block() run AFTER a crew's real, expensive (dev: git-verified)
+# work — the one write that must not be allowed to silently strand an issue at
+# dozer:in-progress. Bounded retry, short fixed backoff, inside tasks/linear.sh.
+# task_claim/task_requeue are deliberately NOT covered by this knob.
+linear_write_retries: 3      # attempts total, including the first
+linear_write_backoff_s: 5    # seconds between attempts
 
 # ── Migration gate (LL-31 guardrail) ────────────────────────────────────────
 # Before merging, if the branch touches a DB schema file but ships no matching

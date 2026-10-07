@@ -210,25 +210,83 @@ link_deps_dir() {  # $1 = source dir (real checkout), $2 = target dir (worktree)
 # green-gate calls this AFTER it has merged, so it must revert before it fails.
 # Callers with nothing to undo just `|| fail "$DEPS_FAIL_MSG"`.
 DEPS_FAIL_MSG=""
+# GSAI-254: the install decision follows DRIFT between the worktree's install inputs and
+# $WORKDIR's, not the mere presence of a node_modules entry. The host's node_modules
+# belongs to whatever branch the host sits on, so a symlink into it is trusted only while
+# package.json and every lockfile match the host's. Lockfiles are compared as a set (not
+# just the precedence-chosen one): any difference, present-vs-absent included, reinstalls.
+DEPS_INPUTS=( package.json pnpm-lock.yaml package-lock.json yarn.lock )
+deps_drifted() {  # $1 = worktree dir → 0 when any install input differs from $WORKDIR's
+  local d="$1" f
+  for f in "${DEPS_INPUTS[@]}"; do
+    if   [[ -e "$d/$f" && -e "$WORKDIR/$f" ]]; then cmp -s "$d/$f" "$WORKDIR/$f" || return 0
+    elif [[ -e "$d/$f" || -e "$WORKDIR/$f" ]]; then return 0
+    fi
+  done
+  return 1
+}
+deps_stamp() {  # $1 = dir → checksum of its install inputs (what a successful install records)
+  local d="$1" f list=()
+  for f in "${DEPS_INPUTS[@]}"; do [[ -f "$d/$f" ]] && list+=( "$d/$f" ); done
+  (( ${#list[@]} )) || { echo none; return 0; }
+  cat "${list[@]}" | cksum
+}
+unlink_nested_deps() {  # $1 = worktree dir → removes nested node_modules SYMLINKS only
+  # A workspace install would write through a nested link into the host checkout, so the
+  # links link_deps planted go before any install. Real nested dirs and the root are left
+  # alone; `rm -f` on a link without a trailing slash removes the link, never its target.
+  local d="$1" nm
+  while IFS= read -r nm; do
+    [[ -n "$nm" && "$nm" != "$d/node_modules" ]] || continue
+    rm -f "$nm" && echo "    [dev] unlinked nested ${nm#"$d"/} (host target untouched)"
+  done < <(find "$d" -maxdepth 5 \( -name .git -o -name node_modules -type d \) -prune \
+             -o -name node_modules -type l -print 2>/dev/null)
+}
 install_deps() {  # $1 = worktree dir, $2 = stage label (also names the log)
-  local d="$1" what="$2" cmd log
+  local d="$1" what="$2" cmd log why="" tgt stamp="$1/node_modules/.dozer-deps-stamp"
   DEPS_FAIL_MSG=""; log="$OUT/$ID.deps-${what// /-}.log"
   [[ -f "$d/package.json" ]] || return 0
-  [[ -e "$d/node_modules" ]] && return 0
+  # 1. decide, with no side effects. Only a live, unchanged link to the host is the
+  #    fast path; a real dir is the worktree's own and is trusted unless its stamp says
+  #    its inputs changed (or it has no stamp, from before stamps existed).
+  if [[ -L "$d/node_modules" ]]; then
+    tgt="$(readlink "$d/node_modules")"
+    if   [[ ! -e "$d/node_modules" ]]; then why="is a dangling link to $tgt"
+    elif deps_drifted "$d";            then why="differs from $WORKDIR's install inputs (linked to $tgt)"
+    else return 0; fi
+  elif [[ -e "$d/node_modules" ]]; then
+    [[ -f "$stamp" ]] || return 0
+    [[ "$(cat "$stamp")" == "$(deps_stamp "$d")" ]] && return 0
+    why="changed since its last install"
+  fi
   [[ "${DEPS_INSTALL:-on}" == "off" ]] && { echo "    [dev] $what: deps install off"; return 0; }
   if   [[ -f "$d/pnpm-lock.yaml" ]];    then cmd="pnpm install --frozen-lockfile --prefer-offline"
   elif [[ -f "$d/package-lock.json" ]]; then cmd="npm ci"
   elif [[ -f "$d/yarn.lock" ]];         then cmd="yarn install --frozen-lockfile"
   else echo "    [dev] ⚠ $what: package.json but no lockfile and no node_modules — not installing"; return 0; fi
-  echo "    [dev] $what: node_modules missing — $cmd"
-  timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$log" 2>&1 && return 0
-  if (( TIMEBOX_HIT )); then
-    DEPS_FAIL_MSG="$(timed_out_msg "$what deps install (\`$cmd\` in $d)" "$T_DEPS" deps) — see $log"
-  else
-    DEPS_FAIL_MSG="$what deps install failed ($cmd in $d) — see $log; last lines:
+  # 2. act. A stale link is removed in THIS worktree only, then the nested links, then install.
+  if   [[ -z "$why" ]]; then echo "    [dev] $what: node_modules missing — $cmd"
+  elif [[ -L "$d/node_modules" ]]; then
+    rm -f "$d/node_modules"
+    echo "    [dev] $what: node_modules $why — link removed in this worktree only, $cmd"
+  else echo "    [dev] $what: node_modules $why — $cmd"; fi
+  unlink_nested_deps "$d"
+  timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$log" 2>&1 || {
+    if (( TIMEBOX_HIT )); then
+      DEPS_FAIL_MSG="$(timed_out_msg "$what deps install (\`$cmd\` in $d)" "$T_DEPS" deps) — see $log"
+    else
+      DEPS_FAIL_MSG="$what deps install failed ($cmd in $d) — see $log; last lines:
 $(tail -n 5 "$log" 2>/dev/null | sed 's/^/      /')"
-  fi
-  return 1
+    fi
+    return 1
+  }
+  # 3. stamp the inputs we just installed from. Without it the next call would trust this
+  #    dir as "no stamp, pre-GSAI-254" and test against stale modules — so a failed write
+  #    fails the install rather than being silently skipped.
+  mkdir -p "$d/node_modules" && deps_stamp "$d" > "$stamp" || {
+    DEPS_FAIL_MSG="$what deps installed, but its stamp could not be written ($stamp)"
+    return 1
+  }
 }
 
 # ── Test gate (GSAI-27) ──────────────────────────────────────────────────────
@@ -1315,8 +1373,11 @@ dlabel="$(crews_get design_only_label)"; dlabel="${dlabel:-design-only}"
 while IFS= read -r l; do [[ "$l" == "$dlabel" ]] && DESIGN_ONLY=1; done \
   < <(crew_meta_field label)
 
-printf 'branch=%s\nmerge_sha=%s\npremerge_sha=%s\ntask_sha=%s\ndesign_only=%s\n' \
-  "$INTEG" "$MERGE_SHA" "$PREMERGE" "$TASK_TIP" "$DESIGN_ONLY" > "$OUT/$ID.merge" 2>/dev/null \
+# GSAI-213: workdir= is the checkout the merge landed in. The reaper re-verifies a stranded
+# merge against it (dozers/reaper.sh) without re-deriving routing; a receipt without it
+# is a legacy receipt and is never requeued on.
+printf 'branch=%s\nmerge_sha=%s\npremerge_sha=%s\ntask_sha=%s\ndesign_only=%s\nworkdir=%s\n' \
+  "$INTEG" "$MERGE_SHA" "$PREMERGE" "$TASK_TIP" "$DESIGN_ONLY" "$WORKDIR" > "$OUT/$ID.merge" 2>/dev/null \
   || fail "merge landed but the receipt could not be written ($OUT/$ID.merge) — NOT labeling merged; investigate .artifacts/dev writability and re-greenlight"
 echo "    [dev] merge receipt: $(git -C "$MW" rev-parse --short HEAD) on $INTEG"
 # GSAI-173: same count fail() would have written, on the success path.

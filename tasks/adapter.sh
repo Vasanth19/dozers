@@ -52,6 +52,13 @@
 #   task_requeue <id>     -> undo a claim: put the task back to ready (keep its lane).
 # A backend without these degrades gracefully — the reaper still reaps stale locks.
 #
+# Optional BUDGET verb (GSAI-252; implemented by linear, run by dozers/reaper.sh):
+#   task_budget_sweep [--dry-run] [--force]
+#                         -> reconcile the release cap: a dozer:blocked issue at the cap
+#                            must carry an outstanding board-ask AND board:to_review. Exit
+#                            non-zero when an issue could not be read or written. A backend
+#                            with no release cap simply does not define it.
+#
 # Optional FOCUS verb (GSAI-176; implemented by linear):
 #   task_focus_line       -> print ONE human line describing the weekly focus window
 #                            (org/config.yaml -> focus:). Reads config only, never the

@@ -30,7 +30,7 @@ Each mutation resolves the *issue's own* team, so multi-team ops are correct.
 Board protocol (GSAI-41): `board-answer <ID>` is the read-only reconcile probe —
 exit 0 = Vas answered (prints the answers), 3 = still waiting, 2 = no board-ask.
 """
-import json, os, re, sys, urllib.request
+import json, os, re, sys, time, urllib.request
 
 API = "https://api.linear.app/graphql"
 KEY = os.environ.get("LINEAR_API_KEY")
@@ -189,11 +189,23 @@ _COLOR = {READY: "#16a05a", INPROG: "#fbca04", NEEDSREVIEW: "#d876e3",
 
 
 def set_labels_and_state(iss, label_ids, state_id_=None):
+    # GSAI-213: gql() only raises on a transport exception or a GraphQL `errors` array —
+    # an HTTP-200 `{"issueUpdate":{"success": false}}` (a transient backend rejection, an
+    # optimistic-lock conflict) used to pass through silently, so merged()/review()/
+    # block() all reported success to their bash caller while the issue's labels never
+    # changed. A "quiet" Linear-side rejection must surface exactly like a network
+    # exception does — same die(), same fail-fast contract as every other call in this
+    # file. Every _relabel() caller (claim/merged/review/block/requeue/done/mark_ready/
+    # finish_repair/...) routes through this one choke point, so the check is free for
+    # all of them.
     inp = {"labelIds": label_ids}
     if state_id_:
         inp["stateId"] = state_id_
-    gql('mutation($id:String!,$in:IssueUpdateInput!){ issueUpdate(id:$id,input:$in){ success } }',
-        {"id": iss["id"], "in": inp})
+    d = gql('mutation($id:String!,$in:IssueUpdateInput!){ issueUpdate(id:$id,input:$in){ success } }',
+            {"id": iss["id"], "in": inp})
+    if not d["issueUpdate"]["success"]:
+        die(f"issueUpdate reported success:false for {iss.get('identifier', iss.get('id'))} "
+            f"— the Linear write did not apply (labelIds={label_ids}, stateId={state_id_})")
 
 
 def _relabel(iss, add=(), remove=(), state_type=None):
@@ -694,7 +706,16 @@ def block(identifier):       # failure off-ramp
     # 2026-09-05: also reset state to Todo (unstarted) — poll only sees dozer:ready
     # issues in backlog/unstarted/triage, so a re-greenlit issue stuck in "started"
     # (In Progress) is invisible until someone moves it back manually.
-    _relabel(issue(identifier), add=[BLOCKED], remove=[INPROG], state_type="unstarted")
+    # GSAI-252: a block that reaches the release cap is a cap event too. It raises the
+    # budget ask BEFORE it sets the labels (ensure_budget_ask), so an exhausted issue can
+    # never sit dozer:blocked with no decision on Vasanth's board.
+    iss = issue(identifier)
+    status = ensure_budget_ask(iss, state_type="unstarted", wait_s=BUDGET_LOCK_WAIT_S)
+    if status == "busy":
+        die(f"{identifier}: another writer holds this issue's budget lock — not blocking it "
+            f"without a board decision; it stays in-progress for the reaper")
+    if status == "under-cap":
+        _relabel(iss, add=[BLOCKED], remove=[INPROG], state_type="unstarted")
 
 
 def done(identifier):        # fully done (e.g. a Director after develop->main promotion)
@@ -767,6 +788,34 @@ def audit_strip(identifier):
     PROMOTE row. Drops the label, never touches state."""
     _relabel(issue(identifier), remove=[MERGEDDEV])
     print(f"{identifier} -> {MERGEDDEV} stripped (closed-issue hygiene)")
+
+
+# --- GSAI-213: repair a finished issue stranded at dozer:in-progress --------------
+# set_labels_and_state()'s success check (above) closes the gap for every FUTURE
+# write, but an issue that already landed an off-ramp label (merged-develop /
+# needs-review / blocked) alongside a lingering dozer:in-progress — the exact
+# MERGED-2 shape tests/linear-inflight-test.sh already asserts the reaper must never
+# requeue (GSAI-119: the work is finished; requeueing would re-run a done crew) — has
+# no label-write path left in this engine that strips the stale label. This verb is
+# that path: label hygiene ONLY, same "never touch state" contract as audit_strip().
+def finish_repair(identifier):
+    iss = issue(identifier)
+    labels = iss["labels"]["nodes"]
+    if not _has(labels, INPROG):
+        print(f"{identifier}: no stale {INPROG} label — nothing to repair")
+        return
+    _relabel(iss, remove=[INPROG])
+    print(f"{identifier} -> {INPROG} stripped (stale off-ramp repair, GSAI-213)")
+
+
+def list_stale_offramp():
+    """Every issue carrying dozer:in-progress together with an off-ramp label — the
+    reaper's pre-step reads this instead of blindly requeueing (which would re-run a
+    crew whose work is already finished and labeled)."""
+    for i in _all_issues():
+        labels = i["labels"]["nodes"]
+        if _has(labels, INPROG) and any(_has(labels, off) for off in (NEEDSREVIEW, MERGEDDEV, BLOCKED)):
+            print(f'{i["identifier"]}\t{_lane_of(labels)}\t{i["title"]}')
 
 
 def requeue(identifier):
@@ -1005,7 +1054,12 @@ def _comment_url(identifier, body):
     iss = issue(identifier)
     d = gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ success comment{ url } } }',
             {"id": iss["id"], "b": _stamp_marker(body)})
-    return (d["commentCreate"].get("comment") or {}).get("url") or ""
+    # GSAI-252: success:false is a write that did not land. It used to come back as an
+    # empty URL and read as success — the caller then set labels on an ask that did not exist.
+    res = d["commentCreate"]
+    if not res.get("success"):
+        die(f"commentCreate reported success=false on {identifier} — the comment did not land")
+    return (res.get("comment") or {}).get("url") or ""
 
 
 def alarm_probe(identifier):
@@ -1214,30 +1268,110 @@ def _budget_ask_body(identifier, count, cap, reasons):
     return "\n".join(lines)
 
 
-def budget_refuse(iss, count, cap, reasons, outstanding):
-    """Refuse the claim and put the decision on Vasanth's board.
+BUDGET_LOCK_WAIT_S = 30    # how long a block/claim waits for another writer's lock
+BUDGET_LOCK_STALE_S = 300  # a lock this old belongs to a dead holder and is taken over
 
-    The labels matter more than the comment. dozer:ready comes OFF — block() alone
-    would not remove it (it only drops in-progress, because every ordinary caller has
-    already had it removed by claim()), and an issue left ready would be re-polled 30
-    seconds later into a tight loop. board:to_review is the teeth: it is the one pile a
-    Director cannot clear itself, and mark_ready() does not strip it, so a re-greenlight
-    leaves the question standing.
+
+def _budget_lock_path(identifier):
+    # NOT ~/.dozers/locks: that namespace holds the Dozer run-locks and the Directors' locks,
+    # and dozers/reaper.sh sweeps every *.lock in it. A budget lock there would be reported
+    # as a foreign lock on every reaper pass.
+    return os.path.join(_state_dir(), "budget-locks", f"{identifier}.lock")
+
+
+def _take_budget_lock(identifier, wait_s=0):
+    """An atomic mkdir per issue. Returns the lock path, or None when another writer still
+    holds it after wait_s seconds. A lock older than BUDGET_LOCK_STALE_S is a crashed
+    holder's: it is removed and retaken, never waited on."""
+    path = _budget_lock_path(identifier)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            os.mkdir(path)
+            return path
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(path) > BUDGET_LOCK_STALE_S:
+                    os.rmdir(path)
+                    continue
+            except OSError:
+                continue   # released (or retaken) between the two calls: look again
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.5)
+
+
+def _release_budget_lock(path):
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
+def _settled(iss):
+    """True when the labels a budget ask leaves behind are already in place."""
+    names = {n["name"] for n in iss["labels"]["nodes"]}
+    return BLOCKED in names and BOARD_REVIEW in names and not names & {BOARD_RESPONDED, READY, INPROG}
+
+
+def ensure_budget_ask(iss, state_type="unstarted", wait_s=0):
+    """The one place a budget ask is raised (GSAI-252). Called by block() when the failure
+    lands at the cap, by claim()'s refusal, and by the sweep. Returns one of:
+
+      under-cap   the gate is off, or the count is below the cap: nothing written; the
+                  caller does its own normal relabel
+      busy        another writer holds this issue's lock: nothing written
+      asked       at the cap, no outstanding ask: the ask was posted, then the labels
+      relabeled   at the cap, the ask already stands, the labels were missing: labels only
+      settled     at the cap, the ask stands and the labels are right: nothing written
+
+    ASK FIRST, LABELS SECOND. The two Linear writes cannot be atomic, so one can land
+    alone. Ask-first means the only half-state is "ask standing, labels missing": the
+    issue stays in-progress, the reaper requeues it, and the next claim finds the ask and
+    sets the labels without posting a second one. Label-first was the bug: dozer:blocked
+    with nothing on Vasanth's board.
+
+    The read-check-post runs under the per-issue lock, so a block and a sweep racing on one
+    issue cannot both see "no ask" and both post one. A failed write dies loudly (gql() and
+    _comment_url() exit non-zero) and the lock is released either way.
+
+    The labels matter more than the comment. dozer:ready comes OFF — an issue left ready
+    would be re-polled 30 seconds later into a tight loop. board:to_review is the teeth: it
+    is the one pile a Director cannot clear itself, and mark_ready() does not strip it, so
+    a re-greenlight leaves the question standing.
 
     Idempotent: an ask already outstanding is not re-posted. A re-greenlight past the cap
-    is silently re-blocked with one stderr line, because an alarm that duplicates itself
-    on every poll is how a real one stops being read (GSAI-180)."""
-    _relabel(iss, add=[BLOCKED, BOARD_REVIEW], remove=[READY, INPROG, BOARD_RESPONDED],
-             state_type="unstarted")
+    is re-blocked with one stderr line, because an alarm that duplicates itself on every
+    poll is how a real one stops being read (GSAI-180)."""
     ident = iss["identifier"]
-    if outstanding is not None:
-        print(f"budget: {ident} re-greenlit past the cap ({count}/{cap}) — re-blocked; "
-              f"the ask from {outstanding['createdAt']} is still unanswered", file=sys.stderr)
-        return
-    body = f"{_budget_ask_body(ident, count, cap, reasons)}\n\n<!-- board-ask id:{_now_iso()} {BUDGET_BY} -->"
-    url = _comment_url(ident, body)
-    print(f"budget: {ident} exhausted its release budget ({count}/{cap}) -> "
-          f"{BLOCKED} + {BOARD_REVIEW} {url}", file=sys.stderr)
+    cap = release_budget()
+    if cap <= 0 or release_state(_issue_comments(ident))[0] < cap:
+        return "under-cap"
+    lock = _take_budget_lock(ident, wait_s)
+    if lock is None:
+        return "busy"
+    try:
+        count, outstanding, reasons = release_state(_issue_comments(ident))
+        if count < cap:
+            return "under-cap"
+        if outstanding is None:
+            body = f"{_budget_ask_body(ident, count, cap, reasons)}\n\n<!-- board-ask id:{_now_iso()} {BUDGET_BY} -->"
+            url = _comment_url(ident, body)
+            _relabel(iss, add=[BLOCKED, BOARD_REVIEW], remove=[READY, INPROG, BOARD_RESPONDED],
+                     state_type=state_type)
+            print(f"budget: {ident} exhausted its release budget ({count}/{cap}) -> "
+                  f"{BLOCKED} + {BOARD_REVIEW} {url}", file=sys.stderr)
+            return "asked"
+        print(f"budget: {ident} is at the cap ({count}/{cap}); the ask from "
+              f"{outstanding['createdAt']} is still unanswered", file=sys.stderr)
+        if _settled(iss):
+            return "settled"
+        _relabel(iss, add=[BLOCKED, BOARD_REVIEW], remove=[READY, INPROG, BOARD_RESPONDED],
+                 state_type=state_type)
+        return "relabeled"
+    finally:
+        _release_budget_lock(lock)
 
 
 def budget_check(iss):
@@ -1250,27 +1384,113 @@ def budget_check(iss):
     if cap <= 0:
         return True
     try:
-        count, outstanding, reasons = release_state(_issue_comments(iss["identifier"]))
+        count, _, _ = release_state(_issue_comments(iss["identifier"]))
     except (Exception, SystemExit) as e:
         print(f"budget: check could not run for {iss['identifier']} ({e}) — allowing the "
               f"claim (fail-open)", file=sys.stderr)
         return True
     if count < cap:
         return True
-    budget_refuse(iss, count, cap, reasons, outstanding)
+    if ensure_budget_ask(iss, wait_s=BUDGET_LOCK_WAIT_S) == "busy":
+        print(f"budget: {iss['identifier']} is locked by another writer — refused; "
+              f"it stays greenlit and the next poll retries", file=sys.stderr)
     return False
 
 
 def release_count(identifier):
     """CLI: `release-count <ID>` — the count, the cap and how the passes died.
-    Read-only; the observability half of the gate, and what the tests assert against."""
+    Read-only; the observability half of the gate, and what the tests assert against.
+
+    GSAI-252: ask=MISSING is the state that must never exist — at the cap with no budget
+    ask standing. board=yes|no says whether board:to_review landed, so a label gap shows too."""
     cap = release_budget()
+    iss = issue(identifier)
     count, outstanding, reasons = release_state(_issue_comments(identifier))
+    exhausted = cap > 0 and count >= cap
+    ask = "none" if not exhausted else ("outstanding" if outstanding else "MISSING")
+    board = "yes" if _has(iss["labels"]["nodes"], BOARD_REVIEW) else "no"
     print(f"{identifier}\treleases={count}\tcap={cap}\t"
-          f"{'EXHAUSTED' if cap > 0 and count >= cap else 'ok'}\t"
-          f"ask={'outstanding' if outstanding else 'none'}")
+          f"{'EXHAUSTED' if exhausted else 'ok'}\task={ask}\tboard={board}")
     for n, r in enumerate(reasons, 1):
         print(f"  {n}. {r}")
+
+
+def _sweep_due(interval_s):
+    """True when the last sweep is older than interval_s, or there is no record of one."""
+    try:
+        with open(os.path.join(_state_dir(), "budget-sweep.stamp")) as fh:
+            last = float(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return True
+    return time.time() - last >= interval_s
+
+
+def budget_sweep(dry_run=False, force=False):
+    """The reconciling sweep (GSAI-252). Invariant: at count >= cap with dozer:blocked, the
+    issue carries BOTH an outstanding budget-ask AND board:to_review. Block-time (block())
+    is the primary path; this is the net under it — it heals a stripped label, an issue that
+    reached the cap before this fix, and anything a future path forgets.
+
+    Idempotent: the ask is keyed on the outstanding-ask check, not on timing, so a second
+    run posts nothing. Respects the human: an unmarked answer resets the count, so the issue
+    is under the cap and skipped. Respects release_budget: 0 (a no-op that says so).
+
+    Throttled. The sweep reads the comments of every dozer:blocked issue, one Linear call
+    each, and the reaper runs it every REAPER_EVERY polls (~5 min). Linear's API key allows
+    ~1500 requests an hour and the poll already spends much of that, so the sweep runs at
+    most once per BUDGET_SWEEP_EVERY seconds (default 1800) unless --force. --dry-run is
+    read-only and never throttled.
+
+    Exits 1 when any issue could not be read or written — never silently."""
+    cap = release_budget()
+    if cap <= 0:
+        print("budget-sweep: release_budget is 0 — the gate is disabled; nothing to sweep",
+              file=sys.stderr)
+        return
+    interval = int(os.environ.get("BUDGET_SWEEP_EVERY") or 1800)
+    if not (dry_run or force) and not _sweep_due(interval):
+        print(f"budget-sweep: throttled — the last run is inside {interval}s", file=sys.stderr)
+        return
+    if not dry_run:
+        os.makedirs(_state_dir(), exist_ok=True)
+        with open(os.path.join(_state_dir(), "budget-sweep.stamp"), "w") as fh:
+            fh.write(str(time.time()))
+    asked = relabeled = settled = 0
+    failed = []
+    for node in _all_issues():
+        if node["state"]["type"] in ("completed", "canceled") or not _has(node["labels"]["nodes"], BLOCKED):
+            continue
+        ident = node["identifier"]
+        try:
+            count, outstanding, _ = release_state(_issue_comments(ident))
+        except (Exception, SystemExit) as e:
+            failed.append(ident)
+            print(f"budget-sweep: {ident} could not be read ({e}) — not asked", file=sys.stderr)
+            continue
+        if count < cap:
+            continue
+        if dry_run:
+            action = ("settled" if _settled(node) else "would-relabel") if outstanding else "would-ask"
+            print(f"{ident}\t{action}\tcount={count}/{cap}")
+            continue
+        try:
+            status = ensure_budget_ask(issue(ident), state_type=None)
+        except (Exception, SystemExit) as e:
+            failed.append(ident)
+            print(f"budget-sweep: {ident} could not be written ({e})", file=sys.stderr)
+            continue
+        if status == "busy":
+            print(f"budget-sweep: {ident} is locked by another writer — skipped", file=sys.stderr)
+        elif status == "asked":
+            asked += 1
+        elif status == "relabeled":
+            relabeled += 1
+        elif status == "settled":
+            settled += 1
+    print(f"budget-sweep: asked={asked} relabeled={relabeled} settled={settled} "
+          f"failed={len(failed)}{' (dry-run)' if dry_run else ''}", file=sys.stderr)
+    if failed:
+        sys.exit(1)
 
 
 
@@ -1312,6 +1532,8 @@ OPS = {
     "list-merged-dev": lambda a: list_merged_dev(),
     "audit-requeue": lambda a: audit_requeue(a[0]),
     "audit-strip": lambda a: audit_strip(a[0]),
+    "finish-repair": lambda a: finish_repair(a[0]),          # GSAI-213: strip stale dozer:in-progress
+    "list-stale-offramp": lambda a: list_stale_offramp(),     # GSAI-213: the reaper's pre-step input
     "alarm-probe": lambda a: alarm_probe(a[0]),
     "alarm-raise": lambda a: alarm_raise(a[0], a[1]),
     "alarm-clear": lambda a: alarm_clear(a[0], a[1]),
@@ -1319,6 +1541,7 @@ OPS = {
     "focus-line": lambda a: focus_line(),     # GSAI-176: one human line, no Linear call
     "board-answer": lambda a: board_answer(a[0]),
     "release-count": lambda a: release_count(a[0]),   # GSAI-184: the budget, read-only
+    "budget-sweep": lambda a: budget_sweep(dry_run="--dry-run" in a, force="--force" in a),  # GSAI-252
 }
 
 if __name__ == "__main__":
