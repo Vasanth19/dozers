@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # tests/promote-test.sh — regression for GSAI-104: a promote is a --no-ff merge, or it
-# does not happen.
+# does not happen. Also covers GSAI-141: a promote carries main's new tip straight
+# back into develop, or develop rots one commit further behind main on every promote.
 #
 # On 2026-09-09 a hand-rolled promote in cfw-social squashed develop into main
 # (`fa85bddc`, ONE parent). New hashes landed on main that develop had never seen, so
 # origin/main and origin/develop stopped sharing recent history and every subsequent
 # gap check lied; CFW-250 was the cleanup. directors/promote.sh is the fix — this test
 # is what keeps it true.
+#
+# GSAI-141: the ORIGINAL script never carried the develop→main merge commit back onto
+# develop, so every promote left develop exactly one commit behind main, forever — by
+# the time this was caught, real repos had 28 such commits of pure scaffolding drift.
+# The fix back-merges main's new tip into develop (a fast-forward in the common case,
+# never a fresh unique commit — see `--ff` not `--no-ff` in promote.sh) in the same
+# run, and heals any pre-existing gap even on an otherwise no-op run.
 #
 # Everything runs against throwaway fixture repos (a bare "origin" + a clone) — no
 # network, no Linear, no ecosystem registry: the script is handed a path, not an id.
@@ -65,7 +73,18 @@ fixture_localonly() {
 omain()   { git -C "$1/origin.git" rev-parse main; }               # published main tip
 parents() { echo $(( $(git -C "$1/origin.git" rev-list --parents -n1 "${2:-main}" | wc -w) - 1 )); }
 gap()     { git -C "$1/origin.git" rev-list --count main..develop; }   # must be 0 after a promote
+# GSAI-141: the REVERSE gap — commits on main that develop has never absorbed. Every
+# past promote's merge commit, before invariant 7 existed to carry it back. Must be 0
+# after any successful promote, same as gap() above, just measured the other way.
+gap_rev()    { git -C "$1/origin.git" rev-list --count develop..main; }
+is_ancestor(){ git -C "$1/origin.git" merge-base --is-ancestor "$2" "$3"; }   # $2 an ancestor of $3?
 run()     { (cd "$1/clone" && "$PROMOTE" "$1/clone" "${@:2}" 2>&1); }
+# GSAI-141: a real promote now publishes develop too (the back-merge), which "$d/src"
+# — the hand-rolled checkout on_develop commits from — has no way to know about. Call
+# this before the next on_develop on a fixture that already had a real (non---no-push)
+# promote run against it, or its push silently fails (non-fast-forward) and the
+# "next round" never actually lands, same as a second contributor pulling first.
+sync_src_develop() { git -C "$1/src" fetch -q origin; git -C "$1/src" checkout -q -B develop origin/develop; }
 
 # ── 1. the happy path: develop ahead, main a strict ancestor ──────────────────
 # A bare `git merge` here would FAST-FORWARD — no merge commit, nothing to revert, no
@@ -79,12 +98,20 @@ out="$(run "$d" --summary "CFW-252, CFW-253")"; rc=$?
 [[ "$(gap "$d")" == "0" ]] && ok "happy: origin/main..origin/develop empty" || bad "happy: gap is $(gap "$d")"
 git -C "$d/origin.git" log -1 --format=%s main | grep -q "promote: develop → main — CFW-252, CFW-253" \
   && ok "happy: summary lands in the merge message" || bad "happy: message is '$(git -C "$d/origin.git" log -1 --format=%s main)'"
+# GSAI-141: the back-merge must have run too — develop absorbs main's new tip in the
+# very same promote, not next time.
+[[ "$(gap_rev "$d")" == "0" ]] && ok "happy (GSAI-141): origin/develop..origin/main empty" \
+  || bad "happy (GSAI-141): reverse gap is $(gap_rev "$d")"
+is_ancestor "$d" main develop && ok "happy (GSAI-141): main is a real ancestor of develop" \
+  || bad "happy (GSAI-141): main is not an ancestor of develop — back-merge did not really carry it forward"
 
 # ── 2. idempotent: running it again promotes nothing ──────────────────────────
 before="$(omain "$d")"
 out="$(run "$d")"; rc=$?
 (( rc == 0 )) && [[ "$(omain "$d")" == "$before" ]] && grep -q "nothing to promote" <<<"$out" \
   && ok "second run is a clean no-op" || bad "second run: exit $rc, main moved=$([[ "$(omain "$d")" == "$before" ]] && echo no || echo yes) — $out"
+[[ "$(gap_rev "$d")" == "0" ]] && ok "second run (GSAI-141): reverse gap still 0" \
+  || bad "second run (GSAI-141): the back-merge commit itself reopened the gap — $(gap_rev "$d")"
 
 # ── 3. the regression itself: a squashed promote is refused, not compounded ───
 # Recreate fa85bddc — someone hand-rolls `merge --squash` onto main. main now carries a
@@ -270,6 +297,86 @@ before="$(git -C "$d/clone" rev-parse main)"
 out="$(run "$d" --no-push)"; rc=$?
 (( rc == 0 )) && grep -q "nothing to promote" <<<"$out" && [[ "$(git -C "$d/clone" rev-parse main)" == "$before" ]] \
   && ok "local-only: second run is a clean no-op" || bad "local-only second run: exit $rc — $out"
+
+# ── 13. GSAI-141: sequential promotes stay caught up ─────────────────────────
+# The shape that actually accumulates drift today: not just the first promote, but
+# EVERY promote. Two rounds in the same fixture; the reverse gap must stay 0 after
+# each one, not just the first.
+d="$(fixture sequential)"
+on_develop "$d" "round-one"
+out="$(run "$d")"; rc=$?
+(( rc == 0 )) && [[ "$(gap_rev "$d")" == "0" ]] && ok "sequential round 1: reverse gap 0" \
+  || bad "sequential round 1: exit $rc, reverse gap $(gap_rev "$d") — $out"
+sync_src_develop "$d"
+on_develop "$d" "round-two"
+out="$(run "$d")"; rc=$?
+(( rc == 0 )) && [[ "$(gap_rev "$d")" == "0" ]] && ok "sequential round 2: reverse gap still 0" \
+  || bad "sequential round 2: exit $rc, reverse gap $(gap_rev "$d") — $out"
+
+# ── 14. GSAI-141: develop moves on between one promote and the next ─────────
+# Race-adjacent approximation (there is no way to inject a commit mid-script without
+# instrumenting promote.sh itself): promote once, catch the hand-rolled "src" checkout
+# back up to what the back-merge just published (exactly what an independent
+# contributor pulling before their next commit would do), add a second commit, and
+# promote again. Proves the back-merge keeps working once develop has moved past what
+# the FIRST promote saw — not only ever in the trivial fast-forward case.
+d="$(fixture racey)"
+on_develop "$d" "round-one"
+run "$d" >/dev/null 2>&1
+sync_src_develop "$d"
+on_develop "$d" "round-two"
+out="$(run "$d")"; rc=$?
+(( rc == 0 )) && [[ "$(gap_rev "$d")" == "0" ]] && ok "racey: second promote closes the reverse gap again" \
+  || bad "racey: exit $rc, reverse gap $(gap_rev "$d") — $out"
+is_ancestor "$d" main develop && ok "racey: main is still an ancestor of develop" \
+  || bad "racey: main is not an ancestor of develop after the race-adjacent round"
+
+# ── 15. GSAI-141: --no-push / LOCAL_ONLY closes the gap too, just locally ───
+d="$(fixture_localonly localonly_revgap)"
+out="$(run "$d" --no-push)"; rc=$?
+(( rc == 0 )) && ok "local-only (GSAI-141): promote exits 0" || bad "local-only (GSAI-141): exit $rc — $out"
+[[ "$(git -C "$d/clone" rev-list --count develop..main)" == "0" ]] \
+  && ok "local-only (GSAI-141): local develop..main empty" \
+  || bad "local-only (GSAI-141): reverse gap is $(git -C "$d/clone" rev-list --count develop..main)"
+git -C "$d/clone" merge-base --is-ancestor main develop \
+  && ok "local-only (GSAI-141): local main is an ancestor of local develop" \
+  || bad "local-only (GSAI-141): main is not an ancestor of develop locally"
+
+# ── 16. GSAI-141: a pre-existing gap is healed by a later, otherwise no-op promote ─
+# Seeds exactly the real-world drift (a promote made the OLD way: a proper --no-ff
+# merge onto main, but no back-merge at all — this repo's actual 28-commit history
+# before this fix). The patched script must heal it even when there is nothing new on
+# develop to promote.
+d="$(fixture healdrift)"; on_develop "$d" "feature-one"
+git -C "$d/src" checkout -q main
+git -C "$d/src" merge -q --no-ff develop -m "promote: develop → main (pre-GSAI-141, no back-merge)"
+git -C "$d/src" push -q origin main
+(( $(gap_rev "$d") > 0 )) && ok "healdrift: fixture seeded the pre-existing drift" \
+  || bad "healdrift: fixture failed to seed drift"
+out="$(run "$d")"; rc=$?
+(( rc == 0 )) && grep -q "nothing to promote" <<<"$out" \
+  && ok "healdrift: still reports a no-op (nothing new on develop)" || bad "healdrift: exit $rc — $out"
+grep -q "healing" <<<"$out" && ok "healdrift: reports the heal" || bad "healdrift: no heal message — $out"
+[[ "$(gap_rev "$d")" == "0" ]] && ok "healdrift: reverse gap healed to 0" \
+  || bad "healdrift: reverse gap still $(gap_rev "$d")"
+
+# ── 17. GSAI-141: --check / --dry-run report pre-existing drift, never heal it ──
+d="$(fixture healdrift_readonly)"; on_develop "$d" "feature-one"
+git -C "$d/src" checkout -q main
+git -C "$d/src" merge -q --no-ff develop -m "promote: develop → main (pre-GSAI-141, no back-merge)"
+git -C "$d/src" push -q origin main
+before_gap="$(gap_rev "$d")"
+out="$(run "$d" --check)"; rc=$?
+(( rc == 0 )) && [[ "$(gap_rev "$d")" == "$before_gap" ]] && grep -q "GSAI-141 drift" <<<"$out" \
+  && ok "healdrift --check: reports the drift, changes nothing" \
+  || bad "healdrift --check: exit $rc, gap now $(gap_rev "$d") — $out"
+out="$(run "$d" --dry-run)"; rc=$?
+(( rc == 0 )) && [[ "$(gap_rev "$d")" == "$before_gap" ]] \
+  && ok "healdrift --dry-run: changes nothing" \
+  || bad "healdrift --dry-run: exit $rc, gap now $(gap_rev "$d") — $out"
+[[ -z "$(git -C "$d/clone" worktree list --porcelain | awk '/^worktree /{print $2}' | tail -n +2)" ]] \
+  && ok "healdrift --check/--dry-run: no stray worktrees left behind" \
+  || bad "healdrift: stray worktree left behind: $(git -C "$d/clone" worktree list)"
 
 out="$("$PROMOTE" "$TMP/nope-not-a-repo-or-id" 2>&1)"; rc=$?
 (( rc == 1 )) && ok "unknown repo id: refused (never guesses a repo)" || bad "unknown repo id: exit $rc — $out"

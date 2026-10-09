@@ -31,6 +31,14 @@
 #   6. A repo with no origin can still promote under --no-push: local <to> is both
 #      the base and the truth, and nothing is published. Without --no-push a missing
 #      origin stays fatal.
+#   7. <to>'s new tip is always carried straight back into <from> in the same run
+#      (GSAI-141) — a mirror-image `git merge --ff <to>` committed onto <from> (a
+#      fast-forward, almost always — a real merge commit only if <from> moved on in
+#      the interim), never published until BOTH sides are merged locally. Without
+#      this, <from> falls one merge commit further behind <to> on every promote, forever —
+#      and every future worktree the Dozer cuts from <from> builds on that rotting
+#      base. A pre-existing gap (a repo promoted before this invariant existed) is
+#      healed the same way, even on an otherwise-no-op run — no separate migration.
 #
 # Exit codes:  0 promoted (or already promoted / check passed) · 1 refused, nothing
 # changed · 2 usage error. Anything non-zero means main was NOT moved.
@@ -90,6 +98,62 @@ say "repo $REPO   promote $FROM → $TO"
 # local/origin adjudication still decides each side's tip).
 _has()  { git -C "$REPO" rev-parse --verify -q "$1^{commit}" >/dev/null 2>&1; }
 _count(){ git -C "$REPO" rev-list --count "$@" 2>/dev/null || echo 0; }
+
+# ── where a branch's merge happens: its own checkout, or a throwaway worktree ──
+# Shared by the forward merge (onto $TO) and the back-merge (onto $FROM, GSAI-141) —
+# a branch can be checked out in only one worktree, so the same lookup serves both.
+# Never calls die(): a caller mid-promote (after $TO already moved) needs to revert
+# $TO before dying, which die() can't do for it. Prints one of three first words on
+# success — "existing <path>" (merge there, touch nothing else after), "new <path>"
+# (a throwaway worktree on a branch that already existed, just wasn't checked out
+# anywhere), or "newbranch <path>" (there was no local branch AT ALL — git's checkout
+# DWIM just minted one tracking origin/<branch>). The newbranch case matters on
+# cleanup: a branch we invented purely as merge scratch space must not survive the
+# run, or it becomes a local-only ref that can silently diverge from origin the next
+# time something else pushes to the same branch (GSAI-141 bit this exact way on the
+# back-merge side under --no-push — see _forget_if_new below). On failure, prints the
+# "[promote] ✗ ..." line itself and returns 1 with nothing on stdout.
+_checkout_for() {   # _checkout_for <branch>
+  local br="$1" at
+  at="$(git -C "$REPO" worktree list --porcelain 2>/dev/null \
+        | awk -v b="refs/heads/$br" '/^worktree /{w=$2} $0=="branch "b{print w; exit}')"
+  if [[ -n "$at" ]]; then
+    if [[ -n "$(git -C "$at" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+      echo "[promote] ✗ $br is checked out dirty at $at — commit or stash there, then re-run" >&2
+      return 1
+    fi
+    echo "existing $at"; return 0
+  fi
+  local hadbranch=0; _has "refs/heads/$br" && hadbranch=1
+  local w werr
+  w="$(mktemp -d "${TMPDIR:-/tmp}/promote-$br.XXXXXX")"
+  rmdir "$w"
+  if ! werr="$(git -C "$REPO" worktree add "$w" "$br" 2>&1 >/dev/null)"; then
+    echo "[promote] ✗ could not create a promote worktree on $br: ${werr:-unknown git error}" >&2
+    return 1
+  fi
+  if (( hadbranch )); then echo "new $w"; else echo "newbranch $w"; fi
+}
+# A branch _checkout_for minted from nothing (kind "newbranch") is forgotten once its
+# throwaway worktree is removed — it existed only as merge scratch space and was never
+# there before this run, so keeping it around risks exactly the GSAI-141 regression:
+# a dangling local ref that looks "ahead" of origin today and genuinely diverges the
+# moment origin moves on before the next promote. A branch that already existed (kind
+# "new") or is still checked out somewhere ("existing") is untouched either way.
+_forget_if_new() {   # _forget_if_new <branch> <kind> <worktree-path>
+  local br="$1" kind="$2" wt="$3"
+  git -C "$REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  [[ "$kind" == newbranch ]] && git -C "$REPO" branch -D "$br" >/dev/null 2>&1 || true
+}
+# Both worktrees this script may open, cleaned up unconditionally on exit — set once
+# here so the trap is safe no matter which code path (self-heal, back-merge, neither)
+# ends up using them.
+MW=""; FW=""; CLEANUP_TO=0; CLEANUP_FROM=0; TO_KIND=""; FROM_KIND=""; PREMERGE=""; FROMPRE=""
+_cleanup() {
+  (( CLEANUP_TO ))   && _forget_if_new "$TO"   "$TO_KIND"   "$MW"
+  (( CLEANUP_FROM )) && _forget_if_new "$FROM" "$FROM_KIND" "$FW"
+}
+trap _cleanup EXIT
 
 HAS_ORIGIN=0; git -C "$REPO" remote get-url origin >/dev/null 2>&1 && HAS_ORIGIN=1
 LOCAL_ONLY=0
@@ -199,6 +263,11 @@ _publish() {
   return 0
 }
 
+# GSAI-141: commits $DST (main) already holds that $SRC (develop) has never absorbed
+# — every past promote's merge commit, before this invariant existed to back-merge
+# them. Computed up front so --check/--dry-run can report it either way below.
+REVGAP="$(_count "$DST" "^$SRC")"
+
 AHEAD="$(_count "$SRC" "^$DST")"
 if (( AHEAD == 0 )); then
   say "✓ nothing to promote — $DST already contains every commit on $SRC (no-op)"
@@ -208,14 +277,42 @@ if (( AHEAD == 0 )); then
     say "origin is behind this machine — publishing the earlier promote"
     _publish
   fi
+  if (( REVGAP > 0 )); then
+    if (( CHECK || DRY )); then
+      say "note: $FROM is $REVGAP commit(s) behind $TO from a past promote (GSAI-141 drift) — a real run would heal this into $FROM"
+    else
+      say "healing $REVGAP pre-existing commit(s) that $FROM is missing from a past promote (GSAI-141)"
+      git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+      _co="$(_checkout_for "$FROM")"; rc=$?
+      (( rc == 0 )) || die "self-heal: could not check out $FROM (see above) — no changes were made"
+      read -r FROM_KIND FW <<<"$_co"
+      [[ "$FROM_KIND" != existing ]] && CLEANUP_FROM=1
+      if (( ! LOCAL_ONLY )) && (( $(_count "$DST" "^$FROM") > 0 )); then
+        git -C "$FW" merge --ff-only "$DST" >/dev/null 2>&1 \
+          || die "self-heal: could not fast-forward $FROM to $DST in $FW — no changes were made"
+      fi
+      if ! _hmerr="$(git -C "$FW" merge --ff --no-edit "$DST" -m "promote: back-merge $TO → $FROM (heal GSAI-141 drift)" 2>&1 >/dev/null)"; then
+        git -C "$FW" merge --abort >/dev/null 2>&1 || true
+        die "self-heal back-merge $TO → $FROM conflicted (should be impossible — see GSAI-141 design): ${_hmerr:-conflict}"
+      fi
+      say "✓ healed — $FROM now contains $TO's drift ($(git -C "$FW" rev-parse --short HEAD))"
+      if (( PUSH )) && (( $(_count "$FROM" "^origin/$FROM") > 0 )); then
+        _serr="$(git -C "$REPO" push origin "$FROM" 2>&1 >/dev/null)" \
+          || die "healed $FROM locally but publishing it failed — push by hand: git -C $REPO push origin $FROM
+    ${_serr:-unknown git error}"
+        say "✓ published $FROM to origin"
+      fi
+    fi
+  fi
   exit 0
 fi
 say "$AHEAD commit(s) to promote:"
 git -C "$REPO" log --oneline "$DST..$SRC" | head -30 | sed 's/^/      /'
+(( REVGAP > 0 )) && say "note: $DST already holds $REVGAP commit(s) that $SRC lacks from an earlier, pre-GSAI-141 promote — this run's back-merge will absorb those too"
 
 if (( CHECK )); then say "✓ check only — $TO is promotable, nothing changed"; exit 0; fi
 if (( DRY )); then
-  say "✓ dry run — would run: git merge --no-ff $SRC   (on $TO)$( (( PUSH )) && echo ", then push origin$( (( UNPUSHED_SRC > 0 )) && echo " $FROM and") $TO")"
+  say "✓ dry run — would run: git merge --no-ff $SRC (on $TO), then merge $TO back into $FROM so $FROM never falls behind (GSAI-141)$( (( PUSH )) && echo ", then push origin $FROM and $TO")"
   exit 0
 fi
 
@@ -224,24 +321,10 @@ fi
 # somewhere, merge THERE when it is clean (a dirty one is a hard stop — invariant 4);
 # otherwise use a throwaway worktree so we never switch anybody's branch.
 git -C "$REPO" worktree prune >/dev/null 2>&1 || true
-MW=""; CLEANUP_WT=0
-_to_at="$(git -C "$REPO" worktree list --porcelain 2>/dev/null \
-          | awk -v b="refs/heads/$TO" '/^worktree /{w=$2} $0=="branch "b{print w; exit}')"
-if [[ -n "$_to_at" ]]; then
-  [[ -z "$(git -C "$_to_at" status --porcelain --untracked-files=no 2>/dev/null)" ]] \
-    || die "$TO is checked out dirty at $_to_at — commit or stash there, then re-run"
-  MW="$_to_at"
-  say "merging in the existing $TO checkout at $MW"
-else
-  MW="$(mktemp -d "${TMPDIR:-/tmp}/promote-$TO.XXXXXX")"
-  rmdir "$MW"
-  _werr="$(git -C "$REPO" worktree add "$MW" "$TO" 2>&1 >/dev/null)" \
-    || die "could not create a promote worktree on $TO: ${_werr:-unknown git error}"
-  CLEANUP_WT=1
-  say "merging in a throwaway worktree ($MW)"
-fi
-_cleanup() { (( CLEANUP_WT )) && { git -C "$REPO" worktree remove --force "$MW" >/dev/null 2>&1 || rm -rf "$MW"; }; }
-trap _cleanup EXIT
+_co="$(_checkout_for "$TO")" || exit 1
+read -r TO_KIND MW <<<"$_co"
+if [[ "$TO_KIND" != existing ]]; then CLEANUP_TO=1; say "merging in a throwaway worktree ($MW)"
+else say "merging in the existing $TO checkout at $MW"; fi
 
 # Local $TO may be behind origin/$TO — fast-forward it so the merge lands on the real
 # tip, not a stale one. (When local $TO is the more advanced side, $DST *is* it: no-op.)
@@ -259,7 +342,12 @@ if ! _merr="$(git -C "$MW" merge --no-ff --no-edit "$SRC" -m "$MSG" 2>&1 >/dev/n
 fi
 
 # ── post-check: reset and fail rather than leave a bad main ─────────────────
-_revert() { git -C "$MW" reset --hard "$PREMERGE" >/dev/null 2>&1 || true; }
+# Also unwinds the back-merge side (FW/FROMPRE) if that step has already started by
+# the time something fails — a reverted promote must never leave $FROM half-merged.
+_revert() {
+  git -C "$MW" reset --hard "$PREMERGE" >/dev/null 2>&1 || true
+  [[ -n "$FROMPRE" ]] && git -C "$FW" reset --hard "$FROMPRE" >/dev/null 2>&1 || true
+}
 NPARENTS=$(( $(git -C "$MW" rev-list --parents -n1 HEAD | wc -w) - 1 ))
 if (( NPARENTS != 2 )); then
   _revert; die "the promote commit has $NPARENTS parent(s), expected 2 — that is a squash/fast-forward, not a merge. Nothing changed."
@@ -273,6 +361,57 @@ if [[ -n "$INTRODUCED" ]]; then
   die "the merge would introduce commit(s) absent from $FROM — nothing changed: $(tr '\n' ' ' <<<"$INTRODUCED")"
 fi
 say "✓ merged $SRC → $TO as a 2-parent merge ($(git -C "$MW" rev-parse --short HEAD))"
+
+# ── back-merge: carry $TO's new tip straight back into $FROM (GSAI-141, invariant 7) ─
+# Always conflict-free: the merge above introduced zero content $SRC lacked (invariant
+# 2), and $SRC is already an ancestor of $FROM's tip, so three-way-merging $TO's new
+# tip into $FROM is either a fast-forward or a true no-op content merge — never a real
+# conflict. A failure anywhere here is fatal to the WHOLE promote, not a partial
+# success (a promote that moves $TO but leaves $FROM behind just re-introduces
+# GSAI-141 one promote at a time) — so every failure path resets $TO back to
+# PREMERGE via _revert before dying, same as the post-checks above.
+#
+# Deliberately --ff here, NOT --no-ff: $FROM typically hasn't moved since $SRC was
+# read, and $TO's new tip IS a descendant of $FROM's current tip in that case (one of
+# its two parents), so the right outcome is $FROM's ref simply moving to it — zero new
+# commits. Forcing --no-ff here (as the forward merge must, for invariant 1) would
+# mint a brand-new, never-before-seen commit on $FROM on EVERY run, which $TO would
+# then be missing — recreating this exact bug in the opposite direction forever. --ff
+# (not bare `merge`, which some configs override via merge.ff=false) still correctly
+# falls back to a real merge commit on the race-case path, where $FROM has moved on.
+NEWTO="$(git -C "$MW" rev-parse HEAD)"
+_co="$(_checkout_for "$FROM")"; rc=$?
+if (( rc != 0 )); then
+  _revert
+  die "back-merge $TO → $FROM could not start (see above) — $TO was reset, nothing changed"
+fi
+read -r FROM_KIND FW <<<"$_co"
+if [[ "$FROM_KIND" != existing ]]; then CLEANUP_FROM=1; say "back-merging $TO into a throwaway worktree on $FROM ($FW)"
+else say "back-merging $TO into the existing $FROM checkout at $FW"; fi
+
+# $FROM's local tip may be behind origin/$FROM — same staleness story as $TO above.
+if (( ! LOCAL_ONLY )) && (( $(_count "$SRC" "^$FROM") > 0 )); then
+  git -C "$FW" merge --ff-only "$SRC" >/dev/null 2>&1 \
+    || { _revert; die "could not fast-forward $FROM to $SRC in $FW — $TO was reset, nothing changed"; }
+fi
+FROMPRE="$(git -C "$FW" rev-parse HEAD)"
+
+if ! _bmerr="$(git -C "$FW" merge --ff --no-edit "$NEWTO" -m "promote: back-merge $TO → $FROM" 2>&1 >/dev/null)"; then
+  git -C "$FW" merge --abort >/dev/null 2>&1 || true
+  _revert
+  die "back-merge $TO → $FROM conflicted (should be impossible — see GSAI-141 design): ${_bmerr:-conflict}. $TO was reset, nothing changed."
+fi
+
+# mirror of invariant 1/2, run in the other direction.
+if ! git -C "$FW" merge-base --is-ancestor "$NEWTO" HEAD; then
+  _revert; die "back-merge $TO → $FROM did not actually carry $TO forward — $TO was reset, nothing changed."
+fi
+BACK_INTRODUCED="$(git -C "$FW" rev-list --no-merges "$FROMPRE..HEAD" "^$NEWTO" 2>/dev/null || true)"
+if [[ -n "$BACK_INTRODUCED" ]]; then
+  _revert
+  die "back-merge $TO → $FROM would introduce commit(s) absent from $TO — $TO was reset, nothing changed: $(tr '\n' ' ' <<<"$BACK_INTRODUCED")"
+fi
+say "✓ back-merged $TO → $FROM ($(git -C "$FW" rev-parse --short HEAD)) — $FROM will never fall behind $TO from this promote"
 
 # ── publish ─────────────────────────────────────────────────────────────────
 _publish
