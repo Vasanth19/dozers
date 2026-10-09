@@ -391,6 +391,114 @@ else
   else no "UNAUTH reason wrong or leaked the key"; dump "$ART/$ID.fail"; fi
 fi
 
+# ── FACELESS: p-reels-faceless (no avatar) — no heygen: block, never contacted (GSAI-262) ─
+reset_prod; ID=VT-FACELESS; LOG="$TMP/$ID.log"
+cp "$BRAND/.config/brand.yaml" "$TMP/brand.yaml.bak"
+cp "$PROD/brief.md" "$TMP/prod-brief.md.bak"
+cat > "$BRAND/.config/brand.yaml" <<'EOF'
+brandInfo:
+  id: "B-GROWTHGUIDE"
+platforms:
+  enabled: [youtube, instagram, facebook, linkedin, tiktok, twitter, threads, bluesky]
+EOF
+if ! grep -q 'valid_non_default' "$BRAND/.brand/recipe-policy.yaml"; then
+  cat >> "$BRAND/.brand/recipe-policy.yaml" <<'EOF'
+valid_non_default:
+  - p-reels-faceless
+EOF
+fi
+cat > "$PROD/brief.md" <<'EOF'
+# Test reel brief
+Recipe: p-reels-faceless
+**Recipe deviation:** faceless per fixture
+EOF
+STUB_COMPOSE_FACELESS="$TMP/stub-compose-faceless.sh"
+cat > "$STUB_COMPOSE_FACELESS" <<'EOS'
+#!/usr/bin/env bash
+set -e; : > "$COMPOSE_RAN"
+mkdir -p "$(dirname "$OUT_MP4")"
+ffmpeg -y -v error -f lavfi -i "color=c=0x1E293B:s=1080x1920:r=10:d=18" -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+  -map 0:v -map 1:a -c:v libx264 -pix_fmt yuv420p -c:a aac -t 18 "$OUT_MP4"
+ffmpeg -y -v error -ss 1 -i "$OUT_MP4" -frames:v 1 "$OUT_COVER"
+EOS
+chmod +x "$STUB_COMPOSE_FACELESS"
+if env MODEL_RAN="$TMP/$ID.model-ran" COMPOSE_RAN="$TMP/$ID.compose-ran" \
+    REPO_ROOT="$REPO" WORKDIR="$BRAND" DOZER_BRIEF="$(brief "$ID" "$VIDEO_BRIEF")" DOZER_PERSONA="test" \
+    MODEL_CMD="bash $STUB_MODEL" COMPOSE_CMD="bash $STUB_COMPOSE_FACELESS" \
+    HEYGEN_VAULT="$TMP/does-not-exist-faceless.env" HEYGEN_API_BASE="$API" \
+    HEYGEN_MCP_VAULT="$TMP/does-not-exist-faceless-mcp.env" HEYGEN_MCP_URL="$API/mcp/v1/" HEYGEN_MCP_TOKEN_URL="$API/oauth/token" \
+    bash "$CREW" "$ID" "GSAI-262 test brief" >"$LOG" 2>&1; then
+  DRAFT="$BRAND/.dozers-review/$ID.md"
+  if [[ ! -s "$REQLOG" && ! -s "$MCPLOG" ]]; then
+    ok "FACELESS: zero HeyGen contact (REQLOG and MCPLOG both empty)"
+  else no "FACELESS should never contact HeyGen"; dump "$REQLOG"; dump "$MCPLOG"; fi
+  if [[ ! -d "$PROD/heygen" ]]; then
+    ok "FACELESS: \$PROD/heygen/ never created"
+  else no "FACELESS must not create heygen/ (no submission, no raw-avatar.mp4)"; ls -la "$PROD/heygen" >&2; fi
+  if [[ -s "$PROD/final/short.mp4" && -s "$PROD/final/cover.png" ]] && compose_ran "$ID"; then
+    ok "FACELESS: final/short.mp4 + cover.png composed without an avatar"
+  else no "FACELESS compose outputs missing"; dump "$LOG"; fi
+  if has "$DRAFT" "no-avatar" && has "$DRAFT" "p-reels-faceless" && has "$DRAFT" "posts/quick" && has "$DRAFT" "NOT published"; then
+    ok "FACELESS: staged with the no-avatar render line and a valid posts/quick payload"
+  else no "FACELESS draft missing the no-avatar render line"; dump "$DRAFT"; fi
+else no "FACELESS should succeed (this is the GSAI-262 regression check — today it fails demanding an avatar)"; dump "$LOG"; [[ -s "$ART/$ID.fail" ]] && dump "$ART/$ID.fail"; fi
+
+# DRY_RUN sub-case: no COMPOSE_CMD, exercises the synthetic no-avatar placeholder
+reset_prod; ID=VT-FACELESSDRY; LOG="$TMP/$ID.log"
+if env MODEL_RAN="$TMP/$ID.model-ran" COMPOSE_RAN="$TMP/$ID.compose-ran" \
+    REPO_ROOT="$REPO" WORKDIR="$BRAND" DOZER_BRIEF="$(brief "$ID" "$VIDEO_BRIEF")" DOZER_PERSONA="test" \
+    MODEL_CMD="bash $STUB_MODEL" DRY_RUN=1 \
+    HEYGEN_VAULT="$TMP/does-not-exist-faceless.env" HEYGEN_API_BASE="$API" \
+    HEYGEN_MCP_VAULT="$TMP/does-not-exist-faceless-mcp.env" HEYGEN_MCP_URL="$API/mcp/v1/" HEYGEN_MCP_TOKEN_URL="$API/oauth/token" \
+    bash "$CREW" "$ID" "GSAI-262 dry-run test brief" >"$LOG" 2>&1; then
+  if [[ -s "$PROD/final/short.mp4" && -s "$PROD/final/cover.png" ]]; then
+    read -r D_VCODEC D_WH D_DUR D_ACODEC <<<"$(python3 - "$PROD/final/short.mp4" <<'PY'
+import json, subprocess, sys
+out = subprocess.run(["ffprobe","-v","error","-print_format","json","-show_streams","-show_format",sys.argv[1]],capture_output=True,text=True)
+d = json.loads(out.stdout)
+v = next((s for s in d.get("streams", []) if s.get("codec_type")=="video"), None)
+a = next((s for s in d.get("streams", []) if s.get("codec_type")=="audio"), None)
+dur = d.get("format", {}).get("duration") or (v or {}).get("duration") or "0"
+print((v or {}).get("codec_name","-"), f"{(v or {}).get('width','?')}x{(v or {}).get('height','?')}", f"{float(dur):.2f}", (a or {}).get("codec_name","-"))
+PY
+)"
+    if [[ "$D_VCODEC" == "h264" && "$D_WH" == "1080x1920" && "$D_ACODEC" == "aac" ]] \
+       && python3 -c "import sys; sys.exit(0 if float('$D_DUR') >= 18 else 1)"; then
+      ok "FACELESS DRY_RUN: synthetic placeholder passes the ffprobe contract (1080x1920 h264+aac >=18s), no model/COMPOSE_CMD call"
+    else no "FACELESS DRY_RUN placeholder failed the ffprobe contract"; fi
+  else no "FACELESS DRY_RUN produced no final outputs"; dump "$LOG"; fi
+else no "FACELESS DRY_RUN should succeed"; dump "$LOG"; [[ -s "$ART/$ID.fail" ]] && dump "$ART/$ID.fail"; fi
+cp "$TMP/brand.yaml.bak" "$BRAND/.config/brand.yaml"
+cp "$TMP/prod-brief.md.bak" "$PROD/brief.md"
+
+# ── Stretch: p-reels-split (uploaded-footage, also off the allowlist) — no heygen: block ─
+reset_prod; ID=VT-UPLOADED; LOG="$TMP/$ID.log"
+cp "$BRAND/.config/brand.yaml" "$TMP/brand.yaml.bak2"
+cp "$PROD/brief.md" "$TMP/prod-brief.md.bak2"
+cat > "$BRAND/.config/brand.yaml" <<'EOF'
+brandInfo:
+  id: "B-GROWTHGUIDE"
+platforms:
+  enabled: [youtube, instagram, facebook, linkedin, tiktok, twitter, threads, bluesky]
+EOF
+cat > "$PROD/brief.md" <<'EOF'
+# Test reel brief
+Recipe: p-reels-split
+**Recipe deviation:** uploaded footage per fixture
+EOF
+if env MODEL_RAN="$TMP/$ID.model-ran" COMPOSE_RAN="$TMP/$ID.compose-ran" \
+    REPO_ROOT="$REPO" WORKDIR="$BRAND" DOZER_BRIEF="$(brief "$ID" "$VIDEO_BRIEF")" DOZER_PERSONA="test" \
+    MODEL_CMD="bash $STUB_MODEL" COMPOSE_CMD="bash $STUB_COMPOSE_FACELESS" \
+    HEYGEN_VAULT="$TMP/does-not-exist-faceless.env" HEYGEN_API_BASE="$API" \
+    HEYGEN_MCP_VAULT="$TMP/does-not-exist-faceless-mcp.env" HEYGEN_MCP_URL="$API/mcp/v1/" HEYGEN_MCP_TOKEN_URL="$API/oauth/token" \
+    bash "$CREW" "$ID" "GSAI-262 uploaded-footage test brief" >"$LOG" 2>&1; then
+  if [[ ! -s "$REQLOG" && ! -s "$MCPLOG" && ! -d "$PROD/heygen" ]]; then
+    ok "UPLOADED (p-reels-split): off the allowlist too — no HeyGen contact, no heygen/ dir"
+  else no "UPLOADED should never contact HeyGen"; dump "$REQLOG"; dump "$MCPLOG"; fi
+else no "UPLOADED (p-reels-split) should succeed"; dump "$LOG"; [[ -s "$ART/$ID.fail" ]] && dump "$ART/$ID.fail"; fi
+cp "$TMP/brand.yaml.bak2" "$BRAND/.config/brand.yaml"
+cp "$TMP/prod-brief.md.bak2" "$PROD/brief.md"
+
 # ── NOV2: static + guard ──────────────────────────────────────────────────────
 if ! grep -qE 'hg_get "/v2/|api\.heygen\.com/v2' "$VIDEO"; then ok "NOV2: video.sh issues no /v2/ request"
 else no "video.sh contains a /v2/ call"; fi
