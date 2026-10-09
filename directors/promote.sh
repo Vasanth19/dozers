@@ -140,10 +140,24 @@ _checkout_for() {   # _checkout_for <branch>
 # a dangling local ref that looks "ahead" of origin today and genuinely diverges the
 # moment origin moves on before the next promote. A branch that already existed (kind
 # "new") or is still checked out somewhere ("existing") is untouched either way.
+#
+# But deleting it is ONLY safe once its tip is actually on origin — a "newbranch" can
+# be exactly the ref holding this run's back-merge (GSAI-141 review: under --no-push,
+# or with no origin at all, a freshly-DWIM'd develop carries the back-merge commit and
+# nothing else points at it). So: delete only when origin/<branch> exists AND already
+# contains this branch's tip (i.e. the branch has nothing origin lacks). Otherwise
+# leave it as a stray local ref — same as the pre-GSAI-141 behavior — rather than
+# silently discarding commits that were never published.
 _forget_if_new() {   # _forget_if_new <branch> <kind> <worktree-path>
   local br="$1" kind="$2" wt="$3"
   git -C "$REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
-  [[ "$kind" == newbranch ]] && git -C "$REPO" branch -D "$br" >/dev/null 2>&1 || true
+  [[ "$kind" == newbranch ]] || return 0
+  if (( HAS_ORIGIN )) && _has "refs/remotes/origin/$br" \
+     && git -C "$REPO" merge-base --is-ancestor "refs/heads/$br" "refs/remotes/origin/$br" 2>/dev/null; then
+    git -C "$REPO" branch -D "$br" >/dev/null 2>&1 || true
+  else
+    say "· leaving $br as a local ref — it was minted fresh this run and isn't published to origin yet; publish or delete it by hand"
+  fi
 }
 # Both worktrees this script may open, cleaned up unconditionally on exit — set once
 # here so the trap is safe no matter which code path (self-heal, back-merge, neither)

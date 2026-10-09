@@ -191,11 +191,17 @@ out="$(run "$d" --no-push)"; rc=$?
 (( rc == 0 )) && [[ "$(git -C "$d/origin.git" rev-parse develop)" == "$odev_before" ]] \
   && ok "--no-push: develop is not published either" || bad "--no-push: exit $rc, origin/develop moved — $out"
 
-# ── 6d. an unpushed EARLIER promote on local main is resumable, not divergence ─
-# Its extra commits are a merge plus develop's own work — nothing main-only. Promote on.
+# ── 6d. an unpushed EARLIER promote is resumable, not divergence ───────────
+# Its extra commits are the earlier --no-push merge (develop→main) plus its GSAI-141
+# back-merge (main→develop), both still unpublished, plus new work layered on top of
+# that SAME local develop afterward (exactly how the Dozer actually continues — in the
+# repo promote.sh ran in, never a separate checkout) — nothing that conflicts with
+# origin. The second, real promote must finish and publish cleanly, not see divergence.
 d="$(fixture unpushedpromote)"; on_develop "$d" "feature-one"
 "$PROMOTE" "$d/clone" --no-push >/dev/null 2>&1
-on_develop "$d" "feature-two"
+git -C "$d/clone" checkout -q develop
+echo "feature-two" >> "$d/clone/app.txt"; git -C "$d/clone" add -A && git -C "$d/clone" commit -qm "feature-two"
+git -C "$d/clone" checkout -q main
 out="$(run "$d")"; rc=$?
 (( rc == 0 )) && [[ "$(gap "$d")" == "0" ]] && ok "unpushed earlier promote: resumes and promotes" \
   || bad "unpushed earlier promote: exit $rc, gap $(gap "$d") — $out"
@@ -377,6 +383,27 @@ out="$(run "$d" --dry-run)"; rc=$?
 [[ -z "$(git -C "$d/clone" worktree list --porcelain | awk '/^worktree /{print $2}' | tail -n +2)" ]] \
   && ok "healdrift --check/--dry-run: no stray worktrees left behind" \
   || bad "healdrift: stray worktree left behind: $(git -C "$d/clone" worktree list)"
+
+# ── 18. GSAI-141 regression: --no-push + develop newly DWIM'd from origin/develop ──
+# (review FAIL on the previous build) must not have its back-merge deleted on cleanup.
+# fixture() clones only ever check out main — develop exists solely as origin/develop
+# until _checkout_for mints a local branch for it — so this is the exact shape
+# _forget_if_new's `branch -D` must not destroy under --no-push.
+d="$(fixture nopush_newbranch)"; on_develop "$d" "feature-one"
+[[ -z "$(git -C "$d/clone" branch --list develop)" ]] \
+  && ok "nopush_newbranch: fixture has no local develop branch yet" \
+  || bad "nopush_newbranch: fixture already has a local develop branch — fixture assumption broken"
+out="$(run "$d" --no-push)"; rc=$?
+(( rc == 0 )) && ok "nopush_newbranch: promote exits 0" || bad "nopush_newbranch: exit $rc — $out"
+[[ -n "$(git -C "$d/clone" branch --list develop)" ]] \
+  && ok "nopush_newbranch: local develop branch survives cleanup" \
+  || bad "nopush_newbranch: local develop branch was deleted — the back-merge is gone (GSAI-141 regression)"
+[[ "$(git -C "$d/clone" rev-list --count develop..main)" == "0" ]] \
+  && ok "nopush_newbranch: local develop..main empty — back-merge actually landed" \
+  || bad "nopush_newbranch: local develop still missing main's tip"
+git -C "$d/clone" merge-base --is-ancestor main develop \
+  && ok "nopush_newbranch: local main is an ancestor of local develop" \
+  || bad "nopush_newbranch: main is not an ancestor of develop locally"
 
 out="$("$PROMOTE" "$TMP/nope-not-a-repo-or-id" 2>&1)"; rc=$?
 (( rc == 1 )) && ok "unknown repo id: refused (never guesses a repo)" || bad "unknown repo id: exit $rc — $out"
