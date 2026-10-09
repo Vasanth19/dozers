@@ -1,25 +1,38 @@
 #!/usr/bin/env bash
-# dozers/mktg-lane/video.sh — the HeyGen VIDEO branch of the marketing lane (GSAI-7).
+# dozers/mktg-lane/video.sh — the VIDEO branch of the marketing lane (GSAI-7).
 #
 # crew.sh hands a brief here when its description carries a `production:` line that
 # points at a `<brand>/creatives/productions/<MM.DD-slug>/` folder. Everything else
 # stays on crew.sh's copy path, untouched.
 #
+# Two shapes share this file, branched on the resolved recipe (GSAI-262):
+#   - AVATAR-WRAPPER recipes (an explicit allowlist, e.g. the brand-default
+#     p-reels-split-heygen) consume a single pre-rendered HeyGen talking-head clip.
+#     These run Phase 1 SUBMIT + the stale gate + Phase 2 DOWNLOAD below, then hand
+#     heygen/raw-avatar.mp4 to compose.
+#   - Every other recipe — uploaded-footage wrappers (p-reels-split/pip/spotlight),
+#     faceless TTS-only recipes (p-reels-faceless), or a recipe that makes its own
+#     provider calls inside compose (p-reels-alternating, 3x HeyGen via c-heygen) —
+#     skips Phase 1/2 entirely: no HeyGen vault read, no submission, no download.
+# Phase 3 COMPOSE and Phase 4 STAGE are recipe-driven throughout and run for both.
+#
 # Pipeline — the automatable spine, with the rest gated (spec: GSAI-7, craft: brain
 # `vasanth-hq/sops/content-production-pipeline.md`):
 #
-#   Phase 1  SUBMIT   — automated (GSAI-233). No usable render (none found, or the found
-#                       one is stale/failed/rejected/cancelled) -> the crew submits itself
-#                       via HeyGen's Remote MCP (OAuth, web-plan credits) — never the
-#                       api-key pool, never a raw REST generate/submit endpoint. Ends the
-#                       run with "processing"; the next greenlight downloads it once done.
-#   Gate     STALE    — the script is hashed and compared to the render's record (and
-#                       the script mtime to renderedAt). A render older than its script
-#                       is stale: auto_submit() resubmits it (GSAI-233), no compose,
-#                       no stage this run.
-#   Phase 2  DOWNLOAD — /v1/video_status.get -> signed video_url -> heygen/raw-avatar.mp4,
-#                       ffprobe-asserted (h264, 1080x1920, duration ±1s of the estimate).
-#                       Record refreshed in heygen/heygen-submission.json.
+#   Phase 1  SUBMIT   — (avatar-wrapper recipes only) automated (GSAI-233). No usable
+#                       render (none found, or the found one is stale/failed/rejected/
+#                       cancelled) -> the crew submits itself via HeyGen's Remote MCP
+#                       (OAuth, web-plan credits) — never the api-key pool, never a raw
+#                       REST generate/submit endpoint. Ends the run with "processing";
+#                       the next greenlight downloads it once done.
+#   Gate     STALE    — (avatar-wrapper recipes only) the script is hashed and compared
+#                       to the render's record (and the script mtime to renderedAt). A
+#                       render older than its script is stale: auto_submit() resubmits
+#                       it (GSAI-233), no compose, no stage this run.
+#   Phase 2  DOWNLOAD — (avatar-wrapper recipes only) /v1/video_status.get -> signed
+#                       video_url -> heygen/raw-avatar.mp4, ffprobe-asserted (h264,
+#                       1080x1920, duration ±1s of the estimate). Record refreshed in
+#                       heygen/heygen-submission.json.
 #   Phase 3  COMPOSE  — the brand's CURRENT recipe (.brand/recipe-policy.yaml `default:`,
 #                       or the brief's justified `Recipe:` line) -> final/short.mp4 +
 #                       final/cover.png, ffprobe-asserted (1080x1920, h264+aac, >=18s).
@@ -168,6 +181,52 @@ for cand in "$BRAND_DIR/.claude/skills/$RECIPE" "$RECIPE_SKILLS_DIR/$RECIPE"; do
 done
 log "recipe: $RECIPE ${RECIPE_DIR:+($RECIPE_DIR)}"
 
+# ── Avatar-recipe allowlist (GSAI-262) ─────────────────────────────────────────────
+# Recipes whose compose step consumes a SINGLE pre-rendered heygen/raw-avatar.mp4 —
+# the exact shape Phase 1 (SUBMIT) + Phase 2 (DOWNLOAD) below produce. Every other
+# recipe either uses footage already on disk (uploaded talking-head recipes) or does
+# its own provider calls inside compose (e.g. p-reels-alternating's 3-segment HeyGen
+# calls via c-heygen) — forcing those through this single-avatar pipeline is wrong,
+# not a fallback. New avatar-wrapper recipes must be added here explicitly; an
+# unlisted recipe skips straight to compose and lets its own SKILL.md decide what it
+# needs (fail fast there, in a recipe-specific error, rather than here in a generic
+# HeyGen one).
+HEYGEN_AVATAR_RECIPES="${DOZER_HEYGEN_AVATAR_RECIPES:-p-reels-split-heygen p-reels-pip-heygen p-reels-spotlight-heygen}"
+NEEDS_AVATAR=0
+for _r in $HEYGEN_AVATAR_RECIPES; do [[ "$RECIPE" == "$_r" ]] && { NEEDS_AVATAR=1; break; }; done
+log "avatar pipeline: $([[ $NEEDS_AVATAR == 1 ]] && echo "yes (HeyGen single-avatar)" || echo "no (recipe composes its own)")"
+
+# Populated only on the avatar-wrapper path (NEEDS_AVATAR=1), below. A no-avatar
+# recipe leaves these empty — Phase 3/4 branch on NEEDS_AVATAR, never on these being set.
+RAW=""; RAW_WH=""; RAW_DUR=""; AVATAR_ID=""; VOICE_ID=""; MOTION=""; CREDITS=""
+RENDERED_ISO=""; VIDEO_ID=""; WANT_TITLE=""; SUB=""
+
+# probe <file> -> "vcodec WxH duration acodec" (acodec '-' when no audio stream). Used
+# by both branches: the downloaded raw avatar (avatar-wrapper path) and the composed
+# final/short.mp4 + cover.png (every path) — defined once, unconditionally.
+probe() {
+  python3 - "$1" <<'PY'
+import json, subprocess, sys
+out = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", sys.argv[1]],
+                     capture_output=True, text=True)
+if out.returncode != 0: print("ERR - - -"); sys.exit(0)
+d = json.loads(out.stdout)
+v = next((s for s in d.get("streams", []) if s.get("codec_type") == "video"), None)
+a = next((s for s in d.get("streams", []) if s.get("codec_type") == "audio"), None)
+dur = d.get("format", {}).get("duration") or (v or {}).get("duration") or "0"
+print((v or {}).get("codec_name", "-"), f"{(v or {}).get('width','?')}x{(v or {}).get('height','?')}", f"{float(dur):.2f}", (a or {}).get("codec_name", "-"))
+PY
+}
+
+# Scratch dir for the lifetime of the run — shared by HeyGen's REST helpers (avatar
+# path) and Phase 4's caption/payload JSON (every path), so it's created unconditionally.
+HG_TMP="$(mktemp -d)"; trap 'rm -rf "$HG_TMP"' EXIT
+# Brand config path — read by Phase 4's platform-exclusion logic for every recipe,
+# avatar-wrapper or not.
+BRAND_YAML="$BRAND_DIR/.config/brand.yaml"
+
+if [[ "$NEEDS_AVATAR" == "1" ]]; then
+
 # ── HeyGen key: vault-first, fail fast, never printed ─────────────────────────────
 [[ -f "$HEYGEN_VAULT" ]] || fail "HeyGen key file missing: $HEYGEN_VAULT — HEYGEN_API_KEY must live in the vault (~/ecosystem/vault/secrets.env); ~/.gsai/secrets.env is gone"
 HEYGEN_API_KEY="$(grep -E '^(export[[:space:]]+)?HEYGEN_API_KEY=' "$HEYGEN_VAULT" | head -1 | sed 's/^export[[:space:]]*//; s/^HEYGEN_API_KEY=//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//')"
@@ -175,7 +234,6 @@ HEYGEN_API_KEY="$(grep -E '^(export[[:space:]]+)?HEYGEN_API_KEY=' "$HEYGEN_VAULT
 
 # hg_get <path?query> -> body on stdout. Refuses /v2/ (sunset 2026-10-31) and any
 # generate/submit path (the crew never spends credits). Auth failures name the vault.
-HG_TMP="$(mktemp -d)"; trap 'rm -rf "$HG_TMP"' EXIT
 hg_get() {
   local path="$1" body="$HG_TMP/resp.json" http
   case "$path" in
@@ -485,20 +543,6 @@ else
   log "download: → heygen/raw-avatar.mp4 ($(du -h "$RAW" | cut -f1))"
 fi
 
-# probe <file> -> "vcodec WxH duration acodec" (acodec '-' when no audio stream)
-probe() {
-  python3 - "$1" <<'PY'
-import json, subprocess, sys
-out = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", sys.argv[1]],
-                     capture_output=True, text=True)
-if out.returncode != 0: print("ERR - - -"); sys.exit(0)
-d = json.loads(out.stdout)
-v = next((s for s in d.get("streams", []) if s.get("codec_type") == "video"), None)
-a = next((s for s in d.get("streams", []) if s.get("codec_type") == "audio"), None)
-dur = d.get("format", {}).get("duration") or (v or {}).get("duration") or "0"
-print((v or {}).get("codec_name", "-"), f"{(v or {}).get('width','?')}x{(v or {}).get('height','?')}", f"{float(dur):.2f}", (a or {}).get("codec_name", "-"))
-PY
-}
 read -r RAW_VCODEC RAW_WH RAW_DUR RAW_ACODEC <<<"$(probe "$RAW")"
 [[ "$RAW_VCODEC" != "ERR" ]] || fail "ffprobe cannot read the downloaded render $RAW"
 [[ "$RAW_VCODEC" == "h264" ]] || fail "render $VIDEO_ID is $RAW_VCODEC, expected h264 — the submission was misconfigured"
@@ -513,7 +557,6 @@ log "assert: h264 $RAW_WH ${RAW_DUR}s (estimate ${EXPECT_DUR}s) ✓"
 # Refresh the record (audit trail for cost + reproducibility). Merges into what exists.
 # write_record + resolve_avatar_voice are defined above, near the SUB path (auto_submit
 # needs them earlier than this Phase 2 step does).
-BRAND_YAML="$BRAND_DIR/.config/brand.yaml"
 read -r AVATAR_ID VOICE_ID <<<"$(resolve_avatar_voice)"
 MOTION="$(sub_get motionEngine)"; MOTION="${MOTION:-Avatar III}"
 CREDITS="$(sub_get creditsCost)"; CREDITS="${CREDITS:-2}"
@@ -523,6 +566,8 @@ write_record "issue=$ID" "production=$SLUG" "videoId=$VIDEO_ID" "title=$WANT_TIT
   "scriptSource=$SCRIPT_REL" "scriptSha256=$SCRIPT_SHA" "durationSeconds=json:$RAW_DUR" \
   "downloadedAt=$(date -u +%FT%TZ)" "downloadedBy=dozer mktg-lane/video.sh"
 log "record: $SUB refreshed (status=downloaded)"
+
+fi  # NEEDS_AVATAR
 
 # ── Phase 3 — COMPOSE with the brand's recipe ─────────────────────────────────────
 FINAL_DIR="$PROD_DIR/final"; mkdir -p "$FINAL_DIR"
@@ -535,18 +580,28 @@ if [[ -n "${COMPOSE_CMD:-}" ]]; then
   fi
   COMPOSED_VIA="COMPOSE_CMD"
 elif [[ "${DRY_RUN:-}" == "1" ]]; then
-  # No model: pass the avatar through so the output contract is still exercised.
-  if [[ "$RAW_ACODEC" == "-" ]]; then
-    ffmpeg -y -v error -i "$RAW" -f lavfi -i anullsrc=r=48000:cl=stereo -map 0:v -map 1:a -c:v copy -c:a aac -shortest "$SHORT" || fail "dry-run compose failed"
+  if [[ "$NEEDS_AVATAR" == "1" ]]; then
+    # No model: pass the avatar through so the output contract is still exercised.
+    if [[ "$RAW_ACODEC" == "-" ]]; then
+      ffmpeg -y -v error -i "$RAW" -f lavfi -i anullsrc=r=48000:cl=stereo -map 0:v -map 1:a -c:v copy -c:a aac -shortest "$SHORT" || fail "dry-run compose failed"
+    else
+      ffmpeg -y -v error -i "$RAW" -c:v copy -c:a aac "$SHORT" || fail "dry-run compose failed"
+    fi
+    COMPOSED_VIA="dry-run passthrough"
   else
-    ffmpeg -y -v error -i "$RAW" -c:v copy -c:a aac "$SHORT" || fail "dry-run compose failed"
+    # No avatar, no model: synthesize a placeholder so the output contract (1080x1920
+    # h264+aac >= FINAL_MIN_S) is still exercised without a real TTS/model call.
+    ffmpeg -y -v error -f lavfi -i "color=c=black:s=1080x1920:r=30:d=$FINAL_MIN_S" \
+      -f lavfi -i "anullsrc=r=48000:cl=stereo" -t "$FINAL_MIN_S" \
+      -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$SHORT" || fail "dry-run no-avatar compose failed"
+    COMPOSED_VIA="dry-run synthetic placeholder (no-avatar recipe $RECIPE)"
   fi
   ffmpeg -y -v error -ss 1 -i "$SHORT" -frames:v 1 "$COVER" || fail "dry-run cover extraction failed"
-  COMPOSED_VIA="dry-run passthrough"
 else
   [[ -n "$RECIPE_DIR" ]] || fail "recipe '$RECIPE' has no SKILL.md under $BRAND_DIR/.claude/skills or $RECIPE_SKILLS_DIR — cannot compose"
   [[ -n "${MODEL_CMD:-}" ]] || fail "no MODEL_CMD for the compose step (model routing did not run)"
-  read -r -d '' PROMPT <<EOF || true
+  if [[ "$NEEDS_AVATAR" == "1" ]]; then
+    read -r -d '' PROMPT <<EOF || true
 You are the Mktg-Dozer COMPOSE step for a short-form video. Work only inside this production folder: $PROD_DIR
 Recipe to follow exactly: $RECIPE — read $RECIPE_DIR/SKILL.md first and follow its compositing steps.
 Brand folder (voice, palette, templates, config): $BRAND_DIR
@@ -559,6 +614,22 @@ Required outputs (nothing else is checked):
   - final/cover.png — the cover frame
 Do NOT publish, schedule, or upload anything anywhere. Do not touch files outside this production folder except the recipe's own scratch dirs. When both outputs exist, stop.
 EOF
+  else
+    read -r -d '' PROMPT <<EOF || true
+You are the Mktg-Dozer COMPOSE step for a short-form video. Work only inside this production folder: $PROD_DIR
+Recipe to follow exactly: $RECIPE — read $RECIPE_DIR/SKILL.md first and follow its compositing steps.
+Brand folder (voice, palette, templates, config): $BRAND_DIR
+This is a from-scratch render — there is no pre-rendered talking-head clip. Build the
+full visual track and audio per the recipe's own SKILL.md (its own TTS provider and/or
+motion-graphics/b-roll steps), starting from:
+  - script: $SCRIPT_REL (the known transcript)
+  - brief: brief.md (if present)
+Required outputs (nothing else is checked):
+  - final/short.mp4 — 1080x1920, h264 video + aac audio, at least ${FINAL_MIN_S}s
+  - final/cover.png — the cover frame
+Do NOT publish, schedule, or upload anything anywhere. Do not touch files outside this production folder except the recipe's own scratch dirs. When both outputs exist, stop.
+EOF
+  fi
   if ! timebox "$T_MODEL" "compose model run" "$PROD_DIR" "$MODEL_CMD \"\$PROMPT\""; then
     (( TIMEBOX_HIT )) && fail "compose model run timed out after ${T_MODEL}s (DOZER_TIMEOUT_MODEL / timeout_model in org/config.yaml) — killed its process group; recipe $RECIPE"
     fail "compose model run failed for recipe $RECIPE"
@@ -575,7 +646,7 @@ python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) e
   || fail "final/short.mp4 runs ${F_DUR}s, below the ${FINAL_MIN_S}s minimum"
 read -r C_CODEC _ _ _ <<<"$(probe "$COVER")"
 [[ "$C_CODEC" == "png" ]] || fail "final/cover.png is not a PNG (ffprobe says: $C_CODEC)"
-write_record "status=composed" "recipe=$RECIPE" "finalPath=final/short.mp4" "coverPath=final/cover.png" "composedAt=$(date -u +%FT%TZ)"
+[[ "$NEEDS_AVATAR" == "1" ]] && write_record "status=composed" "recipe=$RECIPE" "finalPath=final/short.mp4" "coverPath=final/cover.png" "composedAt=$(date -u +%FT%TZ)"
 log "compose: final/short.mp4 $F_WH ${F_DUR}s h264+aac, final/cover.png ✓ ($COMPOSED_VIA)"
 
 # ── Phase 4 — STAGE. Never publish. ───────────────────────────────────────────────
@@ -647,6 +718,12 @@ PY
 )"
 [[ "$PLATFORM_NOTE" == ERR* ]] && fail "${PLATFORM_NOTE#ERR }"
 
+if [[ "$NEEDS_AVATAR" == "1" ]]; then
+  RENDER_LINE="\"$WANT_TITLE\" · $VIDEO_ID · $RENDERED_ISO · $MOTION · $CREDITS credits · script sha256 ${SCRIPT_SHA:0:12}…"
+else
+  RENDER_LINE="no-avatar (recipe $RECIPE, composed via $COMPOSED_VIA) · script sha256 ${SCRIPT_SHA:0:12}…"
+fi
+
 REVIEW_DIR="$WORKDIR/.dozers-review"; mkdir -p "$REVIEW_DIR"
 DRAFT="$REVIEW_DIR/$ID.md"
 {
@@ -657,7 +734,7 @@ production: $PROD_DIR
 recipe: $RECIPE
 final: $SHORT  ($F_WH, ${F_DUR}s, h264+aac)
 cover: $COVER
-render: "$WANT_TITLE" · $VIDEO_ID · $RENDERED_ISO · $MOTION · $CREDITS credits · script sha256 ${SCRIPT_SHA:0:12}…
+render: $RENDER_LINE
 captions: $CAPTION_SRC
 $PLATFORM_NOTE
 status: NEEDS REVIEW — NOT published; nothing publishes until a human approves
@@ -680,7 +757,7 @@ $(cat "$PAYLOAD")
 \`\`\`
 EOF
 } > "$DRAFT"
-write_record "status=staged" "stagedAt=$(date -u +%FT%TZ)" "reviewDraft=$DRAFT"
+[[ "$NEEDS_AVATAR" == "1" ]] && write_record "status=staged" "stagedAt=$(date -u +%FT%TZ)" "reviewDraft=$DRAFT"
 log "staged for approval: $DRAFT  (NOT published)"
 
 cat > "$OUT/$ID.md" <<EOF
