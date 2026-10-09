@@ -38,6 +38,10 @@
 #   (e.g. the main checkout sits on develop) the merge happens IN that checkout when
 #   it's clean; a dirty checkout fails fast. Otherwise a throwaway merge worktree.
 #   On failure the reason lands in .artifacts/dev/<id>.fail for the block comment.
+#   Host-checkout hygiene (GSAI-257): "clean" alone is not enough for a live, human-used
+#   checkout — host_checkout_hygiene also fails closed on an unreadable git state, a
+#   mid-rebase/mid-cherry-pick/mid-bisect operation, and untracked debris outside the
+#   shared DEP_PATHSPEC allowlist, before the merge + green-gate ever runs in that tree.
 #
 # Test gate (GSAI-27): NO detectable test command is a hard STOP, not a shrug.
 #   Opt out per repo only — .dozers-no-test-gate marker, `no_test_gate: true` in the
@@ -357,6 +361,18 @@ test_gate_waiver() {  # $1 = dir → echoes WHY the gate is off for this repo, e
   return 1
 }
 
+# hygiene_gate_waiver — GSAI-257, same shape as test_gate_waiver: $1 = dir → echoes WHY
+# the host-checkout hygiene preflight is off for this repo/run, else returns 1.
+hygiene_gate_waiver() {  # $1 = dir → echoes WHY the gate is off for this checkout, else 1
+  local d="$1" flag
+  [[ "${HYGIENE_GATE:-on}" == "off" ]] && { echo "HYGIENE_GATE=off for this run"; return 0; }
+  [[ -f "$WORKDIR/.dozers-no-hygiene-gate" || -f "$d/.dozers-no-hygiene-gate" ]] \
+    && { echo ".dozers-no-hygiene-gate marker in the repo"; return 0; }
+  flag="$(ecosystem_flag no_hygiene_gate "$WORKDIR")"
+  [[ "$flag" == "true" ]] && { echo "no_hygiene_gate: true in ecosystem.yaml"; return 0; }
+  return 1
+}
+
 # Sets $TEST_CMD for a dir, or explains why there is nothing to run. Returns 1 when
 # the gate is ungated AND unwaived, so callers that must clean up first (the
 # green-gate has already merged) can revert before failing; $NO_TEST_MSG holds the
@@ -446,6 +462,69 @@ migration_gate() {  # $1 = worktree dir, $2 = compare base (integration branch)
   rm -f "$_log_file"
   fail "schema change with no matching migration (LL-31 guardrail) — add a migration (or [skip-migration] if none is needed); worktree kept, sent back
 $schema_hits"
+}
+
+# host_checkout_hygiene <dir> — GSAI-257: the "merge in the existing checkout" path
+# (a human-used checkout the integration branch happens to already be on — GSAI-26)
+# needs more than a dirty check. Runs four checks IN ORDER, fails closed and NAMES the
+# first problem found — same doctrine as migration_gate/gate_read above: a gate that
+# cannot see the tree must stop, never wave the change through.
+#
+#   1. Git-dir sanity — can this checkout's git state even be read?
+#   2. In-progress operation — the SAME markers wip_snapshot already checks for the
+#      task worktree (crew.sh ~669: rebase-merge, rebase-apply, MERGE_HEAD), plus
+#      CHERRY_PICK_HEAD and BISECT_LOG. A paused rebase/cherry-pick can have an
+#      otherwise clean tree, which is exactly why a dirty check alone misses it.
+#   3. Tracked dirtiness — the ORIGINAL check, message text unchanged (so
+#      tests/dev-lane-merge-target-test.sh needs no edits), but its `git status`
+#      stderr is now captured instead of thrown to /dev/null: a failing read is a
+#      named hygiene failure, never a silent "clean".
+#   4. Untracked debris, allowlisted — reuses DEP_PATHSPEC (the exact pathspec
+#      wt_unsaved already builds: node_modules, .env*, pass artifacts), so the
+#      GSAI-26/GSAI-124 node_modules story stays benign; anything else untracked is
+#      unexpected and must not ride into the green-gate's test run.
+#
+# Escape hatch (checked FIRST, skips all four checks when it fires, same shape as
+# test_gate_waiver): HYGIENE_GATE=off, a .dozers-no-hygiene-gate marker, or
+# no_hygiene_gate: true on the repo's ecosystem.yaml entry.
+#
+# Calls `fail` directly (never returns to the caller) — at this call site nothing has
+# been touched yet (no merge, no deps install), so there is no state to unwind first.
+host_checkout_hygiene() {  # $1 = dir
+  local d="$1" why gd out
+  if why="$(hygiene_gate_waiver "$d")"; then
+    echo "    [dev] ⚠ host checkout hygiene: skipped for $d — gate waived ($why)"
+    return 0
+  fi
+  # 1. Git-dir sanity — captured, not discarded.
+  if ! gd="$(git -C "$d" rev-parse --absolute-git-dir 2>&1)"; then
+    fail "integration branch $INTEG is checked out at $d but its git state could not be read — $gd; cannot verify it is safe to merge/test in"
+  fi
+  # 2. In-progress operation.
+  if   [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]; then
+    fail "integration branch $INTEG is checked out at $d but it is mid-rebase; cannot merge — finish or abort the rebase there, then re-greenlight"
+  elif [[ -f "$gd/MERGE_HEAD" ]]; then
+    fail "integration branch $INTEG is checked out at $d but it is mid-merge; cannot merge — finish or abort the merge there, then re-greenlight"
+  elif [[ -f "$gd/CHERRY_PICK_HEAD" ]]; then
+    fail "integration branch $INTEG is checked out at $d but it is mid-cherry-pick; cannot merge — finish or abort the cherry-pick there, then re-greenlight"
+  elif [[ -f "$gd/BISECT_LOG" ]]; then
+    fail "integration branch $INTEG is checked out at $d but it is mid-bisect; cannot merge — finish or reset the bisect there, then re-greenlight"
+  fi
+  # 3. Tracked dirtiness — unchanged failure text; stderr captured instead of discarded.
+  if ! out="$(git -C "$d" status --porcelain --untracked-files=no 2>&1)"; then
+    fail "integration branch $INTEG is checked out at $d but its status could not be read — $out; cannot verify it is clean"
+  fi
+  if [[ -n "$out" ]]; then
+    fail "integration branch $INTEG is checked out dirty at $d; cannot merge — commit or stash there, then re-greenlight"
+  fi
+  # 4. Untracked debris, allowlisted via the shared DEP_PATHSPEC.
+  if ! out="$(git -C "$d" status --porcelain --untracked-files=normal -- . "${DEP_PATHSPEC[@]}" 2>&1)"; then
+    fail "integration branch $INTEG is checked out at $d but its status could not be read — $out; cannot verify it is clean"
+  fi
+  if [[ -n "$out" ]]; then
+    fail "integration branch $INTEG is checked out at $d with unexpected untracked files; cannot merge — clean them up there, then re-greenlight:
+$out"
+  fi
 }
 
 cd "$WORKDIR" 2>/dev/null || fail "workdir missing: $WORKDIR"
@@ -1296,9 +1375,7 @@ git worktree prune >/dev/null 2>&1 || true
 _integ_at="$(git worktree list --porcelain 2>/dev/null \
   | awk -v b="branch refs/heads/$INTEG" '/^worktree /{p=substr($0,10)} $0==b{print p; exit}')"
 if [[ -n "$_integ_at" && "$(cd "$_integ_at" 2>/dev/null && pwd -P)" != "$(cd "$MW" 2>/dev/null && pwd -P)" ]]; then
-  if [[ -n "$(git -C "$_integ_at" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
-    fail "integration branch $INTEG is checked out dirty at $_integ_at; cannot merge — commit or stash there, then re-greenlight"
-  fi
+  host_checkout_hygiene "$_integ_at"
   MW="$_integ_at"; MW_OWNED=0
   echo "    [dev] $INTEG is checked out at $MW (clean) — merging there"
 else
