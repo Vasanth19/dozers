@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# tests/dev-lane-deps-drift-test.sh — regression test for GSAI-254.
+# tests/dev-lane-deps-drift-test.sh — regression test for GSAI-254 (and GSAI-261's
+# switch from a symlinked node_modules to a cloned one — see the probe below).
 #
-# link_deps symlinks the host checkout's node_modules into every task and merge
-# worktree, and install_deps used to return early on ANY node_modules entry. So the
-# host's node_modules — which belongs to whatever branch the host sits on — suppressed
+# link_deps clones the host checkout's node_modules into every task and merge
+# worktree (GSAI-261: a symlink resolves back to the host's real path, which
+# Turbopack and friends reject as outside the worktree's project root), and
+# install_deps used to return early on ANY node_modules entry. So the host's
+# node_modules — which belongs to whatever branch the host sits on — suppressed
 # the install for good. A dependency added on the integration branch could never be
 # installed into a worktree: `Cannot find module 'heic-convert'` on every dev task.
 #
 # The install decision now follows drift between the worktree's install inputs
-# (package.json + lockfiles) and $WORKDIR's. A live, unchanged link is still the fast
-# path, a drifted or dangling link is removed in the worktree only and reinstalled, and
-# a real worktree dir is re-installed only when its stamp says its inputs changed.
+# (package.json + lockfiles) and $WORKDIR's. An unchanged clone is still the fast
+# path (drift is checked BEFORE cloning too, so already-stale inputs skip the clone
+# rather than cloning stale bytes just to invalidate them), and a real worktree dir
+# (cloned or installed) is re-installed only when its stamp says its inputs changed.
 #
 # Hermetic: a fake `npm` on PATH stands in for the real one. `npm ci` provisions
 # node_modules and writes node_modules/heic-convert.marker only when the lockfile names
@@ -73,6 +77,8 @@ cat > "$STUB_TOUCH" <<'EOS'
 {
   [[ -L node_modules ]] && echo "wt-nm-link -> $(readlink node_modules)"
   [[ -d node_modules && ! -L node_modules ]] && echo "wt-nm-dir"
+  [[ ! -e node_modules ]] && echo "wt-nm-absent"
+  [[ -f node_modules/.dozer-deps-stamp ]] && echo "wt-nm-stamp $(cat node_modules/.dozer-deps-stamp)"
 } > "$PROBE"
 printf 'dozer change\n' >> feature.txt
 git add -A && git commit -q -m "stub agent: touch feature"
@@ -120,8 +126,8 @@ grep -q 'TEST-GDD1' "$NPM1" && grep -q -- '-TEST-GDD1' "$NPM1" && ok "npm ci ran
   || no "no npm ci in the task worktree (npm log: $(cat "$NPM1"))"
 grep -q -- '-merge' "$NPM1" && ok "npm ci ran in the merge worktree too (post-merge tree)" \
   || no "no npm ci in the merge worktree"
-grep -q 'node_modules differs from' "$TMP/crew1.log" && ok "drift named in the log" \
-  || no "no drift line in the log"
+grep -q 'node_modules missing' "$TMP/crew1.log" && ok "the already-drifted clone was skipped and reported as missing" \
+  || no "no 'node_modules missing' line in the log"
 
 # ── 3. isolation: the host's node_modules is never written through a link ─────
 [[ "$(tree_sum "$P1" node_modules)" == "$HOST1_BEFORE" ]] && ok "host node_modules tree is byte-identical after the run" \
@@ -141,10 +147,12 @@ run_crew "$P2" TEST-GDD2 "$TMP/crew2.log" "$NPM2" || rc=$?
 
 [[ $rc -eq 0 ]] && ok "crew exited clean on the shared lockfile" \
   || { no "crew exited $rc"; sed 's/^/    | /' "$TMP/crew2.log" >&2; }
-grep -q 'wt-nm-link -> '"$P2"'/node_modules' "$TMP/probe-TEST-GDD2" && ok "node_modules is still a symlink to the host at agent time" \
+grep -qx 'wt-nm-dir' "$TMP/probe-TEST-GDD2" && ok "node_modules is a real dir (cloned from the host) at agent time" \
   || no "fast path broke: $(cat "$TMP/probe-TEST-GDD2" 2>/dev/null)"
+grep -q '^wt-nm-stamp' "$TMP/probe-TEST-GDD2" && ok "the clone carries a deps stamp" \
+  || no "no .dozer-deps-stamp on the clone: $(cat "$TMP/probe-TEST-GDD2" 2>/dev/null)"
 [[ ! -s "$NPM2" ]] && ok "no npm ci/install ran" || no "npm ran on the fast path: $(cat "$NPM2")"
-grep -qE 'node_modules (missing|differs|is a dangling|changed)|unlinked nested' "$TMP/crew2.log" \
+grep -qE 'node_modules (missing|differs|is a dangling|changed)|unlinked nested|removed nested' "$TMP/crew2.log" \
   && no "fast path logged a deps decision" || ok "fast path logged nothing new"
 
 # ── 4. post-build drift: the BUILD pass changes the lockfile ──────────────────
@@ -159,12 +167,12 @@ run_crew "$P4" TEST-GDD4 "$TMP/crew4.log" "$NPM4" || rc=$?
   || { no "crew exited $rc after the build changed the lockfile"; sed 's/^/    | /' "$TMP/crew4.log" >&2; }
 merged_as "$P4" TEST-GDD4 && ok "merge commit landed on develop" \
   || no "develop HEAD is not the expected merge"
-grep -q 'task worktree: node_modules differs' "$TMP/crew4.log" && ok "post-build call saw the drift and re-linked" \
+grep -q 'task worktree: node_modules changed since its last install' "$TMP/crew4.log" && ok "post-build call saw the drift and reinstalled" \
   || no "post-build call did not detect the lockfile drift"
 grep -q -- '-TEST-GDD4$' "$NPM4" && ok "npm ci ran in the task worktree after the build" \
   || no "no post-build npm ci in the task worktree (npm log: $(cat "$NPM4"))"
 
-# ── 5. nested package symlink: removed before the install, never written through ─
+# ── 5. nested package clone: removed before the install, never written through ──
 P5="$TMP/s5"; init_repo "$P5"
 mkdir -p "$P5/packages/web" && printf '{"name":"web","version":"1.0.0"}\n' > "$P5/packages/web/package.json"
 commit_all "$P5" "main: workspace package"
@@ -178,16 +186,20 @@ run_crew "$P5" TEST-GDD5 "$TMP/crew5.log" "$NPM5" || rc=$?
 
 [[ $rc -eq 0 ]] && ok "monorepo task cleared the gate with its root deps" \
   || { no "crew exited $rc"; sed 's/^/    | /' "$TMP/crew5.log" >&2; }
-grep -q 'unlinked nested packages/web/node_modules' "$TMP/crew5.log" \
-  && ok "nested package link removed before the install" \
-  || no "nested link was not removed before the install"
+grep -q 'removed nested packages/web/node_modules clone' "$TMP/crew5.log" \
+  && ok "nested package clone removed before the install" \
+  || no "nested clone was not removed before the install"
 [[ "$(tree_sum "$P5" packages/web/node_modules)" == "$HOST5_BEFORE" ]] \
   && ok "host packages/web/node_modules is unchanged" \
-  || no "host packages/web/node_modules changed — the install wrote through the link"
+  || no "host packages/web/node_modules changed — the install wrote through the clone"
 grep -q -- '-TEST-GDD5$' "$NPM5" && ok "root npm ci ran in the task worktree" \
   || no "no root npm ci in the task worktree (npm log: $(cat "$NPM5"))"
 
-# ── 6. DEPS_INSTALL=off: a drifted link is left alone, nothing runs ───────────
+# ── 6. DEPS_INSTALL=off: an already-drifted source is left unlinked, nothing runs ─
+# (host sits on featA, which has no package.json at all — drifted vs. the task
+# worktree's develop-based package.json before the clone ever runs, so the clone is
+# skipped the same way a drifted link used to be removed; DEPS_INSTALL=off then
+# skips the install too, leaving node_modules absent rather than a stale copy.)
 P6="$TMP/s6"; init_repo "$P6"
 git -C "$P6" checkout -q -b develop; write_deps "$P6" heic; commit_all "$P6" "develop: add heic-convert"
 git -C "$P6" checkout -q -b featA main
@@ -195,8 +207,8 @@ mkdir -p "$P6/node_modules" && : > "$P6/node_modules/.installed"
 STUB="$STUB_TOUCH"; NPM6="$TMP/npm6.log"; : > "$NPM6"; EXTRA_ENV=(DEPS_INSTALL=off)
 run_crew "$P6" TEST-GDD6 "$TMP/crew6.log" "$NPM6" || true   # the gate fails: no heic-convert, as expected
 
-grep -q 'wt-nm-link -> '"$P6"'/node_modules' "$TMP/probe-TEST-GDD6" && ok "drifted link left intact at agent time" \
-  || no "DEPS_INSTALL=off changed the link: $(cat "$TMP/probe-TEST-GDD6" 2>/dev/null)"
+grep -qx 'wt-nm-absent' "$TMP/probe-TEST-GDD6" && ok "already-drifted source left node_modules absent at agent time" \
+  || no "DEPS_INSTALL=off produced unexpected node_modules state: $(cat "$TMP/probe-TEST-GDD6" 2>/dev/null)"
 [[ ! -s "$NPM6" ]] && ok "no npm ci/install ran under DEPS_INSTALL=off" \
   || no "npm ran under DEPS_INSTALL=off: $(cat "$NPM6")"
 grep -q 'task worktree: deps install off' "$TMP/crew6.log" && ok "logged 'deps install off'" \

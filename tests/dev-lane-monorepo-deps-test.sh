@@ -3,10 +3,16 @@
 #
 # In a workspace monorepo (pnpm/npm/yarn workspaces) each package has its OWN
 # node_modules — `vitest` lives in packages/web/node_modules/.bin, not the root.
-# link_deps used to symlink only the root node_modules into the task + merge
+# link_deps used to link only the root node_modules into the task + merge
 # worktrees, so the root `npm test` (which fans out to the packages) ran with the
 # package binaries missing → "vitest: command not found" → the green-gate reverted
 # a perfectly clean merge.
+#
+# GSAI-261: node_modules is now CLONED (APFS `cp -Rc`), never symlinked — a symlink
+# resolves back to the host's real path, which Turbopack (and any resolver doing the
+# same root-boundary check) rejects as outside the worktree's project root. This test
+# also proves a cloned nested node_modules still carries its `.bin/vitest` runnable
+# after the clone (clonefile preserves the package manager's relative `.bin` symlinks).
 #
 # This drives the real crew against a throwaway monorepo whose root `test` script
 # passes ONLY when BOTH the root and the package node_modules are present, and
@@ -52,7 +58,8 @@ STUB="$TMP/stub-agent.sh"; PROBE="$TMP/probe"
 cat > "$STUB" <<EOS2
 #!/usr/bin/env bash
 {
-  [[ -L packages/web/node_modules ]]      && echo web-nm-linked
+  [[ -d packages/web/node_modules && ! -L packages/web/node_modules ]] && echo web-nm-cloned
+  [[ -x packages/web/node_modules/.bin/vitest ]] && echo web-nm-vitest-runnable
   [[ -L packages/web/.env.local ]]        && echo web-env-linked
   [[ ! -e packages/api/node_modules ]]    && echo api-untouched
   git status --porcelain --ignored packages/web/node_modules | grep -q '^!!' && echo web-nm-ignored
@@ -83,14 +90,16 @@ git -C "$PROJ" grep -q "dozer change" develop -- feature.txt 2>/dev/null \
   || no "agent's change missing from develop"
 
 # What the stub agent saw inside the task worktree (same link_deps path as the merge worktree).
-grep -qx web-nm-linked "$PROBE"  2>/dev/null && ok "packages/web/node_modules linked into the worktree" \
-  || no "packages/web/node_modules NOT linked"
+grep -qx web-nm-cloned "$PROBE"  2>/dev/null && ok "packages/web/node_modules cloned into the worktree (real dir, not a symlink)" \
+  || no "packages/web/node_modules NOT cloned"
+grep -qx web-nm-vitest-runnable "$PROBE" 2>/dev/null && ok "cloned node_modules/.bin/vitest is still runnable" \
+  || no "packages/web/node_modules/.bin/vitest missing or not executable after the clone"
 grep -qx web-env-linked "$PROBE" 2>/dev/null && ok "packages/web/.env.local linked into the worktree" \
   || no "packages/web/.env.local NOT linked"
 grep -qx api-untouched "$PROBE"  2>/dev/null && ok "packages/api (no deps in checkout) left alone" \
   || no "packages/api/node_modules unexpectedly created"
-grep -qx web-nm-ignored "$PROBE" 2>/dev/null && ok "package node_modules symlink is git-ignored (never committed)" \
-  || no "package node_modules symlink not ignored"
+grep -qx web-nm-ignored "$PROBE" 2>/dev/null && ok "package node_modules clone is git-ignored (never committed)" \
+  || no "package node_modules clone not ignored"
 grep -q "linked deps for packages/web/" "$LOG" && ok "crew logged the packages/web link" \
   || no "crew log has no 'linked deps for packages/web/' line"
 grep -q "linked deps for node_modules/" "$LOG" && no "find walked INTO the root node_modules" \
