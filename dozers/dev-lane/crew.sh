@@ -160,17 +160,26 @@ tests_timed_out_msg() {  # $1 = what (e.g. "tests (`make test`)")
     "$1" "$TEST_BOUND" "$TEST_ELAPSED" "$TEST_SRC"
 }
 
-# Symlink uncommitted build deps (node_modules, env files) from the real checkout
+# Materialize uncommitted build deps (node_modules, env files) from the real checkout
 # into a worktree so `npm test` resolves them. Needed for BOTH the task worktree
 # AND the merge worktree — the green-gate runs tests in the fresh merge worktree,
 # which otherwise has no node_modules and reverts every merge (GSAI-23).
+#
+# GSAI-261: node_modules is CLONED (APFS `cp -Rc`, copy-on-write — as cheap as a
+# symlink, no bytes duplicated), never symlinked. Turbopack (and any resolver that
+# does the same root-boundary check) refuses to resolve a module whose real path
+# falls outside the project root it auto-detects — which a symlinked node_modules
+# always does, since it resolves back to the real checkout in a different directory
+# tree. A clone's files live physically inside the worktree, so the check never
+# trips. `.env*` stay plain symlinks — nothing does root-boundary resolution
+# through a handful of small files, so there's no bug to fix there.
 #
 # Monorepos (GSAI-67): pnpm/npm/yarn workspaces put each package's binaries in
 # <pkg>/node_modules/.bin — `vitest` lives in apps/web/node_modules, NOT the root.
 # Linking only the root node_modules left every workspace package bare, so the
 # gate ran `vitest: command not found` and reverted clean merges. Now every nested
 # node_modules in the real checkout (packages/*, apps/*, any depth up to 5, never
-# descending INTO a node_modules or .git) is linked at the same relative path —
+# descending INTO a node_modules or .git) is cloned at the same relative path —
 # only when that package dir exists in the worktree (it's on the branch). The env
 # files beside each package are linked the same way.
 DEP_ENTRIES=( node_modules .env .env.local .env.development )
@@ -192,8 +201,37 @@ link_deps() {  # $1 = target worktree dir
 link_deps_dir() {  # $1 = source dir (real checkout), $2 = target dir (worktree)
   local s="$1" t="$2" x
   for x in "${DEP_ENTRIES[@]}"; do
-    [[ -e "$s/$x" && ! -e "$t/$x" ]] && ln -s "$s/$x" "$t/$x" 2>/dev/null || true
+    [[ -e "$s/$x" && ! -e "$t/$x" ]] || continue
+    if [[ "$x" == node_modules ]]; then clone_node_modules "$s" "$t"
+    else ln -s "$s/$x" "$t/$x" 2>/dev/null || true
+    fi
   done
+}
+# GSAI-261: node_modules goes in as a real, physically-local copy — never a symlink
+# across the worktree boundary (that IS the bug: Turbopack's root-boundary check
+# resolves the link back to the host checkout and rejects it). `cp -Rc` is an APFS
+# clonefile — copy-on-write, no bytes duplicated, as cheap as the symlink it
+# replaces. For the ROOT call only ($s == $WORKDIR), skip entirely when $t is
+# already drifted from $WORKDIR (the same comparison install_deps makes, and the
+# only one deps_drifted's hardcoded $WORKDIR actually means): cloning stale bytes
+# just to have install_deps immediately invalidate them wastes the clone; leaving
+# node_modules absent instead sends install_deps down its existing "missing →
+# install" branch. Nested package dirs (link_deps's per-package loop) have no such
+# check — deps_drifted only knows how to compare against the ROOT $WORKDIR, so it
+# can't answer "is THIS package drifted"; they clone unconditionally (same as the
+# old unconditional symlink), and any inconsistency is resolved the same way it
+# always was — by the root's own lockfile install, which hoists/reinstalls as needed.
+clone_node_modules() {  # $1 = source dir, $2 = target dir
+  local s="$1" t="$2"
+  [[ "$s" == "$WORKDIR" ]] && deps_drifted "$t" && return 0
+  if cp -Rc "$s/node_modules" "$t/node_modules" 2>/dev/null; then
+    echo "    [dev] cloned node_modules into ${t#"$WORKDIR"/} (APFS clonefile)"
+  elif cp -R "$s/node_modules" "$t/node_modules" 2>/dev/null; then
+    echo "    [dev] cloned node_modules into ${t#"$WORKDIR"/} (plain copy — clonefile unavailable, e.g. cross-volume)"
+  else
+    return 0   # nothing we can do; install_deps's "missing" branch picks it up
+  fi
+  deps_stamp "$s" > "$t/node_modules/.dozer-deps-stamp" 2>/dev/null || true
 }
 
 # Deps by lockfile (GSAI-26 #2): a worktree with a package.json but NO node_modules
@@ -231,30 +269,30 @@ deps_stamp() {  # $1 = dir → checksum of its install inputs (what a successful
   (( ${#list[@]} )) || { echo none; return 0; }
   cat "${list[@]}" | cksum
 }
-unlink_nested_deps() {  # $1 = worktree dir → removes nested node_modules SYMLINKS only
-  # A workspace install would write through a nested link into the host checkout, so the
-  # links link_deps planted go before any install. Real nested dirs and the root are left
-  # alone; `rm -f` on a link without a trailing slash removes the link, never its target.
-  local d="$1" nm
-  while IFS= read -r nm; do
+unlink_nested_deps() {  # $1 = worktree dir → removes nested node_modules CLONES Dozer planted
+  # GSAI-261: node_modules is a clone now, not a link, so there's nothing to write through
+  # into the host — but a stale nested clone from a prior drifted state still needs
+  # clearing before a fresh install, same as a stale link did. Detect "Dozer planted this"
+  # by the .dozer-deps-stamp marker link_deps_dir writes right after cloning — a genuine
+  # package install never gets that marker (install_deps stamps the ROOT dir it installed,
+  # not nested package dirs it didn't touch), so real nested dirs and the root are left alone.
+  local d="$1" marker nm
+  while IFS= read -r marker; do
+    nm="$(dirname "$marker")"
     [[ -n "$nm" && "$nm" != "$d/node_modules" ]] || continue
-    rm -f "$nm" && echo "    [dev] unlinked nested ${nm#"$d"/} (host target untouched)"
-  done < <(find "$d" -maxdepth 5 \( -name .git -o -name node_modules -type d \) -prune \
-             -o -name node_modules -type l -print 2>/dev/null)
+    rm -rf "$nm" && echo "    [dev] removed nested ${nm#"$d"/} clone (host target untouched)"
+  done < <(find "$d" -maxdepth 6 -name .git -prune -o -name .dozer-deps-stamp -print 2>/dev/null)
 }
 install_deps() {  # $1 = worktree dir, $2 = stage label (also names the log)
-  local d="$1" what="$2" cmd log why="" tgt stamp="$1/node_modules/.dozer-deps-stamp"
+  local d="$1" what="$2" cmd log why="" stamp="$1/node_modules/.dozer-deps-stamp"
   DEPS_FAIL_MSG=""; log="$OUT/$ID.deps-${what// /-}.log"
   [[ -f "$d/package.json" ]] || return 0
-  # 1. decide, with no side effects. Only a live, unchanged link to the host is the
-  #    fast path; a real dir is the worktree's own and is trusted unless its stamp says
-  #    its inputs changed (or it has no stamp, from before stamps existed).
-  if [[ -L "$d/node_modules" ]]; then
-    tgt="$(readlink "$d/node_modules")"
-    if   [[ ! -e "$d/node_modules" ]]; then why="is a dangling link to $tgt"
-    elif deps_drifted "$d";            then why="differs from $WORKDIR's install inputs (linked to $tgt)"
-    else return 0; fi
-  elif [[ -e "$d/node_modules" ]]; then
+  # 1. decide, with no side effects. node_modules is never a symlink into the host
+  #    (GSAI-261 — it's either absent, or a clone/real dir that belongs to THIS
+  #    worktree), so a real dir is trusted unless its stamp says its inputs changed
+  #    (or it has no stamp at all — missing, or a clone link_deps_dir skipped because
+  #    it was already drifted at link time, or pre-GSAI-254).
+  if [[ -e "$d/node_modules" ]]; then
     [[ -f "$stamp" ]] || return 0
     [[ "$(cat "$stamp")" == "$(deps_stamp "$d")" ]] && return 0
     why="changed since its last install"
@@ -264,11 +302,8 @@ install_deps() {  # $1 = worktree dir, $2 = stage label (also names the log)
   elif [[ -f "$d/package-lock.json" ]]; then cmd="npm ci"
   elif [[ -f "$d/yarn.lock" ]];         then cmd="yarn install --frozen-lockfile"
   else echo "    [dev] ⚠ $what: package.json but no lockfile and no node_modules — not installing"; return 0; fi
-  # 2. act. A stale link is removed in THIS worktree only, then the nested links, then install.
+  # 2. act. Stale nested clones are removed first, then install.
   if   [[ -z "$why" ]]; then echo "    [dev] $what: node_modules missing — $cmd"
-  elif [[ -L "$d/node_modules" ]]; then
-    rm -f "$d/node_modules"
-    echo "    [dev] $what: node_modules $why — link removed in this worktree only, $cmd"
   else echo "    [dev] $what: node_modules $why — $cmd"; fi
   unlink_nested_deps "$d"
   timebox "$T_DEPS" "$what deps install" "$d" "$cmd" >"$log" 2>&1 || {
