@@ -12,6 +12,17 @@
 #   closed issue with the label, merge or not -> strip the label           (stripped)
 #   repo unresolvable                         -> leave alone, list loudly  (unresolved)
 #
+# GSAI-156: the pass above is a snapshot of the CURRENT label — an issue relabelled
+# away from dozer:merged-develop (e.g. hand-moved to dozer:blocked, like CFW-160)
+# vanishes from that candidate set entirely and reports as "0 phantom" while sitting
+# unverified. A second pass closes that blind spot: every dozer:blocked issue whose
+# label HISTORY shows dozer:merged-develop was added at some point (list-relabelled-
+# blocked) gets the same git-verification —
+#
+#   open, history shows merged-develop, no merge found    -> strip+requeue (relabelled phantom)
+#   open, history shows merged-develop, merge IS found    -> leave alone, report (Director's call)
+#   closed, history shows merged-develop (any merge state) -> strip label, state left alone (never reopen)
+#
 # Verification matches on the merge-commit SUBJECT for the task's branch —
 #   "^merge <prefix>/<ID> into "   (first-parent log of the integration branch)
 # NEVER a bare grep for the ID: old Paperclip-era commits collide with today's IDs
@@ -118,6 +129,60 @@ while IFS=$'\t' read -r id team hint state lane; do
   requeued=$((requeued+1))
 done <<< "$rows"
 
+# Second pass (GSAI-156): the relabelled-blocked blind spot — issues that hid a
+# phantom merged-develop label behind dozer:blocked before this audit ever ran.
+rows2="$(lin list-relabelled-blocked)" || { echo "audit-merged: could not list $LIN list-relabelled-blocked" >&2; exit 1; }
+
+relabelled_ok=0; relabelled_phantom=0
+while IFS=$'\t' read -r id team hint state lane; do
+  [[ -z "$id" ]] && continue
+  total=$((total+1))
+  repo="$(resolve_repo "$hint" "$team")" || repo=""
+  if [[ -z "$repo" || ! -d "$repo" ]]; then
+    printf '  ? %-9s UNRESOLVED repo (hint=%s team=%s state=%s) — relabelled-blocked, label left alone, resolve by hand\n' "$id" "$hint" "$team" "$state"
+    unresolved=$((unresolved+1)); continue
+  fi
+
+  closed=0; for s in $CLOSED; do [[ "$state" == "$s" ]] && closed=1; done
+
+  if (( closed )); then
+    # GSAI-156 review: a hand-closed issue (completed/canceled outside the engine's
+    # own done(), which would have stripped dozer:blocked too) can still carry
+    # dozer:blocked with dozer:merged-develop in its label history — precedented at
+    # tasks/_linear_api.py's budget-sweep blocked-issue walk. audit_requeue() forces
+    # state back to unstarted unconditionally, so this row must NEVER reach it — that
+    # would resurrect a deliberately closed/dead issue into the live pipeline.
+    printf '  - %-9s closed (%s), relabelled-blocked — strip label, leave state alone%s\n' \
+      "$id" "$state" "$([[ $DRY == 1 ]] && echo ' [dry-run]')"
+    if [[ $DRY == 0 ]]; then
+      lin audit-strip "$id"
+      lin comment "$id" "Audit (GSAI-156): this closed issue carries dozer:blocked with dozer:merged-develop in its label history, but closed issues are never requeued — label hygiene only, state left untouched.
+
+<!-- dozer-audit by:audit-merged -->"
+    fi
+    stripped=$((stripped+1)); continue
+  fi
+
+  if merge_found_in "$repo" "$id"; then
+    printf '  ~ %-9s blocked but merge IS verified on %s (%s) — relabelled away from dozer:merged-develop; leave to the Director, not a phantom\n' "$id" "$(integration_ref "$repo")" "$repo"
+    relabelled_ok=$((relabelled_ok+1)); continue
+  fi
+
+  printf '  ✗ %-9s PHANTOM (relabelled) — was dozer:merged-develop at some point, now hiding behind dozer:blocked, no merge of %s/%s on %s in %s — strip + requeue%s\n' \
+    "$id" "$PREFIX" "$id" "$(integration_ref "$repo" 2>/dev/null || echo '?')" "$repo" \
+    "$([[ $DRY == 1 ]] && echo ' [dry-run]')"
+  if [[ $DRY == 0 ]]; then
+    lin audit-requeue "$id"
+    lin comment "$id" "Audit (GSAI-156): this issue carried dozer:merged-develop at some point in its label history, then was relabelled to dozer:blocked before a merge was ever verified — the audit's old pass only scanned issues CURRENTLY wearing dozer:merged-develop, so this phantom hid behind the relabel and was reported as 0 phantom. No merge of ${PREFIX}/${id} exists on $(basename "$repo")'s integration branch. Label stripped, task requeued so the work is actually done.
+
+<!-- dozer-audit by:audit-merged -->"
+  fi
+  relabelled_phantom=$((relabelled_phantom+1))
+done <<< "$rows2"
+
+requeued=$((requeued+relabelled_phantom))
+
 echo
-printf 'audit-merged: %s checked — %s verified, %s phantom requeued, %s closed stripped, %s unresolved%s\n' \
-  "$total" "$ok" "$requeued" "$stripped" "$unresolved" "$([[ $DRY == 1 ]] && echo ' [DRY RUN]')"
+printf 'audit-merged: %s checked — %s verified, %s phantom requeued, %s closed stripped, %s unresolved%s%s\n' \
+  "$total" "$ok" "$requeued" "$stripped" "$unresolved" "$([[ $DRY == 1 ]] && echo ' [DRY RUN]')" \
+  "$([[ $relabelled_ok -gt 0 ]] && printf ' (%s relabelled-but-merged left for the Director)' "$relabelled_ok")"
