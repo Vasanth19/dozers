@@ -1,86 +1,63 @@
-VERDICT: FAIL
+VERDICT: PASS
 
 ## Summary
 
-The build follows the design's shape closely (new `list-relabelled-blocked` verb,
-`_label_ever_added()` history walk, second pass in `audit-merged.sh`, `BLOCKED` added to
-`audit_requeue()`'s strip list, tests for the open-issue phantom/verified-but-blocked
-cases). But the second pass is missing a state-type guard that the FIRST pass already
-has, and that guard is not optional — this codebase has an existing, deliberate
-precedent proving closed-but-still-`dozer:blocked` is a real reachable state. As shipped,
-the new sweep can reopen a legitimately closed issue.
+This is a re-review after the prior pass (518d7e1) FAILed on a real defect: the new
+relabelled-blocked sweep could force a hand-closed issue's state back to `unstarted`,
+reopening dead work. Commit 99c0ac4 fixes it with two independent layers, both verified
+by running the suite directly (`bash tests/merge-verify-test.sh`) — all cases pass,
+including the new regression test for this exact shape.
 
-## Blocking issue: the relabelled-blocked sweep can resurrect a closed issue
+## What changed since the FAIL
 
-`list_merged_dev()`'s consumer (`audit-merged.sh`'s FIRST loop, lines 99–112) explicitly
-branches on `state` before doing anything else:
+1. **Data-source level** (`tasks/_linear_api.py:803-806`) — `list_relabelled_blocked()`
+   now skips any issue whose `state.type` is `completed` or `canceled` before it ever
+   checks `BLOCKED`/`MERGEDDEV`. A closed+blocked+ever-merged-dev issue (the shape the
+   FAIL review identified, precedented by the budget-sweep guard at
+   `tasks/_linear_api.py:1505`) is never emitted as a row at all.
+2. **Consumer level** (`dozers/audit-merged.sh:146-164`) — the second loop now has the
+   same `closed` branch as the first loop: a closed row gets `audit-strip` + a comment,
+   never `audit-requeue`. Since layer 1 already filters these out, this branch is
+   defense-in-depth (matches the FAIL review's two suggested fix shapes — the build did
+   both rather than choosing one, which is fine here).
+3. **New test** — case 4e (`tests/merge-verify-test.sh:403-420`) feeds a fixture row
+   `AM-10 CFW r-real completed dev` directly into `audit.blocked.rows` (bypassing the
+   python-level filter, so it genuinely exercises the bash-level guard in isolation) and
+   asserts `audit-strip` fires, `audit-requeue` never does, and state is left alone.
 
-```bash
-closed=0; for s in $CLOSED; do [[ "$state" == "$s" ]] && closed=1; done
-if (( closed )); then
-  ...
-  lin audit-strip "$id"      # label-only, state untouched
-  stripped=$((stripped+1)); continue
-fi
-```
+Ran the full suite locally: `merge-verify-test: PASS`, every case including 4c/4d/4e
+green. The specific regression — "AM-10 was requeued — a closed issue would be
+reopened" — does not fire.
 
-`audit_strip()` only removes the label — it never touches state, specifically *because*
-a completed/canceled issue must never be reopened (that's the whole Ship-gate hygiene
-point the comment at `tasks/_linear_api.py:826-831` makes).
+## Non-blocking observation: the bash-level closed branch is effectively dead code with a cosmetic inaccuracy
 
-The new SECOND pass (`tasks/_linear_api.py:794` `list_relabelled_blocked()` +
-`dozers/audit-merged.sh:136-160`) has no equivalent branch. Its docstring claims "Every
-**OPEN** issue on dozer:blocked" but the code never checks `i["state"]["type"]` — it
-only checks `_has(labels, BLOCKED)` and label history. And the consuming loop in
-`audit-merged.sh` has exactly two outcomes: merge found (report only) or merge not found
-→ unconditional `lin audit-requeue "$id"`. `audit_requeue()`
-(`tasks/_linear_api.py:816-823`) calls `_relabel(..., state_type="unstarted")`, which
-`set_labels_and_state` applies unconditionally regardless of the issue's current state.
+Because layer 1 (the python filter) already excludes `completed`/`canceled` issues
+before `list-relabelled-blocked` emits a row, the bash `closed` branch added at
+`dozers/audit-merged.sh:148-164` can never actually run against real data — only
+against a hand-built test fixture that bypasses the python query, as case 4e does. That
+in itself is fine (harmless defense-in-depth).
 
-So: a canceled/completed issue that still carries `dozer:blocked` (never cleaned up
-because it was closed by hand rather than through `done()`) and whose history shows
-`dozer:merged-develop` was added at some point gets caught by the new sweep, found
-phantom (no merge — that's exactly why it's a phantom), and `audit_requeue()`d: label set
-to `dozer:ready`, **state forced back to `unstarted`**. A deliberately closed/dead issue
-is silently reopened and requeued into the Dozer's live pipeline.
+But if it ever did run, it wouldn't do what its own message claims. `lin audit-strip`
+→ `audit_strip()` (`tasks/_linear_api.py:822-825`) only removes `dozer:merged-develop`.
+A row reaching this branch is, by construction, one that does **not** currently carry
+`dozer:merged-develop` (that's what "relabelled away" means, and it's also the
+disjointness filter against `list_merged_dev()`). So `audit_strip` on one of these rows
+removes a label that was never there — a no-op write — and `dozer:blocked` (the label
+actually printed as "strip label" in the log line) is never touched. The issue would
+keep sitting on `dozer:blocked` forever. The `stripped` counter increments and a comment
+posts, but nothing is actually stripped.
 
-This is not a hypothetical corner case invented for this review — the codebase already
-defends against exactly this state elsewhere. `tasks/_linear_api.py:1501-1502`
-(budget-sweep's blocked-issue walk):
+This doesn't cause harm — it correctly declines to reopen anything, which is the bug
+this review cycle exists to fix — and it's unreachable in production today, so it's not
+blocking. Worth a follow-up cleanup (either drop the now-redundant bash branch since the
+python filter already handles it, or fix `audit_strip` to also remove `BLOCKED` for this
+path) but not worth another FAIL cycle over.
 
-```python
-for node in _all_issues():
-    if node["state"]["type"] in ("completed", "canceled") or not _has(node["labels"]["nodes"], BLOCKED):
-        continue
-```
+## Other observations (carried forward, still accurate)
 
-That filter only makes sense if closed-but-still-`dozer:blocked` issues are a real,
-observed state in this Linear workspace. The design doc's own edge-case list
-("History shows merged-develop added and later removed by a legitimate `done()`
-close... isn't `dozer:blocked`, so never a candidate") only covers the case where the
-engine's own `done()` closed the issue — `done()` does strip `BLOCKED` too
-(`tasks/_linear_api.py:721-723`). It does not cover an issue closed by hand in the Linear
-UI (exactly the CFW-160 vector this whole task is about — a human/Director relabelling
-outside the engine's contracts) while `dozer:blocked` is left in place. That path is
-real, precedented in this same file, and unhandled by the new code.
-
-**Fix shape** (small, same pattern as the first loop): either exclude closed issues in
-`list_relabelled_blocked()`'s query (mirror the budget-sweep guard), or add the same
-`closed` branch to the second `while` loop in `audit-merged.sh` and call `audit-strip`
-instead of `audit-requeue` for a closed+blocked+ever-merged-dev row. No test in
-`tests/merge-verify-test.sh` case 4c/4d exercises a closed state for the blocked sweep,
-so this gap shipped unnoticed.
-
-## Other observations (not blocking)
-
-- `addedLabelIds` on Linear's `IssueHistory` type is the schema the design assumed and
-  the build didn't add any introspection check to confirm it against the live API before
-  wiring it in, despite the design's own note that this should be "confirmed via
-  introspection before wiring it in." Low risk — if wrong, it's an isolated one-line fix
-  inside `_label_ever_added()` exactly as scoped — but worth a live smoke-test before this
-  ships to a real Dozer run, since nothing in the test suite touches the real Linear API.
-- Everything else matches the design closely and is well-covered: disjointness between
-  the two passes (AM-2 requeued exactly once), the relabelled-but-actually-merged
-  reporting path (AM-9, left alone), dry-run making no mutations, and the `BLOCKED` strip
-  added to `audit_requeue()`. The `_fetch_team_issues` / `_all_issues` plumbing change
-  (adding `id` and `team{id}`) is correct and doesn't disturb any other caller.
+- `addedLabelIds` on Linear's `IssueHistory` schema is still unverified against the live
+  API by introspection — same note as the prior review. Low risk, isolated to
+  `_label_ever_added()` if wrong, but smoke-test before this runs against real Linear.
+- Disjointness between the two passes, the relabelled-but-actually-merged reporting path
+  (AM-9), dry-run making no mutations, and the `BLOCKED` strip added to
+  `audit_requeue()` all remain correct and well-covered.
