@@ -377,10 +377,31 @@ hygiene_gate_waiver() {  # $1 = dir → echoes WHY the gate is off for this chec
 # the gate is ungated AND unwaived, so callers that must clean up first (the
 # green-gate has already merged) can revert before failing; $NO_TEST_MSG holds the
 # reason. Callers with nothing to undo just `|| fail "$NO_TEST_MSG"`.
+#
+# GSAI-88: a missing/broken worktree is NOT "no test command" and must never be
+# waivable by TEST_GATE=off / no_test_gate / the marker file — those waivers mean
+# "this repo has no tests," not "the Dozer's own working copy is gone." Checked
+# FIRST, unconditionally, and fails straight through `fail` (never returns) so no
+# call site's stage-specific "add a test script" / "TEST_GATE=bootstrap" / "worktree
+# kept for resume" text — all written for the genuinely-untested-repo case — can
+# ever attach to a message about a broken engine, not a broken test suite.
 NO_TEST_MSG=""
 resolve_test_cmd() {  # $1 = dir, $2 = stage label
-  local d="$1" stage="$2" why
+  local d="$1" stage="$2" why gd
   TEST_CMD=""; NO_TEST_MSG=""
+  if [[ ! -d "$d" ]]; then
+    fail "$stage: worktree $d does not exist — this is a Dozer ENGINE fault, not a
+      missing test command (GSAI-88). The repo most likely has tests; the worktree
+      itself vanished or was never created (a crash-reaper race, manual cleanup
+      under ~/.dozers/worktrees, or a disk/volume issue). No test-gate opt-out and
+      no change to the repo's test setup can fix this — that would only blind the
+      gate for a healthy repo. Find out why $d is gone, then re-greenlight."
+  elif ! gd="$(git -C "$d" rev-parse --git-dir 2>&1)"; then
+    fail "$stage: $d exists but is not a readable git worktree ($gd) — this is a
+      Dozer ENGINE fault, not a missing test command (GSAI-88). Same as a missing
+      worktree: no test-gate opt-out will fix this. Investigate $d, then
+      re-greenlight."
+  fi
   if TEST_CMD="$(detect_test_cmd "$d")"; then echo "    [dev] $stage: test command \`$TEST_CMD\`"; return 0; fi
   TEST_CMD=""
   if why="$(test_gate_waiver "$d")"; then
