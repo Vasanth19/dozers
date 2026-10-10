@@ -92,6 +92,7 @@ task_finish_repair()      { python3 "$_LIN" finish-repair "$1"; }  # strip the s
 
 # audit verbs (used by dozers/audit-merged.sh, GSAI-119)
 task_list_merged_dev() { python3 "$_LIN" list-merged-dev; }  # every issue on dozer:merged-develop
+task_list_relabelled_blocked() { python3 "$_LIN" list-relabelled-blocked; }  # GSAI-156: blocked issue whose history shows merged-develop was relabelled away
 task_audit_requeue()   { python3 "$_LIN" audit-requeue "$1"; }  # phantom: strip label + back to ready
 task_audit_strip()     { python3 "$_LIN" audit-strip "$1"; }    # hygiene: strip label off a closed issue
 
