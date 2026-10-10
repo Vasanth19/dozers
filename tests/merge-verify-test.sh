@@ -259,10 +259,14 @@ cat > "$LINSTUB" <<EOL
 #!/usr/bin/env bash
 case "\$1" in
   list-merged-dev) cat "$TMP/audit.rows" ;;
+  list-relabelled-blocked) cat "$TMP/audit.blocked.rows" ;;
   *) echo "\$@" >> "$CALLS" ;;
 esac
 EOL
 chmod +x "$LINSTUB"
+# GSAI-156: the relabelled-blocked sweep's fixture — empty for the original case 4
+# assertions below (no blind-spot rows yet), filled in for case 4c/4d further down.
+: > "$TMP/audit.blocked.rows"
 # Resolver stub: repo hints map to throwaway repos under $TMP.
 RESSTUB="$TMP/resolver-stub.sh"
 cat > "$RESSTUB" <<EOL
@@ -305,6 +309,13 @@ grep -qE 'audit-strip AM-3' "$CALLS" && ok "closed issue stripped (Ship-gate hyg
 grep -q 'comment AM-2' "$CALLS" && ok "phantom got an explanatory comment" || no "no comment on AM-2"
 ! grep -qE 'audit-(requeue|strip) AM-1' "$CALLS" && ok "verified issue untouched" || no "verified issue mutated"
 ! grep -qE 'audit-(requeue|strip) AM-4' "$CALLS" && ok "unresolved issue untouched" || no "unresolved issue mutated"
+# GSAI-156 disjointness: AM-2 is a phantom via the label-present path (list-merged-dev).
+# With the relabelled-blocked second pass now wired in too, it must still be repaired
+# exactly ONCE — the production query makes a row appearing in both passes unreachable
+# (list_relabelled_blocked excludes anything still carrying dozer:merged-develop), so
+# this is the regression guard for that exclusion ever breaking.
+cnt2="$(grep -cE 'audit-requeue AM-2' "$CALLS")"
+[[ "$cnt2" -eq 1 ]] && ok "AM-2 requeued exactly once (no double-repair across both passes)" || no "AM-2 requeue called $cnt2 times, expected 1"
 # dry-run: same verdicts, NO mutations
 : > "$CALLS"
 AUDIT_LINEAR_API="$LINSTUB" AUDIT_RESOLVER="$RESSTUB" bash "$ROOT/dozers/audit-merged.sh" --dry-run >"$TMP/audit-dry.log" 2>&1
@@ -351,5 +362,42 @@ grep -qE 'git -C "[^"]*" log --first-parent[^|]*\| *grep -q' "$ROOT/dozers/audit
   || ok "merge check captures the log BEFORE grep (no SIGPIPE shape)"
 grep -qE 'grep -qE .* <<< "\$log"' "$ROOT/dozers/audit-merged.sh" \
   && ok "grep reads the captured history" || no "captured log is not what grep reads"
+
+# ── case 4c/4d: the relabelled-blocked blind spot (GSAI-156, the CFW-160 shape) ─
+# CFW-160's whole bug: a phantom merged-develop label that got relabelled to
+# dozer:blocked BEFORE the audit ever ran vanishes from list-merged-dev entirely —
+# the old audit reported 0 phantom while it sat unverified. These cases exercise the
+# second pass (list-relabelled-blocked) that closes that blind spot.
+echo "case 4c: relabelled phantom (the CFW-160 shape) — no merge found, strip+requeue"
+cat > "$TMP/audit.rows" <<EOF
+EOF
+# AM-9 gets a REAL merge on r-real (same repo AM-1 lives in) for case 4d below.
+( cd "$RA"
+  git checkout -q -b dozer/AM-9 develop
+  printf 'c\n' >> feature.txt; git add -A; git commit -q -m "am9"
+  git checkout -q develop
+  git merge -q --no-ff dozer/AM-9 -m "merge dozer/AM-9 into develop — #AM-9 real"
+)
+cat > "$TMP/audit.blocked.rows" <<EOF
+AM-8	CFW	r-real	unstarted	dev
+AM-9	CFW	r-real	unstarted	dev
+EOF
+: > "$CALLS"
+L6="$TMP/audit-relabelled.log"
+AUDIT_LINEAR_API="$LINSTUB" AUDIT_RESOLVER="$RESSTUB" bash "$ROOT/dozers/audit-merged.sh" >"$L6" 2>&1 || { no "audit exited non-zero"; dump "$L6"; }
+grep -q "✗ AM-8 *PHANTOM (relabelled)" "$L6" && ok "relabelled phantom detected (AM-8, CFW-160 shape)" || { no "relabelled phantom missed"; dump "$L6"; }
+grep -qE 'audit-requeue AM-8' "$CALLS" && ok "relabelled phantom requeued" || { no "audit-requeue not called for AM-8"; dump "$CALLS"; }
+grep -q 'comment AM-8' "$CALLS" && ok "relabelled phantom got a comment" || no "no comment on AM-8"
+grep -qE 'comment AM-8 .*relabelled' "$CALLS" && ok "comment names the relabel" || no "comment on AM-8 doesn't mention relabelled"
+
+echo "case 4d: relabelled-but-actually-merged — blocked for some OTHER reason, leave alone"
+grep -q "~ AM-9 *blocked but merge IS verified" "$L6" && ok "relabelled-but-merged reported, not mutated" || { no "AM-9's verified-merge case not reported correctly"; dump "$L6"; }
+! grep -qE 'audit-(requeue|strip) AM-9' "$CALLS" && ok "AM-9 untouched (blocked for its own reason, not this audit's call)" || no "AM-9 was mutated"
+
+echo "case 4c/4d dry-run: same verdicts, no mutations"
+: > "$CALLS"
+AUDIT_LINEAR_API="$LINSTUB" AUDIT_RESOLVER="$RESSTUB" bash "$ROOT/dozers/audit-merged.sh" --dry-run >"$TMP/audit-relabelled-dry.log" 2>&1
+grep -q "PHANTOM (relabelled).*dry-run" "$TMP/audit-relabelled-dry.log" && ok "dry-run reports the relabelled phantom" || no "dry-run missed the relabelled phantom"
+[[ ! -s "$CALLS" ]] && ok "dry-run made NO mutations" || { no "dry-run mutated"; dump "$CALLS"; }
 
 if [[ $fail == 0 ]]; then echo "merge-verify-test: PASS"; else echo "merge-verify-test: FAIL" >&2; exit 1; fi

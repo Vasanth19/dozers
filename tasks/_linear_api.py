@@ -150,7 +150,7 @@ def _fetch_team_issues(tid):
     while True:
         d = gql('query($t:ID!,$n:Int!,$c:String){ issues(first:$n, after:$c, '
                 'filter:{team:{id:{eq:$t}}}){ pageInfo{ hasNextPage endCursor } nodes{ '
-                'identifier title team{ key } state{ type } priority createdAt '
+                'id identifier title team{ id key } state{ type } priority createdAt '
                 'projectMilestone{ id name targetDate } project{ name } '
                 'labels{ nodes{ name } } } } }',
                 {"t": tid, "n": _PAGE, "c": cursor})
@@ -774,11 +774,52 @@ def list_merged_dev():
         print(f'{i["identifier"]}\t{i["team"]["key"]}\t{hint}\t{i["state"]["type"]}\t{_lane_of(labels) or "-"}')
 
 
+def _label_ever_added(issue_id, label_id):
+    """Did this issue's label HISTORY ever add label_id — even if it was later removed?
+    GSAI-156: the one thing a relabel can't erase. Pages issue.history the same way
+    _fetch_team_issues pages issues (GSAI-75 lesson: always drain the cursor)."""
+    cursor = None
+    while True:
+        d = gql('query($i:String!,$c:String){ issue(id:$i){ history(first:50, after:$c){ '
+                'pageInfo{ hasNextPage endCursor } nodes{ addedLabelIds } } } }',
+                {"i": issue_id, "c": cursor})
+        page = d["issue"]["history"]
+        if any(label_id in (n.get("addedLabelIds") or []) for n in page["nodes"]):
+            return True
+        if not page["pageInfo"]["hasNextPage"]:
+            return False
+        cursor = page["pageInfo"]["endCursor"]
+
+
+def list_relabelled_blocked():
+    """Every OPEN issue on dozer:blocked whose label HISTORY shows dozer:merged-develop
+    was added at some point — the CFW-160 shape (GSAI-156): a phantom merge-develop
+    label that got relabelled away before the audit ever saw it. Excludes issues that
+    still carry dozer:merged-develop today (those already surface via list_merged_dev()
+    — kept disjoint so a row is never repaired twice). Row format matches
+    list_merged_dev(): identifier \t team \t repo hint \t state type \t lane."""
+    label_ids_by_team = {}
+    for i in _all_issues():
+        labels = i["labels"]["nodes"]
+        if not _has(labels, BLOCKED) or _has(labels, MERGEDDEV):
+            continue
+        tid = i["team"]["id"]
+        if tid not in label_ids_by_team:
+            label_ids_by_team[tid] = _team_labels(tid).get(MERGEDDEV)
+        mdev_id = label_ids_by_team[tid]
+        if not mdev_id or not _label_ever_added(i["id"], mdev_id):
+            continue
+        hint = next((n["name"][len("repo:"):] for n in labels if n["name"].startswith("repo:")), "-")
+        print(f'{i["identifier"]}\t{i["team"]["key"]}\t{hint}\t{i["state"]["type"]}\t{_lane_of(labels) or "-"}')
+
+
 def audit_requeue(identifier):
     """A phantom merge on an OPEN issue: strip the label, hand the task back to the
     queue (dozer:ready + unstarted, lane preserved) so the Dozer actually does the
-    work this time. GSAI-119 — see dozers/audit-merged.sh."""
-    _relabel(issue(identifier), add=[READY], remove=[MERGEDDEV, INPROG], state_type="unstarted")
+    work this time. GSAI-119 — see dozers/audit-merged.sh. GSAI-156: also strips
+    BLOCKED — a phantom caught via the relabelled-blocked sweep carries that label
+    today, and mark_ready()'s contract says a greenlight must never coexist with it."""
+    _relabel(issue(identifier), add=[READY], remove=[MERGEDDEV, INPROG, BLOCKED], state_type="unstarted")
     print(f"{identifier} -> {READY} (phantom {MERGEDDEV} stripped, requeued)")
 
 
@@ -1530,6 +1571,7 @@ OPS = {
     "list-inflight": lambda a: list_inflight(),
     "requeue": lambda a: requeue(a[0]),
     "list-merged-dev": lambda a: list_merged_dev(),
+    "list-relabelled-blocked": lambda a: list_relabelled_blocked(),
     "audit-requeue": lambda a: audit_requeue(a[0]),
     "audit-strip": lambda a: audit_strip(a[0]),
     "finish-repair": lambda a: finish_repair(a[0]),          # GSAI-213: strip stale dozer:in-progress
