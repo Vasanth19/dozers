@@ -19,8 +19,9 @@
 # label HISTORY shows dozer:merged-develop was added at some point (list-relabelled-
 # blocked) gets the same git-verification —
 #
-#   blocked, history shows merged-develop, no merge found  -> strip+requeue (relabelled phantom)
-#   blocked, history shows merged-develop, merge IS found  -> leave alone, report (Director's call)
+#   open, history shows merged-develop, no merge found    -> strip+requeue (relabelled phantom)
+#   open, history shows merged-develop, merge IS found    -> leave alone, report (Director's call)
+#   closed, history shows merged-develop (any merge state) -> strip label, state left alone (never reopen)
 #
 # Verification matches on the merge-commit SUBJECT for the task's branch —
 #   "^merge <prefix>/<ID> into "   (first-parent log of the integration branch)
@@ -140,6 +141,26 @@ while IFS=$'\t' read -r id team hint state lane; do
   if [[ -z "$repo" || ! -d "$repo" ]]; then
     printf '  ? %-9s UNRESOLVED repo (hint=%s team=%s state=%s) — relabelled-blocked, label left alone, resolve by hand\n' "$id" "$hint" "$team" "$state"
     unresolved=$((unresolved+1)); continue
+  fi
+
+  closed=0; for s in $CLOSED; do [[ "$state" == "$s" ]] && closed=1; done
+
+  if (( closed )); then
+    # GSAI-156 review: a hand-closed issue (completed/canceled outside the engine's
+    # own done(), which would have stripped dozer:blocked too) can still carry
+    # dozer:blocked with dozer:merged-develop in its label history — precedented at
+    # tasks/_linear_api.py's budget-sweep blocked-issue walk. audit_requeue() forces
+    # state back to unstarted unconditionally, so this row must NEVER reach it — that
+    # would resurrect a deliberately closed/dead issue into the live pipeline.
+    printf '  - %-9s closed (%s), relabelled-blocked — strip label, leave state alone%s\n' \
+      "$id" "$state" "$([[ $DRY == 1 ]] && echo ' [dry-run]')"
+    if [[ $DRY == 0 ]]; then
+      lin audit-strip "$id"
+      lin comment "$id" "Audit (GSAI-156): this closed issue carries dozer:blocked with dozer:merged-develop in its label history, but closed issues are never requeued — label hygiene only, state left untouched.
+
+<!-- dozer-audit by:audit-merged -->"
+    fi
+    stripped=$((stripped+1)); continue
   fi
 
   if merge_found_in "$repo" "$id"; then

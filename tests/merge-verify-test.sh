@@ -400,4 +400,23 @@ AUDIT_LINEAR_API="$LINSTUB" AUDIT_RESOLVER="$RESSTUB" bash "$ROOT/dozers/audit-m
 grep -q "PHANTOM (relabelled).*dry-run" "$TMP/audit-relabelled-dry.log" && ok "dry-run reports the relabelled phantom" || no "dry-run missed the relabelled phantom"
 [[ ! -s "$CALLS" ]] && ok "dry-run made NO mutations" || { no "dry-run mutated"; dump "$CALLS"; }
 
+# ── case 4e: closed-but-still-blocked (review FAIL fix) — must never reopen ───
+# A hand-closed issue (completed/canceled outside done(), which would have stripped
+# dozer:blocked) can still carry dozer:blocked with dozer:merged-develop in its label
+# history — precedented at tasks/_linear_api.py's budget-sweep blocked-issue walk.
+# The relabelled-blocked sweep must NEVER requeue it (audit_requeue() forces state
+# back to unstarted unconditionally) — that would resurrect a dead issue.
+echo "case 4e: closed + dozer:blocked + ever-merged-develop — strip only, never reopen"
+cat > "$TMP/audit.rows" <<EOF
+EOF
+cat > "$TMP/audit.blocked.rows" <<EOF
+AM-10	CFW	r-real	completed	dev
+EOF
+: > "$CALLS"
+L7="$TMP/audit-closed-blocked.log"
+AUDIT_LINEAR_API="$LINSTUB" AUDIT_RESOLVER="$RESSTUB" bash "$ROOT/dozers/audit-merged.sh" >"$L7" 2>&1 || { no "audit exited non-zero"; dump "$L7"; }
+grep -q "AM-10 *closed (completed), relabelled-blocked — strip label, leave state alone" "$L7" && ok "closed+blocked row reported as strip-only" || { no "closed+blocked row not reported correctly"; dump "$L7"; }
+grep -qE 'audit-strip AM-10' "$CALLS" && ok "closed+blocked row stripped (label hygiene)" || { no "audit-strip not called for AM-10"; dump "$CALLS"; }
+! grep -qE 'audit-requeue AM-10' "$CALLS" && ok "closed+blocked row NEVER requeued (state left alone)" || no "AM-10 was requeued — a closed issue would be reopened"
+
 if [[ $fail == 0 ]]; then echo "merge-verify-test: PASS"; else echo "merge-verify-test: FAIL" >&2; exit 1; fi

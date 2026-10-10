@@ -801,6 +801,10 @@ def list_relabelled_blocked():
     label_ids_by_team = {}
     for i in _all_issues():
         labels = i["labels"]["nodes"]
+        if i["state"]["type"] in ("completed", "canceled"):
+            continue  # GSAI-156 review: a hand-closed issue with dozer:blocked left on
+                      # it (never cleaned up via done()) must never be resurrected by
+                      # this sweep. Mirrors the budget-sweep guard below (~line 1502).
         if not _has(labels, BLOCKED) or _has(labels, MERGEDDEV):
             continue
         tid = i["team"]["id"]
